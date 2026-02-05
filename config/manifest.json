@@ -1,0 +1,51 @@
+{
+    "id": "mycompany.yolov8_people_analytics",
+    "name": "YOLOv8 People Analytics",
+    "description": "Analytics plugin using YOLOv8 model for people detection and tracking.",
+    "version": "1.0.0",
+    "vendor": "HumanCounterV8",
+    "engineSettingsModel": {
+        "type": "Settings",
+        "items": []
+    },
+    "deviceAgentSettingsModel": {
+        "type": "Settings",
+        "items": [
+            {
+                "type": "Switch",
+                "name": "enabled",
+                "caption": "Enable Detection",
+                "defaultValue": true
+            }
+        ]
+    },
+    "capabilities": [
+        "needUncompressedVideoFrames_bgr"
+    ],
+    "supportedObjectTypes": [
+        {
+            "id": "mycompany.yolov8_people_analytics.person",
+            "name": "Person"
+        },
+        {
+            "id": "mycompany.yolov8_people_analytics.cat",
+            "name": "Cat"
+        },
+        {
+            "id": "mycompany.yolov8_people_analytics.dog",
+            "name": "Dog"
+        }
+    ],
+    "supportedEventTypes": [
+        {
+            "id": "mycompany.yolov8_people_analytics.detection",
+            "name": "Object detected"
+        },
+        {
+            "id": "mycompany.yolov8_people_analytics.prolongedDetection",
+            "name": "Object detected (prolonged)",
+            "flags": "stateDependent"
+        }
+    ]
+}
+

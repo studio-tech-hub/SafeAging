@@ -1,0 +1,20 @@
+{
+  "camera_model": "Example wide-angle camera",
+  "resolution": [1920, 1080],
+  "calibration_method": "opencv_chess_board",
+  "notes": "Run calibration script to generate these values from checkerboard images",
+  
+  "camera_matrix": [
+    [1500.0, 0.0, 960.0],
+    [0.0, 1500.0, 540.0],
+    [0.0, 0.0, 1.0]
+  ],
+  
+  "distortion_coefficients": [0.1, -0.2, 0.0, 0.0, 0.0],
+  
+  "calibration_info": {
+    "num_images_used": 20,
+    "reprojection_error": 0.3,
+    "calibration_date": "2025-01-24"
+  }
+}
