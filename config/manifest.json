@@ -45,6 +45,11 @@
             "id": "mycompany.yolov8_people_analytics.prolongedDetection",
             "name": "Object detected (prolonged)",
             "flags": "stateDependent"
+        },
+        {
+            "id": "mycompany.yolov8_people_analytics.fallDetected",
+            "name": "Fall detected",
+            "flags": "stateDependent"
         }
     ]
 }

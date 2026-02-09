@@ -8,6 +8,11 @@
 #include <memory>
 #include <vector>
 #include <set>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 
 #include <nx/sdk/analytics/helpers/event_metadata_packet.h>
 #include <nx/sdk/analytics/helpers/object_metadata_packet.h>
@@ -22,6 +27,17 @@
 namespace sample_company {
 namespace vms_server_plugins {
 namespace opencv_object_detection {
+
+// ========================================
+// Frame job for async processing
+// ========================================
+struct FrameJob
+{
+    std::vector<uint8_t> jpegBytes;  // JPEG encoded frame
+    std::string cameraId;
+    int64_t timestampUs;
+    int64_t frameIndex;
+};
 
 class DeviceAgent: public nx::sdk::analytics::ConsumingDeviceAgent
 {
@@ -60,6 +76,16 @@ private:
     MetadataPacketList processFrame(
         const nx::sdk::analytics::IUncompressedVideoFrame* videoFrame);
 
+    // ============ FLOW 2: Frame queuing & async worker ============
+    // Worker thread function that runs in background
+    void workerThreadRun();
+    
+    // Encode frame to JPEG bytes
+    std::vector<uint8_t> encodeFrameToJpeg(const Frame& frame, int targetWidth = 640);
+    
+    // Process queued frame job and return metadata packets
+    MetadataPacketList processFrameJob(const FrameJob& job);
+
 private:
     const std::string kPersonObjectType = "nx.base.Person";
     const std::string kCatObjectType = "nx.base.Cat";
@@ -71,9 +97,15 @@ private:
 
     const std::string kProlongedDetectionEventType =
         "sample.opencv_object_detection.prolongedDetection";
+    
+    // FLOW 2: Fall Detection Event
+    const std::string kFallDetectedEventType = "mycompany.yolov8_people_analytics.fallDetected";
 
     /** Process every 2nd frame for better detection frequency (reasonable balance). */
     static constexpr int kDetectionFramePeriod = 2;
+    
+    // ============ FLOW 2: Frame queue config ============
+    static constexpr size_t kFrameQueueMaxSize = 3;  // Drop old frames if queue full
 
 private:
     bool m_terminated = false;
@@ -95,6 +127,23 @@ private:
 
     // Tập các trackId person đã từng xuất hiện (đếm không trùng).
     std::set<nx::sdk::Uuid> m_seenPersonIds;
+    
+    // ============ FLOW 2: Async frame processing ============
+    // Mutex + CV for frame queue
+    std::mutex m_frameQueueMutex;
+    std::condition_variable m_frameQueueCV;
+    std::deque<FrameJob> m_frameQueue;
+    
+    // Worker thread
+    std::thread m_workerThread;
+    bool m_workerShouldStop = false;
+    
+    // Outgoing metadata packet queue (non-blocking)
+    std::mutex m_metadataQueueMutex;
+    std::deque<nx::sdk::Ptr<nx::sdk::analytics::IMetadataPacket>> m_metadataQueue;
+    
+    // Fall detection deduplication: track which trackIds have active fallDetected events
+    std::set<nx::sdk::Uuid> m_activeFallDetectedTrackIds;
 };
 
 } // namespace opencv_object_detection

@@ -30,10 +30,23 @@ public:
     void ensureInitialized();
     bool isTerminated() const;
     void terminate();
+    
+    // FLOW 2: Run inference on JPEG bytes via HTTP /infer endpoint
+    // Signature: run(cameraId, jpegBytes) -> DetectionList
+    // Throws ObjectDetectionError on HTTP error / timeout / JSON parse error
+    DetectionList run(const std::string& cameraId, const std::vector<uint8_t>& jpegBytes);
+    
+    // Legacy: Run inference on Frame (still available)
     DetectionList run(const Frame& frame);
 
 private:
     void loadModel();
+    
+    // FLOW 2: Call Python AI service via HTTP multipart/form-data
+    DetectionList callPythonServiceMultipart(
+        const std::string& cameraId, 
+        const std::vector<uint8_t>& jpegBytes);
+    
     DetectionList runImpl(const Frame& frame);
 
 private:

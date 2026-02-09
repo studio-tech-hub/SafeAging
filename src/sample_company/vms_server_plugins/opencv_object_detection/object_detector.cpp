@@ -402,6 +402,197 @@ namespace sample_company {
                     throw ObjectDetectionError(std::string("Std error: ") + e.what());
                 }
             }
+            
+            // ============================================================
+            // FLOW 2: New method - run inference on JPEG bytes
+            // ============================================================
+            DetectionList ObjectDetector::run(const std::string& cameraId, const std::vector<uint8_t>& jpegBytes)
+            {
+                if (isTerminated())
+                    return {};
+
+                try
+                {
+                    if (jpegBytes.empty())
+                        throw ObjectDetectionError("JPEG bytes are empty");
+                    
+                    return callPythonServiceMultipart(cameraId, jpegBytes);
+                }
+                catch (const ObjectDetectionError&)
+                {
+                    throw;  // Re-throw detection errors
+                }
+                catch (const std::exception& e)
+                {
+                    throw ObjectDetectionError(std::string("Error in run(cameraId, jpegBytes): ") + e.what());
+                }
+            }
+            
+            // ============================================================
+            // FLOW 2: HTTP multipart/form-data call to Python service
+            // Uses short timeout for MVP (fail-fast)
+            // ============================================================
+            DetectionList ObjectDetector::callPythonServiceMultipart(
+                const std::string& cameraId, 
+                const std::vector<uint8_t>& jpegBytes)
+            {
+                DetectionList result;
+                
+                try
+                {
+                    // Base64 encode JPEG for JSON request
+                    std::string b64 = base64Encode(jpegBytes.data(), jpegBytes.size());
+                    
+                    if (b64.empty())
+                        throw ObjectDetectionError("Failed to base64 encode JPEG bytes");
+                    
+                    // Create JSON request
+                    json req;
+                    req["camera_id"] = cameraId;
+                    req["image"] = b64;
+                    
+                    std::string jsonBody = req.dump();
+                    
+                    // HTTP client (thread-local, reused)
+                    thread_local httplib::Client cli("127.0.0.1", 18000);
+                    cli.set_keep_alive(true);
+                    
+                    // ⚠️ SHORT TIMEOUT FOR MVP: fail-fast if AI service is slow
+                    // 1.5 seconds total (fail-fast instead of blocking Nx)
+                    cli.set_connection_timeout(0, 500000);  // 500ms
+                    cli.set_read_timeout(1, 0);             // 1s
+                    cli.set_write_timeout(0, 500000);       // 500ms
+                    
+                    static int s_reqCount = 0;
+                    if ((++s_reqCount % 20) == 0)
+                    {
+                        std::cerr << "[FLOW2 C++] Calling /infer with JPEG, count=" << s_reqCount 
+                                  << " jpegSize=" << jpegBytes.size() << " bytes" << std::endl;
+                    }
+                    
+                    // POST /infer endpoint
+                    auto res = cli.Post("/infer", jsonBody, "application/json");
+                    
+                    if (!res)
+                    {
+                        static int s_fail = 0;
+                        if ((++s_fail % 200) == 0)
+                        {
+                            std::cerr << "[FLOW2 C++] /infer failed (no response)" << std::endl;
+                            std::cerr << "[FLOW2 C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
+                        }
+                        throw ObjectDetectionError("No response from /infer endpoint");
+                    }
+                    
+                    if (res->status != 200)
+                    {
+                        static int s_bad = 0;
+                        if ((++s_bad % 200) == 0)
+                        {
+                            std::cerr << "[FLOW2 C++] /infer status=" << res->status 
+                                     << " body=" << res->body.substr(0, 100) << std::endl;
+                        }
+                        throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
+                    }
+                    
+                    // Parse JSON response
+                    json j;
+                    try
+                    {
+                        j = json::parse(res->body);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        throw ObjectDetectionError(std::string("Failed to parse JSON response: ") + e.what());
+                    }
+                    
+                    if (!j.is_array())
+                        throw ObjectDetectionError("Response is not a JSON array");
+                    
+                    // Parse each detection
+                    for (const auto& item : j)
+                    {
+                        try
+                        {
+                            const std::string classLabel = item.value("cls", "person");
+                            const float score = item.value("score", 0.0f);
+                            
+                            float x = item.value("x", 0.0f);
+                            float y = item.value("y", 0.0f);
+                            float w = item.value("w", 0.0f);
+                            float h = item.value("h", 0.0f);
+                            
+                            const bool fallDetected = item.value("fall_detected", false);  // FLOW 2
+                            
+                            if (w <= 0.0f || h <= 0.0f)
+                                continue;
+                            
+                            // Get JPEG dimensions from request (we need to track them separately)
+                            // For now, assume frame is ~640 width (downscaled)
+                            // This should be passed explicitly in future
+                            int frameW = 640;
+                            int frameH = 480;
+                            
+                            // Try to get from response metadata if available
+                            if (item.count("img_width"))
+                                frameW = item.value("img_width", 640);
+                            if (item.count("img_height"))
+                                frameH = item.value("img_height", 480);
+                            
+                            // Normalize coordinates
+                            float xNorm = x / static_cast<float>(frameW);
+                            float yNorm = y / static_cast<float>(frameH);
+                            float wNorm = w / static_cast<float>(frameW);
+                            float hNorm = h / static_cast<float>(frameH);
+                            
+                            // Clamp
+                            if (xNorm < 0.0f) xNorm = 0.0f;
+                            if (yNorm < 0.0f) yNorm = 0.0f;
+                            if (xNorm + wNorm > 1.0f) wNorm = 1.0f - xNorm;
+                            if (yNorm + hNorm > 1.0f) hNorm = 1.0f - yNorm;
+                            
+                            if (wNorm <= 0.0f || hNorm <= 0.0f)
+                                continue;
+                            
+                            // Get track ID
+                            const int trackId = item.value("track_id", 0);
+                            nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+                            
+                            // FLOW 2: Include fall_detected flag
+                            auto detection = std::make_shared<Detection>(Detection{
+                                nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
+                                classLabel,
+                                score,
+                                trackUuid,
+                                fallDetected  // FLOW 2
+                            });
+                            
+                            result.push_back(detection);
+                        }
+                        catch (const std::exception& e)
+                        {
+                            std::cerr << "[FLOW2 C++] Error parsing detection item: " << e.what() << std::endl;
+                            continue;  // Skip bad items
+                        }
+                    }
+                    
+                    static int s_log = 0;
+                    if ((++s_log % 100) == 0)
+                    {
+                        std::cerr << "[FLOW2 C++] detections=" << result.size() << std::endl;
+                    }
+                    
+                    return result;
+                }
+                catch (const ObjectDetectionError&)
+                {
+                    throw;
+                }
+                catch (const std::exception& e)
+                {
+                    throw ObjectDetectionError(std::string("callPythonServiceMultipart error: ") + e.what());
+                }
+            }
 
             //-------------------------------------------------------------------------------------------------
             // private
