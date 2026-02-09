@@ -8,6 +8,8 @@
 #include <chrono>
 #include <exception>
 #include <cctype>
+#include <cstdint>
+#include <sstream>
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn/dnn.hpp>
@@ -45,6 +47,9 @@ namespace sample_company {
                 m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
                 m_objectTracker(std::make_unique<ObjectTracker>())
             {
+                std::ostringstream os;
+                os << "nx_cam_" << reinterpret_cast<std::uintptr_t>(deviceInfo);
+                m_cameraId = os.str();
             }
 
             DeviceAgent::~DeviceAgent()
@@ -63,6 +68,11 @@ namespace sample_company {
         {
             "id": ")json" + kProlongedDetectionEventType + R"json(",
             "name": "Object detected (prolonged)",
+            "flags": "stateDependent"
+        },
+        {
+            "id": ")json" + kFallDetectedEventType + R"json(",
+            "name": "Fall detected",
             "flags": "stateDependent"
         }
     ],
@@ -252,6 +262,61 @@ namespace sample_company {
                 return result;
             }
 
+            DeviceAgent::MetadataPacketList DeviceAgent::fallEventsToEventMetadataPacketList(
+                const DetectionList& detections,
+                int64_t timestampUs)
+            {
+                std::set<nx::sdk::Uuid> frameFallingTrackIds;
+                for (const std::shared_ptr<Detection>& detection : detections)
+                {
+                    if (detection->classLabel == "person" && detection->fallDetected)
+                        frameFallingTrackIds.insert(detection->trackId);
+                }
+
+                const auto eventMetadataPacket = makePtr<EventMetadataPacket>();
+                bool hasEvents = false;
+
+                for (const auto& trackId : frameFallingTrackIds)
+                {
+                    if (m_activeFallTrackIds.find(trackId) != m_activeFallTrackIds.end())
+                        continue;
+
+                    const auto eventMetadata = makePtr<EventMetadata>();
+                    const std::string trackIdStr = nx::sdk::UuidHelper::toStdString(trackId);
+                    const std::string description = "Track ID: " + trackIdStr;
+                    eventMetadata->setCaption("Fall detected STARTED");
+                    eventMetadata->setDescription(description);
+                    eventMetadata->setIsActive(true);
+                    eventMetadata->setTypeId(kFallDetectedEventType);
+                    eventMetadataPacket->addItem(eventMetadata.get());
+                    hasEvents = true;
+                }
+
+                for (const auto& trackId : m_activeFallTrackIds)
+                {
+                    if (frameFallingTrackIds.find(trackId) != frameFallingTrackIds.end())
+                        continue;
+
+                    const auto eventMetadata = makePtr<EventMetadata>();
+                    const std::string trackIdStr = nx::sdk::UuidHelper::toStdString(trackId);
+                    const std::string description = "Track ID: " + trackIdStr;
+                    eventMetadata->setCaption("Fall detected FINISHED");
+                    eventMetadata->setDescription(description);
+                    eventMetadata->setIsActive(false);
+                    eventMetadata->setTypeId(kFallDetectedEventType);
+                    eventMetadataPacket->addItem(eventMetadata.get());
+                    hasEvents = true;
+                }
+
+                m_activeFallTrackIds = std::move(frameFallingTrackIds);
+
+                if (!hasEvents)
+                    return {};
+
+                eventMetadataPacket->setTimestampUs(timestampUs);
+                return {eventMetadataPacket};
+            }
+
             Ptr<ObjectMetadataPacket> DeviceAgent::detectionsToObjectMetadataPacket(
                 const DetectionList& detections,
                 int64_t timestampUs)
@@ -380,7 +445,7 @@ namespace sample_company {
                     }
 
                     // 1) Gọi Python service -> lấy detections đã có track_id
-                    DetectionList detections = m_objectDetector->run(frame);
+                    DetectionList detections = m_objectDetector->run(frame, m_cameraId);
 
                     // 2) Dùng trực tiếp detections từ Python để tạo ObjectMetadata
                     const auto& objectMetadataPacket =
@@ -390,6 +455,8 @@ namespace sample_company {
                     EventList emptyEvents;
                     const auto& eventMetadataPacketList =
                         eventsToEventMetadataPacketList(emptyEvents, frame.timestampUs);
+                    const auto& fallEventMetadataPacketList =
+                        fallEventsToEventMetadataPacketList(detections, frame.timestampUs);
 
                     MetadataPacketList result;
                     if (objectMetadataPacket)
@@ -399,6 +466,10 @@ namespace sample_company {
                         result.end(),
                         std::make_move_iterator(eventMetadataPacketList.begin()),
                         std::make_move_iterator(eventMetadataPacketList.end()));
+                    result.insert(
+                        result.end(),
+                        std::make_move_iterator(fallEventMetadataPacketList.begin()),
+                        std::make_move_iterator(fallEventMetadataPacketList.end()));
 
                     return result;
                 }

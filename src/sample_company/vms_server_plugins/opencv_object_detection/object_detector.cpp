@@ -179,22 +179,13 @@ namespace sample_company {
                 }
 
                 // Gọi Python service, trả về DetectionList (danh sách Detection của plugin)
-                DetectionList callPythonService(const Frame& frame)
+                DetectionList callPythonService(const Frame& frame, const std::string& cameraId)
                 {
                     DetectionList result;
 
                     const Mat& image = frame.cvMat;
                     if (image.empty())
                         return result;
-
-                    static std::chrono::steady_clock::time_point lastCall = std::chrono::steady_clock::now();
-                    auto now = std::chrono::steady_clock::now();
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCall).count();
-
-                    // ví dụ: chỉ gọi tối đa 5 lần/giây
-                    if (ms < 200)
-                        return {};
-                    lastCall = now;
 
                 // Resize để giảm thời gian imencode/base64 và tăng FPS tổng
                     cv::Mat sendImg = image;
@@ -237,7 +228,7 @@ namespace sample_company {
 
                     // 2. JSON request body
                     json req;
-                    req["camera_id"] = "nx_camera";  // tạm thời, sau này map đúng ID camera nếu cần
+                    req["camera_id"] = cameraId;
                     req["image"] = b64;
 
                     // 3. HTTP client -> POST /infer
@@ -245,10 +236,10 @@ namespace sample_company {
                     thread_local httplib::Client cli("127.0.0.1", 18000);
                     cli.set_keep_alive(true); // Keep connection alive để tái sử dụng
 
-                    // Tăng timeout để Python service có thời gian xử lý
-                    cli.set_connection_timeout(1, 500000); // 1.5s (1s + 500ms)
-                    cli.set_read_timeout(2, 500000);       // 2.5s (2s + 500ms)
-                    cli.set_write_timeout(1, 0);           // 1s
+                    // Fail fast to avoid blocking the Nx analytics pipeline.
+                    cli.set_connection_timeout(0, 250000); // 250ms
+                    cli.set_read_timeout(0, 400000);       // 400ms
+                    cli.set_write_timeout(0, 250000);      // 250ms
 
 
                     static int s_reqCount = 0;
@@ -262,22 +253,14 @@ namespace sample_company {
                     // ❗ res là pointer-like
                     if (!res)
                     {
-                        static int s_fail = 0;
-                        if ((++s_fail % 200) == 0)
-                        {
-                            std::cerr << "[C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
-                        }
-                        return {};
+                        throw ObjectDetectionError(
+                            "Python /infer failed (no response). Service may be unavailable or timed out.");
                     }
 
                     if (res->status != 200)
                     {
-                        static int s_bad = 0;
-                        if ((++s_bad % 200) == 0)
-                            std::cerr << "[C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
-                        return {};
+                        throw ObjectDetectionError(
+                            "Python /infer returned HTTP status " + std::to_string(res->status));
                     }
 
                     json j;
@@ -285,13 +268,14 @@ namespace sample_company {
                     {
                         j = json::parse(res->body);
                     }
-                    catch (...)
+                    catch (const std::exception& e)
                     {
-                        return {};
+                        throw ObjectDetectionError(
+                            std::string("Invalid JSON from Python /infer: ") + e.what());
                     }
 
                     if (!j.is_array())
-                        return {};
+                        throw ObjectDetectionError("Unexpected JSON payload from Python /infer (expected array).");
 
                     // 5. Mỗi phần tử là 1 detection:
                     //    { "cls": "person", "score": 0.9, "x": 180.0, "y": 270.6, "w": 120.0, "h": 360.8, "track_id": 1 }
@@ -325,13 +309,15 @@ namespace sample_company {
 
                         // 🔹 Lấy track_id từ JSON -> UUID ổn định
                         const int trackId = item.value("track_id", 0);
+                        const bool fallDetected = item.value("fall_detected", false);
                         nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
 
                         auto detection = std::make_shared<Detection>(Detection{
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
                             classLabel,
                             score,
-                            trackUuid
+                            trackUuid,
+                            fallDetected
                             });
 
                         result.push_back(detection);
@@ -379,14 +365,14 @@ namespace sample_company {
                 m_terminated = true;
             }
 
-            DetectionList ObjectDetector::run(const Frame& frame)
+            DetectionList ObjectDetector::run(const Frame& frame, const std::string& cameraId)
             {
                 if (isTerminated())
                     return {};
 
                 try
                 {
-                    return runImpl(frame);
+                    return runImpl(frame, cameraId);
                 }
                 catch (const ObjectDetectionError&)
                 {
@@ -412,7 +398,7 @@ namespace sample_company {
                 // KHÔNG còn dùng OpenCV DNN / ONNX nữa.
             }
 
-            DetectionList ObjectDetector::runImpl(const Frame& frame)
+            DetectionList ObjectDetector::runImpl(const Frame& frame, const std::string& cameraId)
             {
                 if (isTerminated())
                 {
@@ -421,7 +407,7 @@ namespace sample_company {
                 }
 
                 // Thay toàn bộ logic ONNX cũ bằng gọi Python service:
-                return callPythonService(frame);
+                return callPythonService(frame, cameraId);
             }
 
         } // namespace opencv_object_detection

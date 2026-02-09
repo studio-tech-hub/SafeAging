@@ -430,6 +430,8 @@ def auto_adjust_brightness(frame: np.ndarray, target_brightness: float = 190.0) 
     except Exception as e:
         logger.warning(f"Brightness adjustment error: {e}")
         return frame
+
+def apply_clahe(frame: np.ndarray) -> np.ndarray:
     """
     Apply CLAHE (Contrast Limited Adaptive Histogram Equalization).
     Great for wide-angle cameras with uneven lighting.

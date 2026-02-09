@@ -8,6 +8,7 @@
 #include <memory>
 #include <vector>
 #include <set>
+#include <string>
 
 #include <nx/sdk/analytics/helpers/event_metadata_packet.h>
 #include <nx/sdk/analytics/helpers/object_metadata_packet.h>
@@ -57,6 +58,10 @@ private:
         const EventList& events,
         int64_t timestampUs);
 
+    MetadataPacketList fallEventsToEventMetadataPacketList(
+        const DetectionList& detections,
+        int64_t timestampUs);
+
     MetadataPacketList processFrame(
         const nx::sdk::analytics::IUncompressedVideoFrame* videoFrame);
 
@@ -71,6 +76,8 @@ private:
 
     const std::string kProlongedDetectionEventType =
         "sample.opencv_object_detection.prolongedDetection";
+    const std::string kFallDetectedEventType =
+        "sample.opencv_object_detection.fallDetected";
 
     /** Process every 2nd frame for better detection frequency (reasonable balance). */
     static constexpr int kDetectionFramePeriod = 2;
@@ -81,6 +88,7 @@ private:
 
     std::filesystem::path m_pluginHomeDir;
     std::filesystem::path m_modelPath;
+    std::string m_cameraId;
 
     const std::unique_ptr<ObjectDetector> m_objectDetector;
     std::unique_ptr<ObjectTracker> m_objectTracker;
@@ -95,6 +103,7 @@ private:
 
     // Tập các trackId person đã từng xuất hiện (đếm không trùng).
     std::set<nx::sdk::Uuid> m_seenPersonIds;
+    std::set<nx::sdk::Uuid> m_activeFallTrackIds;
 };
 
 } // namespace opencv_object_detection

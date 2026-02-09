@@ -30,11 +30,11 @@ public:
     void ensureInitialized();
     bool isTerminated() const;
     void terminate();
-    DetectionList run(const Frame& frame);
+    DetectionList run(const Frame& frame, const std::string& cameraId);
 
 private:
     void loadModel();
-    DetectionList runImpl(const Frame& frame);
+    DetectionList runImpl(const Frame& frame, const std::string& cameraId);
 
 private:
     bool m_netLoaded = false;

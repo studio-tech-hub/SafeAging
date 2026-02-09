@@ -28,6 +28,7 @@ struct Detection
     const std::string classLabel;
     const float confidence;
     const nx::sdk::Uuid trackId;
+    const bool fallDetected = false;
 };
 
 using DetectionList = std::vector<std::shared_ptr<Detection>>;

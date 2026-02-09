@@ -1,0 +1,24 @@
+{
+    "id": "mycompany.yolov8_flow2",
+    "name": "YOLOv8 FLOW2 Analytics",
+    "description": "Nx plugin receives frames, sends to AI service /infer, and publishes object/event metadata.",
+    "version": "2.0.0",
+    "vendor": "mycompany",
+    "runtimeConfigEnv": {
+        "NX_AI_SERVICE_URL": "http://127.0.0.1:18000",
+        "NX_AI_TIMEOUT_CONNECT_MS": "250",
+        "NX_AI_TIMEOUT_READ_MS": "400",
+        "NX_AI_TIMEOUT_WRITE_MS": "250",
+        "NX_AI_SAMPLE_FPS": "5.0",
+        "NX_AI_QUEUE_SIZE": "4",
+        "NX_AI_SEND_WIDTH": "640",
+        "NX_AI_JPEG_QUALITY": "80",
+        "NX_AI_CIRCUIT_FAILS": "3",
+        "NX_AI_CIRCUIT_OPEN_MS": "3000",
+        "NX_AI_FALL_FINISH_MS": "3000",
+        "NX_AI_SYNTH_TRACK_TTL_MS": "2000",
+        "NX_AI_TRACK_MAP_TTL_MS": "60000",
+        "NX_AI_LOG_THROTTLE_MS": "5000"
+    }
+}
+
