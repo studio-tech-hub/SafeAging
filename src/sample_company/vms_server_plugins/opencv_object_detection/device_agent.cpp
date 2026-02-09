@@ -45,7 +45,9 @@ namespace sample_company {
                 m_pluginHomeDir(std::move(pluginHomeDir)),
                 m_modelPath(std::move(modelPath)),
                 m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
-                m_objectTracker(std::make_unique<ObjectTracker>())
+                m_objectTracker(std::make_unique<ObjectTracker>()),
+                m_workerThread(&DeviceAgent::workerThreadRun, this),  // FLOW 2: Start worker thread
+                m_workerShouldStop(false)
             {
                 std::ostringstream os;
                 os << "nx_cam_" << reinterpret_cast<std::uintptr_t>(deviceInfo);
@@ -54,6 +56,16 @@ namespace sample_company {
 
             DeviceAgent::~DeviceAgent()
             {
+                // FLOW 2: Signal worker thread to stop and wait for it
+                {
+                    std::unique_lock<std::mutex> lk(m_frameQueueMutex);
+                    m_workerShouldStop = true;
+                }
+                m_frameQueueCV.notify_one();
+                if (m_workerThread.joinable())
+                {
+                    m_workerThread.join();
+                }
             }
 
             std::string DeviceAgent::manifestString() const
@@ -105,7 +117,6 @@ namespace sample_company {
                         << std::endl;
                 }
 
-
                 if (m_frameIndex % 200 == 0)
                 {
                     pushPluginDiagnosticEvent(
@@ -115,6 +126,7 @@ namespace sample_company {
                             " w=" + std::to_string(videoFrame->width()) +
                             " h=" + std::to_string(videoFrame->height())).c_str());
                 }
+                
                 // Nếu detector đã bị terminate cứng (hiếm), chỉ báo 1 lần rồi bỏ qua frame.
                 m_terminated = m_terminated || m_objectDetector->isTerminated();
                 if (m_terminated)
@@ -130,43 +142,62 @@ namespace sample_company {
                     return true;
                 }
 
+                // ============================================================
+                // FLOW 2: Frame callback MUST NOT process frames here.
+                //         Instead, enqueue frame for async worker thread.
+                //         This callback returns immediately (NON-BLOCKING).
+                // ============================================================
+                
                 // 🔻 Process detection frames regularly:
-                // Detect every kDetectionFramePeriod frames for consistent performance
-                // Purpose: balance detection accuracy with system load
                 const int kPeriod = kDetectionFramePeriod;
                 if (m_frameIndex % kPeriod == 0)
                 {
-                    MetadataPacketList metadataPackets;
                     try
                     {
-                        metadataPackets = processFrame(videoFrame);
+                        // Convert Nx frame to OpenCV Mat for encoding
+                        Frame frame(videoFrame, m_frameIndex);
+                        
+                        // Encode frame to JPEG with downscaling
+                        std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 640);
+                        
+                        // Create frame job
+                        FrameJob job;
+                        job.jpegBytes = std::move(jpegBytes);
+                        job.cameraId = "nx_camera";  // TODO: Get from device info
+                        job.timestampUs = frame.timestampUs;
+                        job.frameIndex = m_frameIndex;
+                        
+                        // ⚠️ BACKPRESSURE: bounded queue (size 3)
+                        // If queue is full, drop oldest frame and add newest
+                        {
+                            std::unique_lock<std::mutex> lk(m_frameQueueMutex);
+                            if (m_frameQueue.size() >= kFrameQueueMaxSize)
+                            {
+                                // Drop oldest (front) frame to make room
+                                m_frameQueue.pop_front();
+                                if (m_frameIndex % 20 == 0)
+                                {
+                                    pushPluginDiagnosticEvent(
+                                        nx::sdk::IPluginDiagnosticEvent::Level::warning,
+                                        "Frame queue full - dropping old frames",
+                                        "Worker thread may be slow; increase queue or reduce FPS");
+                                }
+                            }
+                            m_frameQueue.push_back(std::move(job));
+                        }
+                        m_frameQueueCV.notify_one();  // Wake up worker thread
                     }
                     catch (const std::exception& e)
                     {
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::error,
-                            "Frame processing error (processFrame failed)",
-                            (std::string("Exception: ") + e.what()).c_str());
-                        metadataPackets.clear();
-                    }
-                    catch (...)
-                    {
-                        pushPluginDiagnosticEvent(
-                            nx::sdk::IPluginDiagnosticEvent::Level::error,
-                            "Frame processing error (unknown exception)",
-                            "Unknown exception type in processFrame");
-                        metadataPackets.clear();
-                    }
-
-                    for (const Ptr<IMetadataPacket>& metadataPacket : metadataPackets)
-                    {
-                        metadataPacket->addRef();
-                        pushMetadataPacket(metadataPacket.get());
+                            "Frame encoding error",
+                            e.what());
                     }
                 }
 
                 ++m_frameIndex;
-                return true;
+                return true;  // ✓ Frame callback returns immediately
             }
 
             void DeviceAgent::doSetNeededMetadataTypes(
@@ -198,6 +229,201 @@ namespace sample_company {
 
             //-------------------------------------------------------------------------------------------------
             // private
+
+            // ============================================================
+            // FLOW 2: Worker thread - runs in background
+            // Dequeues newest frame, processes it, and pushes metadata
+            // ============================================================
+            void DeviceAgent::workerThreadRun()
+            {
+                while (true)
+                {
+                    FrameJob job;
+                    
+                    // Wait for frame or shutdown signal
+                    {
+                        std::unique_lock<std::mutex> lk(m_frameQueueMutex);
+                        m_frameQueueCV.wait(lk, [this]() {
+                            return !m_frameQueue.empty() || m_workerShouldStop;
+                        });
+                        
+                        if (m_workerShouldStop && m_frameQueue.empty())
+                            break;  // Exit thread
+                        
+                        if (m_frameQueue.empty())
+                            continue;  // Spurious wakeup, wait again
+                        
+                        // Dequeue NEWEST frame (drop old ones if multiple in queue)
+                        job = std::move(m_frameQueue.back());
+                        m_frameQueue.clear();  // Drop all other frames
+                    }
+                    
+                    // Process frame job (WITHOUT holding lock)
+                    try
+                    {
+                        MetadataPacketList metadataPackets = processFrameJob(job);
+                        
+                        // Enqueue metadata packets for Nx to pull
+                        {
+                            std::unique_lock<std::mutex> lk(m_metadataQueueMutex);
+                            for (const auto& pkt : metadataPackets)
+                            {
+                                m_metadataQueue.push_back(pkt);
+                            }
+                        }
+                    }
+                    catch (const std::exception& e)
+                    {
+                        pushPluginDiagnosticEvent(
+                            nx::sdk::IPluginDiagnosticEvent::Level::error,
+                            "Worker thread: frame processing error",
+                            e.what());
+                    }
+                }
+            }
+            
+            // ============================================================
+            // FLOW 2: Encode frame to JPEG bytes
+            // ============================================================
+            std::vector<uint8_t> DeviceAgent::encodeFrameToJpeg(const Frame& frame, int targetWidth)
+            {
+                cv::Mat sendImg = frame.cvMat;
+                
+                // Downscale for faster HTTP transmission and inference
+                if (frame.width > targetWidth)
+                {
+                    float scale = (float)targetWidth / (float)frame.width;
+                    int newH = std::max(1, (int)std::round(frame.height * scale));
+                    cv::resize(sendImg, sendImg, cv::Size(targetWidth, newH));
+                }
+                
+                // Encode to JPEG
+                std::vector<uint8_t> jpegBytes;
+                std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 80};  // 80% quality
+                
+                if (!cv::imencode(".jpg", sendImg, jpegBytes, params))
+                {
+                    throw ObjectDetectionError("Failed to encode frame to JPEG");
+                }
+                
+                return jpegBytes;
+            }
+            
+            // ============================================================
+            // FLOW 2: Process queued frame job
+            // ============================================================
+            DeviceAgent::MetadataPacketList DeviceAgent::processFrameJob(const FrameJob& job)
+            {
+                MetadataPacketList result;
+                
+                try
+                {
+                    // Call Python AI service with JPEG bytes
+                    DetectionList detections = m_objectDetector->run(job.cameraId, job.jpegBytes);
+                    
+                    // Create ObjectMetadata for bboxes
+                    const auto& objectMetadataPacket =
+                        detectionsToObjectMetadataPacket(detections, job.timestampUs);
+                    
+                    if (objectMetadataPacket)
+                        result.push_back(objectMetadataPacket);
+
+                    // Emit state-dependent person presence event (start/finish).
+                    bool hasPerson = false;
+                    std::set<nx::sdk::Uuid> currentFallDetectedTrackIds;
+                    for (const auto& detection : detections)
+                    {
+                        if (detection->classLabel != "person")
+                            continue;
+
+                        hasPerson = true;
+                        if (detection->fallDetected)
+                            currentFallDetectedTrackIds.insert(detection->trackId);
+                    }
+
+                    if (hasPerson != m_personDetectionActive)
+                    {
+                        EventList personEvents;
+                        personEvents.push_back(std::make_shared<Event>(Event{
+                            hasPerson ? EventType::detection_started : EventType::detection_finished,
+                            job.timestampUs,
+                            "person"
+                        }));
+
+                        const auto personEventPackets =
+                            eventsToEventMetadataPacketList(personEvents, job.timestampUs);
+                        result.insert(
+                            result.end(),
+                            std::make_move_iterator(personEventPackets.begin()),
+                            std::make_move_iterator(personEventPackets.end()));
+
+                        m_personDetectionActive = hasPerson;
+                    }
+
+                    // Emit state-dependent fall events per track_id.
+                    // START: newly fallen tracks.
+                    for (const auto& trackId : currentFallDetectedTrackIds)
+                    {
+                        if (m_activeFallDetectedTrackIds.count(trackId) > 0)
+                            continue;
+
+                        auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                        eventMetadata->setCaption("Fall detected");
+                        eventMetadata->setDescription(
+                            "Person " + nx::sdk::UuidHelper::toStdString(trackId) + " is in fallen state");
+                        eventMetadata->setIsActive(true);
+                        eventMetadata->setTypeId(kFallDetectedEventType);
+
+                        auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                        eventPacket->addItem(eventMetadata.get());
+                        eventPacket->setTimestampUs(job.timestampUs);
+                        result.push_back(eventPacket);
+
+                        m_activeFallDetectedTrackIds.insert(trackId);
+                    }
+
+                    // FINISH: tracks that were fallen before but are no longer fallen now.
+                    std::vector<nx::sdk::Uuid> tracksToClear;
+                    for (const auto& activeTrackId : m_activeFallDetectedTrackIds)
+                    {
+                        if (currentFallDetectedTrackIds.count(activeTrackId) > 0)
+                            continue;
+
+                        auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                        eventMetadata->setCaption("Fall cleared");
+                        eventMetadata->setDescription(
+                            "Person " + nx::sdk::UuidHelper::toStdString(activeTrackId) + " is no longer fallen");
+                        eventMetadata->setIsActive(false);
+                        eventMetadata->setTypeId(kFallDetectedEventType);
+
+                        auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                        eventPacket->addItem(eventMetadata.get());
+                        eventPacket->setTimestampUs(job.timestampUs);
+                        result.push_back(eventPacket);
+
+                        tracksToClear.push_back(activeTrackId);
+                    }
+
+                    for (const auto& trackId : tracksToClear)
+                        m_activeFallDetectedTrackIds.erase(trackId);
+                }
+                catch (const ObjectDetectionError& e)
+                {
+                    pushPluginDiagnosticEvent(
+                        nx::sdk::IPluginDiagnosticEvent::Level::error,
+                        "AI service call failed - will retry next frame",
+                        e.what());
+                }
+                catch (const std::exception& e)
+                {
+                    pushPluginDiagnosticEvent(
+                        nx::sdk::IPluginDiagnosticEvent::Level::error,
+                        "Unexpected error in processFrameJob",
+                        e.what());
+                }
+                
+                return result;
+            }
 
             DeviceAgent::MetadataPacketList DeviceAgent::eventsToEventMetadataPacketList(
                 const EventList& events,

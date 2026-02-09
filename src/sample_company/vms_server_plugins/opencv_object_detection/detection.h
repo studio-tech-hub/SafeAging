@@ -28,7 +28,7 @@ struct Detection
     const std::string classLabel;
     const float confidence;
     const nx::sdk::Uuid trackId;
-    const bool fallDetected = false;
+    const bool fallDetected;  // FLOW 2: Fall detection flag from Python service
 };
 
 using DetectionList = std::vector<std::shared_ptr<Detection>>;

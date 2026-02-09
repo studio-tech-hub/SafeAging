@@ -127,3 +127,4 @@ frame_samples/*.png
 frame_samples/*.avi
 frame_samples/*.mp4
 Fall-Detection-and-Human-Activity-Recognition/
+.env
