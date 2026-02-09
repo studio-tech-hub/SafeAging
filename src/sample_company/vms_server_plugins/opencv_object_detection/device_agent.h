@@ -144,6 +144,9 @@ private:
     
     // Fall detection deduplication: track which trackIds have active fallDetected events
     std::set<nx::sdk::Uuid> m_activeFallDetectedTrackIds;
+
+    // Track state of person presence to emit start/finish state-dependent events.
+    bool m_personDetectionActive = false;
 };
 
 } // namespace opencv_object_detection

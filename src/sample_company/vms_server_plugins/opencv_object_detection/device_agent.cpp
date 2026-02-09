@@ -76,6 +76,11 @@ namespace sample_company {
             "id": ")json" + kProlongedDetectionEventType + R"json(",
             "name": "Object detected (prolonged)",
             "flags": "stateDependent"
+        },
+        {
+            "id": ")json" + kFallDetectedEventType + R"json(",
+            "name": "Fall detected",
+            "flags": "stateDependent"
         }
     ],
     "supportedTypes": [
@@ -317,42 +322,85 @@ namespace sample_company {
                     
                     if (objectMetadataPacket)
                         result.push_back(objectMetadataPacket);
-                    
-                    // FLOW 2: Create EventMetadata for fall detected
-                    // Emit START event only once per person (deduplication)
+
+                    // Emit state-dependent person presence event (start/finish).
+                    bool hasPerson = false;
+                    std::set<nx::sdk::Uuid> currentFallDetectedTrackIds;
                     for (const auto& detection : detections)
                     {
-                        if (detection->fallDetected && detection->classLabel == "person")
-                        {
-                            // Check if this track already has an active fallDetected event
-                            bool alreadyActive = m_activeFallDetectedTrackIds.count(detection->trackId) > 0;
-                            
-                            if (!alreadyActive)
-                            {
-                                // Create START event for this person
-                                auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
-                                eventMetadata->setCaption("Fall Detected");
-                                eventMetadata->setDescription("Person fell down");
-                                eventMetadata->setIsActive(true);
-                                eventMetadata->setTypeId(kFallDetectedEventType);
-                                
-                                auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
-                                eventPacket->addItem(eventMetadata.get());
-                                eventPacket->setTimestampUs(job.timestampUs);
-                                
-                                result.push_back(eventPacket);
-                                
-                                // Mark this track as having active event (prevent spam)
-                                m_activeFallDetectedTrackIds.insert(detection->trackId);
-                                
-                                if (job.frameIndex % 10 == 0)
-                                {
-                                    std::cerr << "[FLOW2] Fall detected for track: " 
-                                              << nx::sdk::UuidHelper::toStdString(detection->trackId) << std::endl;
-                                }
-                            }
-                        }
+                        if (detection->classLabel != "person")
+                            continue;
+
+                        hasPerson = true;
+                        if (detection->fallDetected)
+                            currentFallDetectedTrackIds.insert(detection->trackId);
                     }
+
+                    if (hasPerson != m_personDetectionActive)
+                    {
+                        EventList personEvents;
+                        personEvents.push_back(std::make_shared<Event>(Event{
+                            hasPerson ? EventType::detection_started : EventType::detection_finished,
+                            job.timestampUs,
+                            "person"
+                        }));
+
+                        const auto personEventPackets =
+                            eventsToEventMetadataPacketList(personEvents, job.timestampUs);
+                        result.insert(
+                            result.end(),
+                            std::make_move_iterator(personEventPackets.begin()),
+                            std::make_move_iterator(personEventPackets.end()));
+
+                        m_personDetectionActive = hasPerson;
+                    }
+
+                    // Emit state-dependent fall events per track_id.
+                    // START: newly fallen tracks.
+                    for (const auto& trackId : currentFallDetectedTrackIds)
+                    {
+                        if (m_activeFallDetectedTrackIds.count(trackId) > 0)
+                            continue;
+
+                        auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                        eventMetadata->setCaption("Fall detected");
+                        eventMetadata->setDescription(
+                            "Person " + nx::sdk::UuidHelper::toStdString(trackId) + " is in fallen state");
+                        eventMetadata->setIsActive(true);
+                        eventMetadata->setTypeId(kFallDetectedEventType);
+
+                        auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                        eventPacket->addItem(eventMetadata.get());
+                        eventPacket->setTimestampUs(job.timestampUs);
+                        result.push_back(eventPacket);
+
+                        m_activeFallDetectedTrackIds.insert(trackId);
+                    }
+
+                    // FINISH: tracks that were fallen before but are no longer fallen now.
+                    std::vector<nx::sdk::Uuid> tracksToClear;
+                    for (const auto& activeTrackId : m_activeFallDetectedTrackIds)
+                    {
+                        if (currentFallDetectedTrackIds.count(activeTrackId) > 0)
+                            continue;
+
+                        auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                        eventMetadata->setCaption("Fall cleared");
+                        eventMetadata->setDescription(
+                            "Person " + nx::sdk::UuidHelper::toStdString(activeTrackId) + " is no longer fallen");
+                        eventMetadata->setIsActive(false);
+                        eventMetadata->setTypeId(kFallDetectedEventType);
+
+                        auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                        eventPacket->addItem(eventMetadata.get());
+                        eventPacket->setTimestampUs(job.timestampUs);
+                        result.push_back(eventPacket);
+
+                        tracksToClear.push_back(activeTrackId);
+                    }
+
+                    for (const auto& trackId : tracksToClear)
+                        m_activeFallDetectedTrackIds.erase(trackId);
                 }
                 catch (const ObjectDetectionError& e)
                 {

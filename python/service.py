@@ -82,6 +82,7 @@ ENABLE_MULTI_SCALE = os.getenv("ENABLE_MULTI_SCALE", "true").lower() == "true"
 ENABLE_FRAME_ENHANCEMENT = os.getenv("ENABLE_FRAME_ENHANCEMENT", "false").lower() == "true"
 CLAHE_CLIP_LIMIT = float(os.getenv("CLAHE_CLIP_LIMIT", "2.0"))
 CLAHE_TILE_SIZE = int(os.getenv("CLAHE_TILE_SIZE", "16"))
+SAVE_DEBUG_SAMPLES = os.getenv("SAVE_DEBUG_SAMPLES", "false").lower() == "true"
 
 # ============================
 # Wide-Angle Optimization: ROI (Region of Interest) - ENABLED by default
@@ -430,6 +431,7 @@ def auto_adjust_brightness(frame: np.ndarray, target_brightness: float = 190.0) 
     except Exception as e:
         logger.warning(f"Brightness adjustment error: {e}")
         return frame
+def apply_clahe(frame: np.ndarray) -> np.ndarray:
     """
     Apply CLAHE (Contrast Limited Adaptive Histogram Equalization).
     Great for wide-angle cameras with uneven lighting.
@@ -438,18 +440,18 @@ def auto_adjust_brightness(frame: np.ndarray, target_brightness: float = 190.0) 
         # Convert to LAB color space for better contrast enhancement
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        
+
         # Apply CLAHE only to L channel
         clahe = cv2.createCLAHE(
-            clipLimit=CLAHE_CLIP_LIMIT, 
+            clipLimit=CLAHE_CLIP_LIMIT,
             tileGridSize=(CLAHE_TILE_SIZE, CLAHE_TILE_SIZE)
         )
         l_clahe = clahe.apply(l)
-        
+
         # Merge back
         lab_clahe = cv2.merge([l_clahe, a, b])
         frame_clahe = cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2BGR)
-        
+
         return frame_clahe
     except Exception as e:
         logger.warning(f"CLAHE failed: {e}, returning original frame")
@@ -709,15 +711,16 @@ def infer(req: InferRequest):
         frame_min = np.min(frame)
         if request_counter % 20 == 0:
             logger.info(f"[{camera_id}] Frame: {W}x{H}, mean={frame_mean:.1f}, min={frame_min}, max={frame_max}")
-            # Save frame to disk for inspection
-            try:
-                import os
-                os.makedirs('frame_samples', exist_ok=True)
-                sample_path = f'frame_samples/frame_{request_counter:06d}.jpg'
-                cv2.imwrite(sample_path, frame)
-                logger.info(f"[{camera_id}] Saved frame sample to {sample_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save frame sample: {e}")
+            if SAVE_DEBUG_SAMPLES:
+                # Save frame to disk only when explicitly enabled via env var.
+                try:
+                    import os
+                    os.makedirs('frame_samples', exist_ok=True)
+                    sample_path = f'frame_samples/frame_{request_counter:06d}.jpg'
+                    cv2.imwrite(sample_path, frame)
+                    logger.info(f"[{camera_id}] Saved frame sample to {sample_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to save frame sample: {e}")
         logger.debug(f"[{camera_id}] Frame size: {W}x{H}")
 
         # Store original frame for coordinate mapping

@@ -508,6 +508,14 @@ namespace sample_company {
                     
                     if (!j.is_array())
                         throw ObjectDetectionError("Response is not a JSON array");
+
+                    // Determine the exact image size that was sent to /infer.
+                    // This avoids bbox normalization errors when frame height is not 480.
+                    const cv::Mat decodedJpeg = cv::imdecode(jpegBytes, cv::IMREAD_COLOR);
+                    if (decodedJpeg.empty())
+                        throw ObjectDetectionError("Failed to decode JPEG bytes to determine frame dimensions");
+                    const int frameW = decodedJpeg.cols;
+                    const int frameH = decodedJpeg.rows;
                     
                     // Parse each detection
                     for (const auto& item : j)
@@ -526,18 +534,6 @@ namespace sample_company {
                             
                             if (w <= 0.0f || h <= 0.0f)
                                 continue;
-                            
-                            // Get JPEG dimensions from request (we need to track them separately)
-                            // For now, assume frame is ~640 width (downscaled)
-                            // This should be passed explicitly in future
-                            int frameW = 640;
-                            int frameH = 480;
-                            
-                            // Try to get from response metadata if available
-                            if (item.count("img_width"))
-                                frameW = item.value("img_width", 640);
-                            if (item.count("img_height"))
-                                frameH = item.value("img_height", 480);
                             
                             // Normalize coordinates
                             float xNorm = x / static_cast<float>(frameW);
