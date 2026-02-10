@@ -11,6 +11,7 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn/dnn.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 #include <nx/sdk/i_plugin_diagnostic_event.h>
 #include <nx/sdk/analytics/helpers/event_metadata.h>

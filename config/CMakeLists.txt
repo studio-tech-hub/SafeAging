@@ -3,6 +3,7 @@
 cmake_minimum_required(VERSION 3.15)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 project(yolov8_people_analytics_plugin)
+set(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
 
 set(metadataSdkVersion "6.0.6.41837")
 set(metadataSdkDir "" CACHE PATH
@@ -73,8 +74,14 @@ endif()
 message(STATUS "Found Conan: ${CONAN_CMD}")
 
 if(WIN32)
-    set(CONAN_VS_RUNTIME_MT_SETTING "compiler.runtime=MT")
+    set(CONAN_SETTINGS
+        "compiler=Visual Studio"
+        "compiler.version=17"
+        "compiler.runtime=MT"
+        "compiler.toolset=v142"
+    )
 endif()
+
 set(OPENCV_OPTIONS
     opencv:parallel=False
     opencv:contrib=True
@@ -104,18 +111,20 @@ if(UNIX)
     )
 endif()
 
-conan_cmake_run(BUILD_TYPE "Release")
+conan_cmake_run(BUILD_TYPE "Release" SETTINGS ${CONAN_SETTINGS})
+
 conan_cmake_configure(REQUIRES opencv/4.5.5
     GENERATORS cmake_find_package
     OPTIONS ${OPENCV_OPTIONS}
-    SETTINGS ${CONAN_VS_RUNTIME_MT_SETTING}
+    SETTINGS ${CONAN_SETTINGS}
 )
 
 conan_cmake_install(PATH_OR_REFERENCE .
     OPTIONS ${OPENCV_OPTIONS}
-    SETTINGS ${CONAN_VS_RUNTIME_MT_SETTING}
+    SETTINGS ${CONAN_SETTINGS}
     BUILD missing
 )
+
 
 find_package(OpenCV REQUIRED)
 
@@ -190,7 +199,8 @@ target_compile_definitions(nx_sdk PRIVATE NX_PLUGIN_API=${API_EXPORT_MACRO})
 #--------------------------------------------------------------------------------------------------
 # Define opencv_object_detection_analytics_plugin lib, dynamic, depends on nx_kit and nx_sdk.
 
-set(OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR ${CMAKE_CURRENT_LIST_DIR}/src)
+set(OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR
+    ${PROJECT_ROOT}/src/sample_company/vms_server_plugins/opencv_object_detection)
 file(GLOB_RECURSE OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/*)
 
@@ -198,7 +208,7 @@ add_library(yolov8_people_analytics_plugin SHARED
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC})
 target_include_directories(yolov8_people_analytics_plugin PRIVATE 
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}
-    ${CMAKE_CURRENT_LIST_DIR}/3rd_party
+    ${PROJECT_ROOT}/3rd_party
 )
 target_link_libraries(yolov8_people_analytics_plugin
     nx_kit
