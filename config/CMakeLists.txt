@@ -87,7 +87,7 @@ set(OPENCV_OPTIONS
     opencv:contrib=True
     opencv:contrib_freetype=False
     opencv:contrib_sfm=False
-    opencv:with_jpeg=False 
+    opencv:with_jpeg=libjpeg
     opencv:with_png=False
     opencv:with_tiff=False
     opencv:with_jpeg2000=False
@@ -206,6 +206,10 @@ file(GLOB_RECURSE OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC
 
 add_library(yolov8_people_analytics_plugin SHARED
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC})
+set_source_files_properties(
+    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/object_tracker.cpp
+    PROPERTIES COMPILE_FLAGS "/Od"
+)
 target_include_directories(yolov8_people_analytics_plugin PRIVATE 
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}
     ${PROJECT_ROOT}/3rd_party

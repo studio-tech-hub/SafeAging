@@ -457,11 +457,10 @@ namespace sample_company {
                     thread_local httplib::Client cli("127.0.0.1", 18000);
                     cli.set_keep_alive(true);
                     
-                    // ⚠️ SHORT TIMEOUT FOR MVP: fail-fast if AI service is slow
-                    // 1.5 seconds total (fail-fast instead of blocking Nx)
-                    cli.set_connection_timeout(0, 500000);  // 500ms
-                    cli.set_read_timeout(1, 0);             // 1s
-                    cli.set_write_timeout(0, 500000);       // 500ms
+                    // Longer timeouts for high-res GPU inference (avoid client cancel -> 500)
+                    cli.set_connection_timeout(2, 0);  // 2s
+                    cli.set_read_timeout(15, 0);       // 15s
+                    cli.set_write_timeout(2, 0);       // 2s
                     
                     static int s_reqCount = 0;
                     if ((++s_reqCount % 20) == 0)

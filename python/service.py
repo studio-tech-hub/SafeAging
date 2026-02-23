@@ -3,6 +3,7 @@ import json
 import time
 import logging
 import os
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -15,6 +16,16 @@ import torch
 
 # Import fall detection module
 from fall_detection import FallDetectionManager
+
+# ============================
+# Logging Configuration
+# ============================
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Fix PyTorch 2.6 compatibility issue with YOLO weights
 if hasattr(torch.serialization, 'add_safe_globals'):
@@ -34,84 +45,214 @@ import uvicorn
 # ============================
 # PyTorch 2.6+ Compatibility Fix
 # ============================
-import torch
 if hasattr(torch.serialization, 'add_safe_globals'):
     try:
         from ultralytics.nn.tasks import DetectionModel
         torch.serialization.add_safe_globals([DetectionModel])
-    except Exception as e:
+    except Exception:
         pass  # Silently continue if fix not needed
-
-# ============================
-# Logging Configuration
-# ============================
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
 
 # ============================
 # Configuration
 # ============================
-SERVICE_PORT = int(os.getenv("SERVICE_PORT", "18000"))
-SERVICE_HOST = os.getenv("SERVICE_HOST", "127.0.0.1")
-MODEL_PATH = os.getenv("MODEL_PATH", "yolov8n.pt")
-CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.35"))  # Optimized: 35% catches small people better
-IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.45"))  # IoU for NMS
-MIN_DETECTION_AREA = int(os.getenv("MIN_DETECTION_AREA", "20"))  # Catch even small people at distance
-TRACK_TTL = float(os.getenv("TRACK_TTL", "15.0"))  # Keep tracks for 15 seconds
-IOA_THRESHOLD = float(os.getenv("IOA_THRESHOLD", "0.05"))  # Track matching threshold
-FLICKER_REUSE_TIME = float(os.getenv("FLICKER_REUSE_TIME", "1.0"))  # Anti-flicker reuse time
+def _load_local_env() -> None:
+    """Load KEY=VALUE pairs from .env without overwriting existing env vars."""
+    candidates = [
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent / ".env",
+        Path(__file__).resolve().parent.parent / ".env",
+    ]
+    env_path = next((p for p in candidates if p.exists()), None)
+    if env_path is None:
+        return
 
-# ============================
-# Fall Detection Configuration
-# ============================
-ENABLE_FALL_DETECTION = os.getenv("ENABLE_FALL_DETECTION", "true").lower() == "true"
-FALL_VELOCITY_THRESHOLD = float(os.getenv("FALL_VELOCITY_THRESHOLD", "20.0"))  # Pixels per frame
-FALL_ANGLE_CHANGE_THRESHOLD = float(os.getenv("FALL_ANGLE_CHANGE_THRESHOLD", "45.0"))  # Degrees
-FALL_ASPECT_RATIO_THRESHOLD = float(os.getenv("FALL_ASPECT_RATIO_THRESHOLD", "1.5"))  # Width/Height ratio
-FALL_CONFIDENCE_THRESHOLD = float(os.getenv("FALL_CONFIDENCE_THRESHOLD", "0.8"))  # 80% confidence for fall
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception as e:
+        logger.warning(f"Could not load .env file: {e}")
 
-# ============================
-# Production Settings (Optimized for wide-angle cameras - ENABLED by default)
-# ============================
-ENABLE_CLAHE = os.getenv("ENABLE_CLAHE", "true").lower() == "true"
-ENABLE_MULTI_SCALE = os.getenv("ENABLE_MULTI_SCALE", "true").lower() == "true"
-ENABLE_FRAME_ENHANCEMENT = os.getenv("ENABLE_FRAME_ENHANCEMENT", "false").lower() == "true"
-CLAHE_CLIP_LIMIT = float(os.getenv("CLAHE_CLIP_LIMIT", "2.0"))
-CLAHE_TILE_SIZE = int(os.getenv("CLAHE_TILE_SIZE", "16"))
-SAVE_DEBUG_SAMPLES = os.getenv("SAVE_DEBUG_SAMPLES", "false").lower() == "true"
 
-# ============================
-# Wide-Angle Optimization: ROI (Region of Interest) - ENABLED by default
-# ============================
-# Crop to relevant area only (e.g., doorway, walkway) to catch smaller people
-ENABLE_ROI = os.getenv("ENABLE_ROI", "true").lower() == "true"
-ROI_TYPE = os.getenv("ROI_TYPE", "rect")  # "rect" or "polygon"
-# Rectangle ROI: specify as percentage of frame (0.0-1.0)
-ROI_X_MIN = float(os.getenv("ROI_X_MIN", "0.0"))    # Left edge percentage
-ROI_X_MAX = float(os.getenv("ROI_X_MAX", "1.0"))    # Right edge percentage
-ROI_Y_MIN = float(os.getenv("ROI_Y_MIN", "0.3"))    # Top edge percentage (skip ceiling/roof)
-ROI_Y_MAX = float(os.getenv("ROI_Y_MAX", "1.0"))    # Bottom edge percentage (full height below)
-# Polygon ROI: JSON array of [x,y] points as percentages
-ROI_POLYGON_JSON = os.getenv("ROI_POLYGON_JSON", "")
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-# ============================
-# Wide-Angle Optimization: Undistortion - ENABLED by default
-# ============================
-# For wide-angle/fisheye cameras, undistort first to normalize geometry
-ENABLE_UNDISTORT = os.getenv("ENABLE_UNDISTORT", "true").lower() == "true"
-CAMERA_MATRIX_JSON = os.getenv("CAMERA_MATRIX_JSON", "")  # 3x3 intrinsic matrix as JSON
-DISTORTION_COEFFS_JSON = os.getenv("DISTORTION_COEFFS_JSON", "")  # k1,k2,p1,p2,k3... as JSON
-CALIBRATION_FILE = os.getenv("CALIBRATION_FILE", "camera_calibration.json")
 
-# ============================
-# Inference Image Size
-# ============================
-# Increased from 640 to 960 for better small object detection (after ROI crop)
-YOLO_IMGSZ = int(os.getenv("YOLO_IMGSZ", "960"))
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid int for {name}='{raw}', using default {default}")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(f"Invalid float for {name}='{raw}', using default {default}")
+        return default
+
+
+def _clamp(value: float, low: float, high: float, name: str) -> float:
+    if value < low:
+        logger.warning(f"{name}={value} is below {low}, clamping to {low}")
+        return low
+    if value > high:
+        logger.warning(f"{name}={value} is above {high}, clamping to {high}")
+        return high
+    return value
+
+
+class AppConfig:
+    def __init__(self) -> None:
+        cuda_available = torch.cuda.is_available()
+
+        self.service_port = _env_int("SERVICE_PORT", 18000)
+        self.service_host = os.getenv("SERVICE_HOST", "127.0.0.1")
+        self.model_path = os.getenv("MODEL_PATH", "yolov8n.pt")
+        self.confidence_threshold = _clamp(_env_float("CONFIDENCE_THRESHOLD", 0.20), 0.0, 1.0, "CONFIDENCE_THRESHOLD")
+        self.iou_threshold = _clamp(_env_float("IOU_THRESHOLD", 0.45), 0.0, 1.0, "IOU_THRESHOLD")
+        self.min_detection_area = max(1, _env_int("MIN_DETECTION_AREA", 20))
+        self.track_ttl = max(1.0, _env_float("TRACK_TTL", 15.0))
+        self.ioa_threshold = _clamp(_env_float("IOA_THRESHOLD", 0.05), 0.0, 1.0, "IOA_THRESHOLD")
+        self.flicker_reuse_time = max(0.0, _env_float("FLICKER_REUSE_TIME", 1.0))
+
+        # Defaults fixed for your workflow: run service directly without env setup.
+        self.bbox_smoothing = _clamp(_env_float("BBOX_SMOOTHING", 0.6), 0.0, 1.0, "BBOX_SMOOTHING")
+        self.enable_post_nms = _env_bool("ENABLE_POST_NMS", True)
+        self.post_nms_iou = _clamp(_env_float("POST_NMS_IOU", 0.6), 0.0, 1.0, "POST_NMS_IOU")
+        self.match_iou_threshold = _clamp(_env_float("MATCH_IOU_THRESHOLD", 0.20), 0.0, 1.0, "MATCH_IOU_THRESHOLD")
+        self.max_center_distance_ratio = _clamp(
+            _env_float("MAX_CENTER_DISTANCE_RATIO", 1.2), 0.1, 10.0, "MAX_CENTER_DISTANCE_RATIO"
+        )
+        self.new_track_min_confidence = _clamp(
+            _env_float("NEW_TRACK_MIN_CONFIDENCE", 0.35), 0.0, 1.0, "NEW_TRACK_MIN_CONFIDENCE"
+        )
+        self.track_duplicate_iou = _clamp(
+            _env_float("TRACK_DUPLICATE_IOU", 0.65), 0.0, 1.0, "TRACK_DUPLICATE_IOU"
+        )
+        self.track_output_hold_time = max(0.0, _env_float("TRACK_OUTPUT_HOLD_TIME", 0.8))
+        self.enable_history_rematch = _env_bool("ENABLE_HISTORY_REMATCH", False)
+
+        self.enable_fall_detection = _env_bool("ENABLE_FALL_DETECTION", True)
+        self.fall_velocity_threshold = max(0.0, _env_float("FALL_VELOCITY_THRESHOLD", 20.0))
+        self.fall_angle_change_threshold = max(0.0, _env_float("FALL_ANGLE_CHANGE_THRESHOLD", 45.0))
+        self.fall_aspect_ratio_threshold = max(0.0, _env_float("FALL_ASPECT_RATIO_THRESHOLD", 1.5))
+        self.fall_confidence_threshold = _clamp(_env_float("FALL_CONFIDENCE_THRESHOLD", 0.8), 0.0, 1.0, "FALL_CONFIDENCE_THRESHOLD")
+
+        self.enable_clahe = _env_bool("ENABLE_CLAHE", True)
+        self.enable_multi_scale = _env_bool("ENABLE_MULTI_SCALE", True)
+        self.enable_frame_enhancement = _env_bool("ENABLE_FRAME_ENHANCEMENT", False)
+        self.clahe_clip_limit = max(0.1, _env_float("CLAHE_CLIP_LIMIT", 2.0))
+        self.clahe_tile_size = max(2, _env_int("CLAHE_TILE_SIZE", 16))
+        self.save_debug_samples = _env_bool("SAVE_DEBUG_SAMPLES", False)
+
+        self.enable_roi = _env_bool("ENABLE_ROI", True)
+        self.roi_type = os.getenv("ROI_TYPE", "rect").strip().lower()
+        if self.roi_type not in {"rect", "polygon"}:
+            logger.warning(f"Invalid ROI_TYPE='{self.roi_type}', fallback to 'rect'")
+            self.roi_type = "rect"
+        self.roi_x_min = _clamp(_env_float("ROI_X_MIN", 0.0), 0.0, 1.0, "ROI_X_MIN")
+        self.roi_x_max = _clamp(_env_float("ROI_X_MAX", 1.0), 0.0, 1.0, "ROI_X_MAX")
+        self.roi_y_min = _clamp(_env_float("ROI_Y_MIN", 0.3), 0.0, 1.0, "ROI_Y_MIN")
+        self.roi_y_max = _clamp(_env_float("ROI_Y_MAX", 1.0), 0.0, 1.0, "ROI_Y_MAX")
+        self.roi_polygon_json = os.getenv("ROI_POLYGON_JSON", "")
+
+        if self.roi_x_min >= self.roi_x_max:
+            logger.warning("ROI_X_MIN must be < ROI_X_MAX, fallback to [0.0, 1.0]")
+            self.roi_x_min, self.roi_x_max = 0.0, 1.0
+        if self.roi_y_min >= self.roi_y_max:
+            logger.warning("ROI_Y_MIN must be < ROI_Y_MAX, fallback to [0.3, 1.0]")
+            self.roi_y_min, self.roi_y_max = 0.3, 1.0
+
+        self.enable_undistort = _env_bool("ENABLE_UNDISTORT", True)
+        self.camera_matrix_json = os.getenv("CAMERA_MATRIX_JSON", "")
+        self.distortion_coeffs_json = os.getenv("DISTORTION_COEFFS_JSON", "")
+        self.calibration_file = os.getenv("CALIBRATION_FILE", "camera_calibration.json")
+
+        self.yolo_imgsz = max(64, _env_int("YOLO_IMGSZ", 1280))
+
+        self.device = os.getenv("DEVICE", "cuda:0" if cuda_available else "cpu")
+        self.use_half = _env_bool("USE_HALF", False)
+        if not self.device.startswith("cuda"):
+            self.use_half = False
+        self.torch_cudnn_benchmark = _env_bool("TORCH_CUDNN_BENCHMARK", True)
+
+
+_load_local_env()
+CONFIG = AppConfig()
+
+# Keep old names to avoid touching downstream inference logic.
+SERVICE_PORT = CONFIG.service_port
+SERVICE_HOST = CONFIG.service_host
+MODEL_PATH = CONFIG.model_path
+CONFIDENCE_THRESHOLD = CONFIG.confidence_threshold
+IOU_THRESHOLD = CONFIG.iou_threshold
+MIN_DETECTION_AREA = CONFIG.min_detection_area
+TRACK_TTL = CONFIG.track_ttl
+IOA_THRESHOLD = CONFIG.ioa_threshold
+FLICKER_REUSE_TIME = CONFIG.flicker_reuse_time
+BBOX_SMOOTHING = CONFIG.bbox_smoothing
+ENABLE_POST_NMS = CONFIG.enable_post_nms
+POST_NMS_IOU = CONFIG.post_nms_iou
+MATCH_IOU_THRESHOLD = CONFIG.match_iou_threshold
+MAX_CENTER_DISTANCE_RATIO = CONFIG.max_center_distance_ratio
+NEW_TRACK_MIN_CONFIDENCE = CONFIG.new_track_min_confidence
+TRACK_DUPLICATE_IOU = CONFIG.track_duplicate_iou
+TRACK_OUTPUT_HOLD_TIME = CONFIG.track_output_hold_time
+ENABLE_HISTORY_REMATCH = CONFIG.enable_history_rematch
+ENABLE_FALL_DETECTION = CONFIG.enable_fall_detection
+FALL_VELOCITY_THRESHOLD = CONFIG.fall_velocity_threshold
+FALL_ANGLE_CHANGE_THRESHOLD = CONFIG.fall_angle_change_threshold
+FALL_ASPECT_RATIO_THRESHOLD = CONFIG.fall_aspect_ratio_threshold
+FALL_CONFIDENCE_THRESHOLD = CONFIG.fall_confidence_threshold
+ENABLE_CLAHE = CONFIG.enable_clahe
+ENABLE_MULTI_SCALE = CONFIG.enable_multi_scale
+ENABLE_FRAME_ENHANCEMENT = CONFIG.enable_frame_enhancement
+CLAHE_CLIP_LIMIT = CONFIG.clahe_clip_limit
+CLAHE_TILE_SIZE = CONFIG.clahe_tile_size
+SAVE_DEBUG_SAMPLES = CONFIG.save_debug_samples
+ENABLE_ROI = CONFIG.enable_roi
+ROI_TYPE = CONFIG.roi_type
+ROI_X_MIN = CONFIG.roi_x_min
+ROI_X_MAX = CONFIG.roi_x_max
+ROI_Y_MIN = CONFIG.roi_y_min
+ROI_Y_MAX = CONFIG.roi_y_max
+ROI_POLYGON_JSON = CONFIG.roi_polygon_json
+ENABLE_UNDISTORT = CONFIG.enable_undistort
+CAMERA_MATRIX_JSON = CONFIG.camera_matrix_json
+DISTORTION_COEFFS_JSON = CONFIG.distortion_coeffs_json
+CALIBRATION_FILE = CONFIG.calibration_file
+YOLO_IMGSZ = CONFIG.yolo_imgsz
+DEVICE = CONFIG.device
+USE_HALF = CONFIG.use_half
+TORCH_CUDNN_BENCHMARK = CONFIG.torch_cudnn_benchmark
+
+if DEVICE.startswith("cuda"):
+    try:
+        torch.backends.cudnn.benchmark = TORCH_CUDNN_BENCHMARK
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
 logger.info(f"="*60)
 logger.info(f"YOLOv8 People Analytics Service")
@@ -122,12 +263,19 @@ logger.info(f"Model: {MODEL_PATH}")
 logger.info(f"Confidence: {CONFIDENCE_THRESHOLD}")
 logger.info(f"IOU: {IOU_THRESHOLD}")
 logger.info(f"ImgSize: {YOLO_IMGSZ}")
+logger.info(f"Device: {DEVICE} | FP16: {USE_HALF}")
 logger.info(f"="*60)
 logger.info(f"CLAHE: {ENABLE_CLAHE}")
 logger.info(f"Multi-Scale: {ENABLE_MULTI_SCALE}")
 logger.info(f"Frame Enhancement: {ENABLE_FRAME_ENHANCEMENT}")
 logger.info(f"ROI: {ENABLE_ROI} (type={ROI_TYPE})")
 logger.info(f"Undistort: {ENABLE_UNDISTORT}")
+logger.info(f"="*60)
+logger.info(
+    f"Tracking: post_nms={ENABLE_POST_NMS} iou={POST_NMS_IOU} "
+    f"match_iou={MATCH_IOU_THRESHOLD} dup_iou={TRACK_DUPLICATE_IOU} "
+    f"hold={TRACK_OUTPUT_HOLD_TIME}s history_rematch={ENABLE_HISTORY_REMATCH}"
+)
 logger.info(f"="*60)
 logger.info(f"Fall Detection: {ENABLE_FALL_DETECTION}")
 if ENABLE_FALL_DETECTION:
@@ -161,7 +309,14 @@ def load_model():
         
         try:
             model = YOLO(MODEL_PATH)
-            model.to('cpu')
+            try:
+                model.fuse()  # fuse Conv+BN for speed
+            except Exception:
+                pass
+            try:
+                model.to(DEVICE)
+            except Exception as e:
+                logger.warning(f"Failed to move model to {DEVICE}: {e}")
             logger.info(f"✅ YOLO model loaded successfully")
         finally:
             # Restore original torch.load
@@ -520,7 +675,8 @@ def multi_scale_inference_smart(yolo_model, frame: np.ndarray, original_h: int, 
         imgsz=YOLO_IMGSZ,
         verbose=False,
         augment=False,
-        device='cpu',
+        device=DEVICE,
+        half=USE_HALF,
     )[0]
     
     # If detections found, return them
@@ -540,7 +696,8 @@ def multi_scale_inference_smart(yolo_model, frame: np.ndarray, original_h: int, 
         imgsz=YOLO_IMGSZ,
         verbose=False,
         augment=False,
-        device='cpu',
+        device=DEVICE,
+        half=USE_HALF,
     )[0]
     
     # Scale boxes back to original size
@@ -621,6 +778,74 @@ def iou(a, b) -> float:
     if area_a <= 0.0 or area_b <= 0.0:
         return 0.0
     return inter / (area_a + area_b - inter + 1e-6)
+
+def center_distance_ratio(a, b) -> float:
+    """
+    Center distance normalized by average bbox diagonal.
+    Lower is better (0 = same center).
+    """
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    acx = 0.5 * (ax1 + ax2)
+    acy = 0.5 * (ay1 + ay2)
+    bcx = 0.5 * (bx1 + bx2)
+    bcy = 0.5 * (by1 + by2)
+    dist = ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5
+
+    aw = max(1.0, ax2 - ax1)
+    ah = max(1.0, ay2 - ay1)
+    bw = max(1.0, bx2 - bx1)
+    bh = max(1.0, by2 - by1)
+    diag_a = (aw * aw + ah * ah) ** 0.5
+    diag_b = (bw * bw + bh * bh) ** 0.5
+    norm = max(1.0, 0.5 * (diag_a + diag_b))
+    return dist / norm
+
+def smooth_bbox(old_bbox: tuple, new_bbox: tuple, alpha: float) -> tuple:
+    """Exponential smoothing for bbox to reduce jitter (alpha = weight of new bbox)."""
+    if alpha <= 0.0:
+        return old_bbox
+    if alpha >= 1.0:
+        return new_bbox
+    ox1, oy1, ox2, oy2 = old_bbox
+    nx1, ny1, nx2, ny2 = new_bbox
+    return (
+        ox1 * (1.0 - alpha) + nx1 * alpha,
+        oy1 * (1.0 - alpha) + ny1 * alpha,
+        ox2 * (1.0 - alpha) + nx2 * alpha,
+        oy2 * (1.0 - alpha) + ny2 * alpha,
+    )
+
+def post_nms_dedupe(dets: List[Dict[str, float]], iou_thresh: float) -> List[Dict[str, float]]:
+    """
+    Extra IoU-based dedupe after YOLO NMS to avoid overlapping boxes for the same person.
+    Keeps highest-score boxes.
+    """
+    if len(dets) <= 1:
+        return dets
+    dets_sorted = sorted(dets, key=lambda d: d["score"], reverse=True)
+    kept: List[Dict[str, float]] = []
+    for det in dets_sorted:
+        if all(iou(det["bbox"], k["bbox"]) < iou_thresh for k in kept):
+            kept.append(det)
+    return kept
+
+def has_duplicate_track_overlap(
+    det_box: tuple,
+    track_by_id: Dict[int, Dict[str, Any]],
+    now_ts: float,
+    overlap_iou: float,
+    recent_only_sec: float,
+) -> bool:
+    """Prevent creating a new track for the same person when detections are duplicated."""
+    for tr in track_by_id.values():
+        last_seen = tr.get("last_seen", 0.0)
+        if now_ts - last_seen > recent_only_sec:
+            continue
+        if iou(det_box, tr["bbox"]) >= overlap_iou:
+            return True
+    return False
 
 # ============================
 # Health Check Endpoint
@@ -787,7 +1012,8 @@ def infer(req: InferRequest):
                     imgsz=YOLO_IMGSZ,  # 960 for better small object detection (after ROI crop)
                     verbose=False,
                     augment=False,  # No test-time augmentation in production
-                    device='cpu',  # Force CPU for stability
+                    device=DEVICE,
+                    half=USE_HALF,
                 )[0]
             
             inference_time_ms = (time.time() - inference_start) * 1000
@@ -809,12 +1035,13 @@ def infer(req: InferRequest):
         tracks = state["tracks"]
         next_id = state["next_id"]
 
-        new_tracks = []
         detections: List[Detection] = []
 
         # ============================================
         # 3) Process YOLO outputs with tracking
         # ============================================
+        # Build raw detections first (for optional extra NMS)
+        raw_dets: List[Dict[str, float]] = []
         for box in r.boxes:
             try:
                 cls_id = int(box.cls[0].item())
@@ -833,39 +1060,70 @@ def infer(req: InferRequest):
                 w_box = x2 - x1
                 h_box = y2 - y1
                 area = w_box * h_box
-                
+
                 # Filter by minimum area
                 if w_box <= 1.0 or h_box <= 1.0 or area < MIN_DETECTION_AREA:
                     logger.debug(f"[{camera_id}] Skipping small detection: {w_box:.1f}x{h_box:.1f} (area={area:.0f} < {MIN_DETECTION_AREA})")
                     continue
 
                 det_box = (x1, y1, x2, y2)
+                raw_dets.append({"bbox": det_box, "score": score})
+            except Exception as e:
+                logger.warning(f"[{camera_id}] Error parsing box: {type(e).__name__}: {e}")
+                continue
+
+        # Extra dedupe to avoid overlapping boxes for the same person
+        if ENABLE_POST_NMS and len(raw_dets) > 1:
+            raw_dets = post_nms_dedupe(raw_dets, POST_NMS_IOU)
+
+        # Track state (persistent)
+        track_by_id = {tr["id"]: tr for tr in tracks}
+        matched_ids = set()
+        output_track_ids = set()
+
+        for det in raw_dets:
+            try:
+                det_box = det["bbox"]
+                score = det["score"]
+                x1, y1, x2, y2 = det_box
+                w_box = x2 - x1
+                h_box = y2 - y1
 
                 # ============================================
                 # Track matching: find best match using IoU + Appearance
                 # ============================================
                 det_appearance = extract_appearance(frame, det_box)
                 best_score, best_tr = -1.0, None
-                
+
                 # FIRST: Try to match against active tracks
-                for tr in tracks:
+                for tr in track_by_id.values():
+                    if tr.get("id") in matched_ids:
+                        continue
                     iou_score = iou(det_box, tr["bbox"])
-                    
+                    center_ratio = center_distance_ratio(det_box, tr["bbox"])
+
+                    # Hard gating to avoid cross-matching close objects with wrong IDs.
+                    if iou_score < MATCH_IOU_THRESHOLD and center_ratio > MAX_CENTER_DISTANCE_RATIO:
+                        continue
+
                     # Always try to compare appearance if we have it
                     if tr.get("appearance") and det_appearance["color_hist"] is not None:
                         app_dist = appearance_distance(tr["appearance"]["color_hist"], det_appearance["color_hist"])
-                        match_score = combined_track_score(iou_score, app_dist)
+                        app_similarity = 1.0 - app_dist
+                        match_score = 0.85 * iou_score + 0.15 * app_similarity
                     else:
                         # Fall back to IoU only
                         match_score = iou_score
-                    
+
                     if match_score > best_score:
                         best_score, best_tr = match_score, tr
 
                 # SECOND: If no good active track match, search track history
-                # This allows re-matching people who left and came back
-                if (best_tr is None or best_score < IOA_THRESHOLD) and state["track_history"]:
+                # Disabled by default for stability (can be enabled by env if needed).
+                if ENABLE_HISTORY_REMATCH and (best_tr is None or best_score < MATCH_IOU_THRESHOLD) and state["track_history"]:
                     for hist_tr in state["track_history"]:
+                        if hist_tr.get("id") in matched_ids:
+                            continue
                         # Only match if appearance is similar enough (less reliance on position)
                         if hist_tr.get("appearance") and det_appearance["color_hist"] is not None:
                             app_dist = appearance_distance(hist_tr["appearance"]["color_hist"], det_appearance["color_hist"])
@@ -876,51 +1134,77 @@ def infer(req: InferRequest):
                                     best_score, best_tr = hist_score, hist_tr
                                     logger.debug(f"[{camera_id}] Re-matched track ID={hist_tr['id']} from history (app_dist={app_dist:.2f})")
 
-                # Track matching threshold: adjust based on appearance quality
-                match_threshold = IOA_THRESHOLD
-                if best_tr is not None and det_appearance["color_hist"] is not None and best_tr.get("appearance"):
-                    app_dist = appearance_distance(best_tr["appearance"]["color_hist"], det_appearance["color_hist"])
-                    # If appearance is very similar, lower threshold significantly
-                    if app_dist < 0.3:
-                        match_threshold = 0.05  # More forgiving if colors match
-                
-                if best_tr is not None and best_score >= match_threshold:
-                    # Existing track: update position and appearance
+                match_threshold = MATCH_IOU_THRESHOLD
+
+                if best_tr is not None and best_score >= match_threshold and best_tr.get("id") not in matched_ids:
+                    # Existing track: update position and appearance (with smoothing)
                     track_id = best_tr["id"]
-                    best_tr["bbox"] = det_box
+                    if BBOX_SMOOTHING > 0.0 and best_tr.get("bbox"):
+                        best_tr["bbox"] = smooth_bbox(best_tr["bbox"], det_box, BBOX_SMOOTHING)
+                    else:
+                        best_tr["bbox"] = det_box
                     best_tr["last_seen"] = now
                     best_tr["appearance"] = det_appearance
-                    # If this was from history, bring it back to active tracks
-                    if best_tr not in tracks:
-                        tracks.append(best_tr)
+                    best_tr["score"] = score
+                    track_by_id[track_id] = best_tr
                 else:
                     # New track
+                    if score < NEW_TRACK_MIN_CONFIDENCE:
+                        continue
+
+                    if has_duplicate_track_overlap(
+                        det_box=det_box,
+                        track_by_id=track_by_id,
+                        now_ts=now,
+                        overlap_iou=TRACK_DUPLICATE_IOU,
+                        recent_only_sec=max(TRACK_OUTPUT_HOLD_TIME, 0.5),
+                    ):
+                        # This detection is likely a duplicate of an already tracked person.
+                        continue
+
                     track_id = next_id
                     next_id += 1
                     best_tr = {
-                        "id": track_id, 
-                        "bbox": det_box, 
+                        "id": track_id,
+                        "bbox": det_box,
                         "last_seen": now,
                         "created_at": now,
-                        "appearance": det_appearance
+                        "appearance": det_appearance,
+                        "score": score,
                     }
+                    track_by_id[track_id] = best_tr
 
-                new_tracks.append(best_tr)
-
-                # Create detection object for C++ plugin
-                detections.append(Detection(
-                    cls="person",
-                    score=score,
-                    x=float(x1),
-                    y=float(y1),
-                    w=float(w_box),
-                    h=float(h_box),
-                    track_id=int(track_id)
-                ))
-                
+                matched_ids.add(track_id)
+                output_track_ids.add(track_id)
             except Exception as e:
-                logger.warning(f"[{camera_id}] Error processing box: {type(e).__name__}: {e}")
+                logger.warning(f"[{camera_id}] Error processing detection: {type(e).__name__}: {e}")
                 continue
+
+        # Keep recent tracks for a short time to avoid flicker on temporary misses.
+        for tr in track_by_id.values():
+            if now - tr.get("last_seen", 0.0) <= TRACK_OUTPUT_HOLD_TIME:
+                output_track_ids.add(tr["id"])
+
+        # Build final detections from stable track state (one bbox per track_id).
+        detections = []
+        for track_id in sorted(output_track_ids):
+            tr = track_by_id.get(track_id)
+            if not tr:
+                continue
+            x1, y1, x2, y2 = tr["bbox"]
+            w_box = max(0.0, x2 - x1)
+            h_box = max(0.0, y2 - y1)
+            if w_box <= 1.0 or h_box <= 1.0:
+                continue
+            detections.append(Detection(
+                cls="person",
+                score=float(tr.get("score", 0.0)),
+                x=float(x1),
+                y=float(y1),
+                w=float(w_box),
+                h=float(h_box),
+                track_id=int(track_id)
+            ))
 
         # ============================================
         # 3.2) Fall Detection (NEW)
@@ -980,19 +1264,22 @@ def infer(req: InferRequest):
         # ============================================
         # Keep active tracks for ~15 seconds, move very old ones to history for re-matching
         old_count = len(state["tracks"])
-        
+
         # Separate active tracks from expired ones
         active_tracks = []
         expired_tracks = []
-        for tr in new_tracks:
+        for tr in track_by_id.values():
             if now - tr["last_seen"] <= TRACK_TTL:  # 15 seconds
                 active_tracks.append(tr)
             else:
                 expired_tracks.append(tr)
         
-        # Move expired tracks to history (keep for 30 seconds for re-matching)
-        state["track_history"] = [tr for tr in state["track_history"] if now - tr.get("last_seen", now) <= 30.0]
-        state["track_history"].extend(expired_tracks)
+        # Move expired tracks to history only when history rematch is enabled.
+        if ENABLE_HISTORY_REMATCH:
+            state["track_history"] = [tr for tr in state["track_history"] if now - tr.get("last_seen", now) <= 30.0]
+            state["track_history"].extend(expired_tracks)
+        else:
+            state["track_history"] = []
         
         state["tracks"] = active_tracks
         removed = old_count - len(state["tracks"])
