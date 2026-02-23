@@ -57,7 +57,8 @@ protected:
 
     virtual bool pushUncompressedVideoFrame(
         const nx::sdk::analytics::IUncompressedVideoFrame* videoFrame) override;
-
+    virtual bool pullMetadataPackets(
+        std::vector<nx::sdk::analytics::IMetadataPacket*>* metadataPackets) override;
     virtual void doSetNeededMetadataTypes(
         nx::sdk::Result<void>* outValue,
         const nx::sdk::analytics::IMetadataTypes* neededMetadataTypes) override;
@@ -81,7 +82,7 @@ private:
     void workerThreadRun();
     
     // Encode frame to JPEG bytes
-    std::vector<uint8_t> encodeFrameToJpeg(const Frame& frame, int targetWidth = 640);
+    std::vector<uint8_t> encodeFrameToJpeg(const Frame& frame, int targetWidth = 0);
     
     // Process queued frame job and return metadata packets
     MetadataPacketList processFrameJob(const FrameJob& job);

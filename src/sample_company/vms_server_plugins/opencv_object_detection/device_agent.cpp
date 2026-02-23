@@ -27,26 +27,28 @@
 #include "exceptions.h"
 #include "frame.h"
 
-namespace sample_company {
-    namespace vms_server_plugins {
-        namespace opencv_object_detection {
+namespace sample_company
+{
+    namespace vms_server_plugins
+    {
+        namespace opencv_object_detection
+        {
 
             using namespace nx::sdk;
             using namespace nx::sdk::analytics;
             using namespace std::string_literals;
 
             DeviceAgent::DeviceAgent(
-                const nx::sdk::IDeviceInfo* deviceInfo,
+                const nx::sdk::IDeviceInfo *deviceInfo,
                 std::filesystem::path pluginHomeDir,
                 std::filesystem::path modelPath)
-                :
-                ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
-                m_pluginHomeDir(std::move(pluginHomeDir)),
-                m_modelPath(std::move(modelPath)),
-                m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
-                m_objectTracker(std::make_unique<ObjectTracker>()),
-                m_workerThread(&DeviceAgent::workerThreadRun, this),  // FLOW 2: Start worker thread
-                m_workerShouldStop(false)
+                : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
+                  m_pluginHomeDir(std::move(pluginHomeDir)),
+                  m_modelPath(std::move(modelPath)),
+                  m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
+                  m_objectTracker(std::make_unique<ObjectTracker>()),
+                  m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
+                  m_workerShouldStop(false)
             {
             }
 
@@ -70,36 +72,42 @@ namespace sample_company {
 {
     "eventTypes": [
         {
-            "id": ")json" + kDetectionEventType + R"json(",
+            "id": ")json" +
+                       kDetectionEventType + R"json(",
             "name": "Object detected"
         },
         {
-            "id": ")json" + kProlongedDetectionEventType + R"json(",
+            "id": ")json" +
+                       kProlongedDetectionEventType + R"json(",
             "name": "Object detected (prolonged)",
             "flags": "stateDependent"
         },
         {
-            "id": ")json" + kFallDetectedEventType + R"json(",
+            "id": ")json" +
+                       kFallDetectedEventType + R"json(",
             "name": "Fall detected",
             "flags": "stateDependent"
         }
     ],
     "supportedTypes": [
         {
-            "objectTypeId": ")json" + kPersonObjectType + R"json("
+            "objectTypeId": ")json" +
+                       kPersonObjectType + R"json("
         },
         {
-            "objectTypeId": ")json" + kCatObjectType + R"json("
+            "objectTypeId": ")json" +
+                       kCatObjectType + R"json("
         },
         {
-            "objectTypeId": ")json" + kDogObjectType + R"json("
+            "objectTypeId": ")json" +
+                       kDogObjectType + R"json("
         }
     ]
 }
 )json";
             }
 
-            bool DeviceAgent::pushUncompressedVideoFrame(const IUncompressedVideoFrame* videoFrame)
+            bool DeviceAgent::pushUncompressedVideoFrame(const IUncompressedVideoFrame *videoFrame)
             {
                 if (!videoFrame)
                     return false;
@@ -107,10 +115,10 @@ namespace sample_company {
                 if (m_frameIndex % 200 == 0)
                 {
                     std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                        << " w=" << videoFrame->width()
-                        << " h=" << videoFrame->height()
-                        << " lineSize0=" << videoFrame->lineSize(0)
-                        << std::endl;
+                              << " w=" << videoFrame->width()
+                              << " h=" << videoFrame->height()
+                              << " lineSize0=" << videoFrame->lineSize(0)
+                              << std::endl;
                 }
 
                 if (m_frameIndex % 200 == 0)
@@ -119,10 +127,11 @@ namespace sample_company {
                         nx::sdk::IPluginDiagnosticEvent::Level::info,
                         "Frame arrived",
                         ("frame#" + std::to_string(m_frameIndex) +
-                            " w=" + std::to_string(videoFrame->width()) +
-                            " h=" + std::to_string(videoFrame->height())).c_str());
+                         " w=" + std::to_string(videoFrame->width()) +
+                         " h=" + std::to_string(videoFrame->height()))
+                            .c_str());
                 }
-                
+
                 // Nếu detector đã bị terminate cứng (hiếm), chỉ báo 1 lần rồi bỏ qua frame.
                 m_terminated = m_terminated || m_objectDetector->isTerminated();
                 if (m_terminated)
@@ -143,7 +152,7 @@ namespace sample_company {
                 //         Instead, enqueue frame for async worker thread.
                 //         This callback returns immediately (NON-BLOCKING).
                 // ============================================================
-                
+
                 // 🔻 Process detection frames regularly:
                 const int kPeriod = kDetectionFramePeriod;
                 if (m_frameIndex % kPeriod == 0)
@@ -152,17 +161,18 @@ namespace sample_company {
                     {
                         // Convert Nx frame to OpenCV Mat for encoding
                         Frame frame(videoFrame, m_frameIndex);
-                        
-                        // Encode frame to JPEG with downscaling
-                        std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 640);
-                        
+
+                        // Encode frame to JPEG with downscale to ~720p width for faster, more stable detection.
+                        // 2560x1440 -> 1280x720 (keeps aspect ratio, no crop).
+                        std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
+
                         // Create frame job
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
-                        job.cameraId = "nx_camera";  // TODO: Get from device info
+                        job.cameraId = "nx_camera"; // TODO: Get from device info
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
-                        
+
                         // ⚠️ BACKPRESSURE: bounded queue (size 3)
                         // If queue is full, drop oldest frame and add newest
                         {
@@ -181,9 +191,9 @@ namespace sample_company {
                             }
                             m_frameQueue.push_back(std::move(job));
                         }
-                        m_frameQueueCV.notify_one();  // Wake up worker thread
+                        m_frameQueueCV.notify_one(); // Wake up worker thread
                     }
-                    catch (const std::exception& e)
+                    catch (const std::exception &e)
                     {
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::error,
@@ -193,12 +203,24 @@ namespace sample_company {
                 }
 
                 ++m_frameIndex;
-                return true;  // ✓ Frame callback returns immediately
+                return true; // ✓ Frame callback returns immediately
+            }
+
+            bool DeviceAgent::pullMetadataPackets(
+                std::vector<nx::sdk::analytics::IMetadataPacket *> *metadataPackets)
+            {
+                std::unique_lock<std::mutex> lk(m_metadataQueueMutex);
+                while (!m_metadataQueue.empty())
+                {
+                    metadataPackets->push_back(m_metadataQueue.front().releasePtr());
+                    m_metadataQueue.pop_front();
+                }
+                return true;
             }
 
             void DeviceAgent::doSetNeededMetadataTypes(
-                nx::sdk::Result<void>* outValue,
-                const nx::sdk::analytics::IMetadataTypes* /*neededMetadataTypes*/)
+                nx::sdk::Result<void> *outValue,
+                const nx::sdk::analytics::IMetadataTypes * /*neededMetadataTypes*/)
             {
                 pushPluginDiagnosticEvent(
                     nx::sdk::IPluginDiagnosticEvent::Level::info,
@@ -212,12 +234,12 @@ namespace sample_company {
                 {
                     m_objectDetector->ensureInitialized();
                 }
-                catch (const ObjectDetectorInitializationError& e)
+                catch (const ObjectDetectorInitializationError &e)
                 {
-                    *outValue = { ErrorCode::otherError, new String(e.what()) };
+                    *outValue = {ErrorCode::otherError, new String(e.what())};
                     m_terminated = true;
                 }
-                catch (const ObjectDetectorIsTerminatedError&)
+                catch (const ObjectDetectorIsTerminatedError &)
                 {
                     m_terminated = true;
                 }
@@ -235,40 +257,39 @@ namespace sample_company {
                 while (true)
                 {
                     FrameJob job;
-                    
+
                     // Wait for frame or shutdown signal
                     {
                         std::unique_lock<std::mutex> lk(m_frameQueueMutex);
-                        m_frameQueueCV.wait(lk, [this]() {
-                            return !m_frameQueue.empty() || m_workerShouldStop;
-                        });
-                        
+                        m_frameQueueCV.wait(lk, [this]()
+                                            { return !m_frameQueue.empty() || m_workerShouldStop; });
+
                         if (m_workerShouldStop && m_frameQueue.empty())
-                            break;  // Exit thread
-                        
+                            break; // Exit thread
+
                         if (m_frameQueue.empty())
-                            continue;  // Spurious wakeup, wait again
-                        
+                            continue; // Spurious wakeup, wait again
+
                         // Dequeue NEWEST frame (drop old ones if multiple in queue)
                         job = std::move(m_frameQueue.back());
-                        m_frameQueue.clear();  // Drop all other frames
+                        m_frameQueue.clear(); // Drop all other frames
                     }
-                    
+
                     // Process frame job (WITHOUT holding lock)
                     try
                     {
                         MetadataPacketList metadataPackets = processFrameJob(job);
-                        
+
                         // Enqueue metadata packets for Nx to pull
                         {
                             std::unique_lock<std::mutex> lk(m_metadataQueueMutex);
-                            for (const auto& pkt : metadataPackets)
+                            for (const auto &pkt : metadataPackets)
                             {
                                 m_metadataQueue.push_back(pkt);
                             }
                         }
                     }
-                    catch (const std::exception& e)
+                    catch (const std::exception &e)
                     {
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::error,
@@ -277,57 +298,58 @@ namespace sample_company {
                     }
                 }
             }
-            
+
             // ============================================================
             // FLOW 2: Encode frame to JPEG bytes
             // ============================================================
-            std::vector<uint8_t> DeviceAgent::encodeFrameToJpeg(const Frame& frame, int targetWidth)
+            std::vector<uint8_t> DeviceAgent::encodeFrameToJpeg(const Frame &frame, int targetWidth)
             {
                 cv::Mat sendImg = frame.cvMat;
-                
-                // Downscale for faster HTTP transmission and inference
-                if (frame.width > targetWidth)
+
+                // Optional downscale for faster HTTP transmission and inference.
+                // targetWidth <= 0 means keep full frame size.
+                if (targetWidth > 0 && frame.width > targetWidth)
                 {
                     float scale = (float)targetWidth / (float)frame.width;
                     int newH = std::max(1, (int)std::round(frame.height * scale));
                     cv::resize(sendImg, sendImg, cv::Size(targetWidth, newH));
                 }
-                
+
                 // Encode to JPEG
                 std::vector<uint8_t> jpegBytes;
-                std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 80};  // 80% quality
-                
+                std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 80}; // 80% quality (balanced)
+
                 if (!cv::imencode(".jpg", sendImg, jpegBytes, params))
                 {
                     throw ObjectDetectionError("Failed to encode frame to JPEG");
                 }
-                
+
                 return jpegBytes;
             }
-            
+
             // ============================================================
             // FLOW 2: Process queued frame job
             // ============================================================
-            DeviceAgent::MetadataPacketList DeviceAgent::processFrameJob(const FrameJob& job)
+            DeviceAgent::MetadataPacketList DeviceAgent::processFrameJob(const FrameJob &job)
             {
                 MetadataPacketList result;
-                
+
                 try
                 {
                     // Call Python AI service with JPEG bytes
                     DetectionList detections = m_objectDetector->run(job.cameraId, job.jpegBytes);
-                    
+
                     // Create ObjectMetadata for bboxes
-                    const auto& objectMetadataPacket =
+                    const auto &objectMetadataPacket =
                         detectionsToObjectMetadataPacket(detections, job.timestampUs);
-                    
+
                     if (objectMetadataPacket)
                         result.push_back(objectMetadataPacket);
 
                     // Emit state-dependent person presence event (start/finish).
                     bool hasPerson = false;
                     std::set<nx::sdk::Uuid> currentFallDetectedTrackIds;
-                    for (const auto& detection : detections)
+                    for (const auto &detection : detections)
                     {
                         if (detection->classLabel != "person")
                             continue;
@@ -343,8 +365,7 @@ namespace sample_company {
                         personEvents.push_back(std::make_shared<Event>(Event{
                             hasPerson ? EventType::detection_started : EventType::detection_finished,
                             job.timestampUs,
-                            "person"
-                        }));
+                            "person"}));
 
                         const auto personEventPackets =
                             eventsToEventMetadataPacketList(personEvents, job.timestampUs);
@@ -358,7 +379,7 @@ namespace sample_company {
 
                     // Emit state-dependent fall events per track_id.
                     // START: newly fallen tracks.
-                    for (const auto& trackId : currentFallDetectedTrackIds)
+                    for (const auto &trackId : currentFallDetectedTrackIds)
                     {
                         if (m_activeFallDetectedTrackIds.count(trackId) > 0)
                             continue;
@@ -380,7 +401,7 @@ namespace sample_company {
 
                     // FINISH: tracks that were fallen before but are no longer fallen now.
                     std::vector<nx::sdk::Uuid> tracksToClear;
-                    for (const auto& activeTrackId : m_activeFallDetectedTrackIds)
+                    for (const auto &activeTrackId : m_activeFallDetectedTrackIds)
                     {
                         if (currentFallDetectedTrackIds.count(activeTrackId) > 0)
                             continue;
@@ -400,29 +421,29 @@ namespace sample_company {
                         tracksToClear.push_back(activeTrackId);
                     }
 
-                    for (const auto& trackId : tracksToClear)
+                    for (const auto &trackId : tracksToClear)
                         m_activeFallDetectedTrackIds.erase(trackId);
                 }
-                catch (const ObjectDetectionError& e)
+                catch (const ObjectDetectionError &e)
                 {
                     pushPluginDiagnosticEvent(
                         nx::sdk::IPluginDiagnosticEvent::Level::error,
                         "AI service call failed - will retry next frame",
                         e.what());
                 }
-                catch (const std::exception& e)
+                catch (const std::exception &e)
                 {
                     pushPluginDiagnosticEvent(
                         nx::sdk::IPluginDiagnosticEvent::Level::error,
                         "Unexpected error in processFrameJob",
                         e.what());
                 }
-                
+
                 return result;
             }
 
             DeviceAgent::MetadataPacketList DeviceAgent::eventsToEventMetadataPacketList(
-                const EventList& events,
+                const EventList &events,
                 int64_t timestampUs)
             {
                 if (events.empty())
@@ -432,7 +453,7 @@ namespace sample_company {
 
                 const auto objectDetectedEventMetadataPacket = makePtr<EventMetadataPacket>();
 
-                for (const std::shared_ptr<Event>& event : events)
+                for (const std::shared_ptr<Event> &event : events)
                 {
                     const auto eventMetadata = makePtr<EventMetadata>();
 
@@ -443,8 +464,8 @@ namespace sample_company {
                         static const std::string kFinishedSuffix = " FINISHED";
 
                         const std::string suffix = (event->eventType == EventType::detection_started)
-                            ? kStartedSuffix
-                            : kFinishedSuffix;
+                                                       ? kStartedSuffix
+                                                       : kFinishedSuffix;
 
                         const std::string caption =
                             kClassesToDetectPluralCapitalized.at(event->classLabel) +
@@ -485,7 +506,7 @@ namespace sample_company {
             }
 
             Ptr<ObjectMetadataPacket> DeviceAgent::detectionsToObjectMetadataPacket(
-                const DetectionList& detections,
+                const DetectionList &detections,
                 int64_t timestampUs)
             {
                 using nx::sdk::Attribute;
@@ -503,7 +524,7 @@ namespace sample_company {
                 m_currentPersons = 0;
                 std::set<nx::sdk::Uuid> framePersonIds;
 
-                for (const std::shared_ptr<Detection>& detection : detections)
+                for (const std::shared_ptr<Detection> &detection : detections)
                 {
                     if (detection->classLabel == "person")
                     {
@@ -517,7 +538,7 @@ namespace sample_company {
                 const int totalUniquePersons = static_cast<int>(m_seenPersonIds.size());
 
                 // --- PASS 2: tạo ObjectMetadata + gắn attribute + caption ---
-                for (const std::shared_ptr<Detection>& detection : detections)
+                for (const std::shared_ptr<Detection> &detection : detections)
                 {
                     auto objectMetadata = makePtr<ObjectMetadata>();
 
@@ -563,7 +584,7 @@ namespace sample_company {
                 return objectMetadataPacket;
             }
 
-            void DeviceAgent::reinitializeObjectTrackerOnFrameSizeChanges(const Frame& frame)
+            void DeviceAgent::reinitializeObjectTrackerOnFrameSizeChanges(const Frame &frame)
             {
                 const bool frameSizeUnset = m_previousFrameWidth == 0 && m_previousFrameHeight == 0;
                 if (frameSizeUnset)
@@ -586,15 +607,15 @@ namespace sample_company {
             }
 
             DeviceAgent::MetadataPacketList DeviceAgent::processFrame(
-                const IUncompressedVideoFrame* videoFrame)
+                const IUncompressedVideoFrame *videoFrame)
             {
                 if (m_frameIndex % 200 == 0)
                 {
                     std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                        << " w=" << videoFrame->width()
-                        << " h=" << videoFrame->height()
-                        << " lineSize0=" << videoFrame->lineSize(0)
-                        << std::endl;
+                              << " w=" << videoFrame->width()
+                              << " h=" << videoFrame->height()
+                              << " lineSize0=" << videoFrame->lineSize(0)
+                              << std::endl;
                 }
 
                 try
@@ -615,12 +636,12 @@ namespace sample_company {
                     DetectionList detections = m_objectDetector->run(frame);
 
                     // 2) Dùng trực tiếp detections từ Python để tạo ObjectMetadata
-                    const auto& objectMetadataPacket =
+                    const auto &objectMetadataPacket =
                         detectionsToObjectMetadataPacket(detections, frame.timestampUs);
 
                     // 3) Không còn events từ tracking, nên truyền EventList rỗng
                     EventList emptyEvents;
-                    const auto& eventMetadataPacketList =
+                    const auto &eventMetadataPacketList =
                         eventsToEventMetadataPacketList(emptyEvents, frame.timestampUs);
 
                     MetadataPacketList result;
@@ -634,7 +655,7 @@ namespace sample_company {
 
                     return result;
                 }
-                catch (const ObjectDetectionError& e)
+                catch (const ObjectDetectionError &e)
                 {
                     // Log error nhưng KHÔNG terminate plugin
                     // Plugin sẽ tiếp tục chạy và retry lần sau
@@ -643,14 +664,14 @@ namespace sample_company {
                         "Object detection failed - will retry next frame",
                         e.what());
                 }
-                catch (const ObjectTrackingError& e)
+                catch (const ObjectTrackingError &e)
                 {
                     pushPluginDiagnosticEvent(
                         nx::sdk::IPluginDiagnosticEvent::Level::error,
                         "Object tracking error - will retry next frame",
                         e.what());
                 }
-                catch (const std::runtime_error& e)
+                catch (const std::runtime_error &e)
                 {
                     // Frame constructor throws std::runtime_error for unsupported pixel format
                     pushPluginDiagnosticEvent(
@@ -658,7 +679,7 @@ namespace sample_company {
                         "Frame conversion error (unsupported pixel format or OpenCV error) - skipping frame",
                         e.what());
                 }
-                catch (const std::exception& e)
+                catch (const std::exception &e)
                 {
                     pushPluginDiagnosticEvent(
                         nx::sdk::IPluginDiagnosticEvent::Level::error,
