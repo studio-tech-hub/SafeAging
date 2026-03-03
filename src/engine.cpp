@@ -99,6 +99,7 @@ DeviceAgentConfig Engine::loadConfigFromEnvironment() const
         static_cast<int64_t>(envInt("NX_AI_SYNTH_TRACK_TTL_MS", 2000, 100, 120000)) * 1000;
     config.trackMapTtlUs =
         static_cast<int64_t>(envInt("NX_AI_TRACK_MAP_TTL_MS", 60000, 1000, 3'600'000)) * 1000;
+    config.trackMapMaxSize = static_cast<size_t>(envInt("NX_AI_TRACK_MAP_MAX_SIZE", 50000, 100, 1'000'000));
     config.logThrottleMs = envInt("NX_AI_LOG_THROTTLE_MS", 5000, 200, 60000);
     return config;
 }

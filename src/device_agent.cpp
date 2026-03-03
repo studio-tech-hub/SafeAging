@@ -272,18 +272,17 @@ void DeviceAgent::resolveTrackIds(DetectionList* detections, int64_t timestampUs
 
     for (auto& detection : *detections)
     {
-        int64_t key = 0;
+        int64_t baseTrackId = 0;
         if (detection.aiTrackId.has_value())
         {
-            key = *detection.aiTrackId;
+            baseTrackId = *detection.aiTrackId;
         }
         else
         {
-            key = resolveSyntheticTrackId(detection.bbox, timestampUs);
+            baseTrackId = resolveSyntheticTrackId(detection.bbox, timestampUs);
         }
 
-        detection.trackId = getOrCreateUuid(key);
-        m_trackLastSeenUs[key] = timestampUs;
+        detection.trackId = uuidFromTrackId(m_cameraId, baseTrackId, timestampUs);
     }
 }
 
@@ -317,19 +316,26 @@ int64_t DeviceAgent::resolveSyntheticTrackId(const Rect& bbox, int64_t timestamp
     return bestTrackId;
 }
 
-nx::sdk::Uuid DeviceAgent::getOrCreateUuid(int64_t key)
+nx::sdk::Uuid DeviceAgent::uuidFromTrackId(const std::string& cameraId, int64_t trackId, int64_t timestampUs)
 {
-    const auto it = m_trackUuidByKey.find(key);
-    if (it != m_trackUuidByKey.end())
-        return it->second;
+    // key type already defined in header
+    TrackKey key{cameraId, trackId};
 
-    const nx::sdk::Uuid uuid = nx::sdk::UuidHelper::randomUuid();
-    m_trackUuidByKey.emplace(key, uuid);
+    auto it = m_trackUuidByKey.find(key);
+    if (it != m_trackUuidByKey.end())
+    {
+        it->second.lastSeenUs = timestampUs;
+        return it->second.uuid;
+    }
+
+    nx::sdk::Uuid uuid = nx::sdk::UuidHelper::randomUuid();
+    m_trackUuidByKey.emplace(key, UuidEntry{uuid, timestampUs});
     return uuid;
 }
 
 void DeviceAgent::cleanupTrackState(int64_t timestampUs)
 {
+    // purge old synthetic tracks as before
     for (auto it = m_syntheticTracks.begin(); it != m_syntheticTracks.end(); )
     {
         if (timestampUs - it->second.lastSeenUs > m_config.syntheticTrackTtlUs)
@@ -338,17 +344,29 @@ void DeviceAgent::cleanupTrackState(int64_t timestampUs)
             ++it;
     }
 
-    for (auto it = m_trackLastSeenUs.begin(); it != m_trackLastSeenUs.end(); )
+    // remove expired track-uuid entries by TTL
+    for (auto it = m_trackUuidByKey.begin(); it != m_trackUuidByKey.end(); )
     {
-        if (timestampUs - it->second > m_config.trackMapTtlUs)
-        {
-            m_trackUuidByKey.erase(it->first);
-            it = m_trackLastSeenUs.erase(it);
-        }
+        if (timestampUs - it->second.lastSeenUs > m_config.trackMapTtlUs)
+            it = m_trackUuidByKey.erase(it);
         else
-        {
             ++it;
-        }
+    }
+
+    // enforce maximum size by evicting least-recently-seen
+    if (m_trackUuidByKey.size() > m_config.trackMapMaxSize)
+    {
+        // collect pairs for sorting
+        std::vector<std::pair<TrackKey, int64_t>> items;
+        items.reserve(m_trackUuidByKey.size());
+        for (const auto& p : m_trackUuidByKey)
+            items.emplace_back(p.first, p.second.lastSeenUs);
+        std::sort(items.begin(), items.end(),
+            [](auto const& a, auto const& b)
+            { return a.second < b.second; });
+        size_t toRemove = m_trackUuidByKey.size() - m_config.trackMapMaxSize;
+        for (size_t i = 0; i < toRemove && i < items.size(); ++i)
+            m_trackUuidByKey.erase(items[i].first);
     }
 }
 

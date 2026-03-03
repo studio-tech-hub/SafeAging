@@ -33,6 +33,7 @@ struct DeviceAgentConfig
     int64_t fallFinishGraceUs = 3'000'000;
     int64_t syntheticTrackTtlUs = 2'000'000;
     int64_t trackMapTtlUs = 60'000'000;
+    size_t trackMapMaxSize = 50'000; //< max number of track entries to keep
     int logThrottleMs = 5000;
 };
 
@@ -82,7 +83,9 @@ private:
 
     void resolveTrackIds(DetectionList* detections, int64_t timestampUs);
     int64_t resolveSyntheticTrackId(const nx::sdk::analytics::Rect& bbox, int64_t timestampUs);
-    nx::sdk::Uuid getOrCreateUuid(int64_t key);
+
+    // return uuid for a given camera+track; updates cache last-seen and creates new uuid if needed
+    nx::sdk::Uuid uuidFromTrackId(const std::string& cameraId, int64_t trackId, int64_t timestampUs);
     void cleanupTrackState(int64_t timestampUs);
 
     nx::sdk::Ptr<nx::sdk::analytics::ObjectMetadataPacket> makeObjectPacket(
@@ -115,8 +118,28 @@ private:
 
     int64_t m_nextSyntheticTrackId = -1;
     std::map<int64_t, SyntheticTrack> m_syntheticTracks;
-    std::map<int64_t, nx::sdk::Uuid> m_trackUuidByKey;
-    std::map<int64_t, int64_t> m_trackLastSeenUs;
+
+    // combined cache for track->uuid entries; key includes camera id to avoid cross-device
+    struct TrackKey
+    {
+        std::string cameraId;
+        int64_t trackId = 0;
+
+        bool operator<(TrackKey const& other) const
+        {
+            if (cameraId != other.cameraId)
+                return cameraId < other.cameraId;
+            return trackId < other.trackId;
+        }
+    };
+
+    struct UuidEntry
+    {
+        nx::sdk::Uuid uuid;
+        int64_t lastSeenUs = 0;
+    };
+
+    std::map<TrackKey, UuidEntry> m_trackUuidByKey;
     std::map<nx::sdk::Uuid, FallTrackState> m_activeFallTracks;
 
     std::chrono::steady_clock::time_point m_lastLogAt{};
