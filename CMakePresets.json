@@ -1,0 +1,32 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 16,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "windows-vs2022-x64",
+            "displayName": "Windows VS2022 x64",
+            "description": "Configure FLOW2 plugin with Visual Studio 2022 x64",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build_flow2",
+            "cacheVariables": {
+                "NX_METADATA_SDK_DIR": "$env{NX_METADATA_SDK_DIR}"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "windows-vs2022-x64-release",
+            "displayName": "Build Release (VS2022 x64)",
+            "configurePreset": "windows-vs2022-x64",
+            "configuration": "Release",
+            "targets": [
+                "yolov8_flow2_plugin"
+            ]
+        }
+    ]
+}

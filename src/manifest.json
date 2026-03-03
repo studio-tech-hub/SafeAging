@@ -4,6 +4,9 @@
     "description": "Nx plugin receives frames, sends to AI service /infer, and publishes object/event metadata.",
     "version": "2.0.0",
     "vendor": "mycompany",
+    "capabilities": [
+        "needUncompressedVideoFrames_yuv420"
+    ],
     "runtimeConfigEnv": {
         "NX_AI_SERVICE_URL": "http://127.0.0.1:18000",
         "NX_AI_TIMEOUT_CONNECT_MS": "250",

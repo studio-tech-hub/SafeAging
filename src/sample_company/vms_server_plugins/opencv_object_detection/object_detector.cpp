@@ -19,6 +19,9 @@
 #include "json.hpp"
 #include <unordered_map>
 #include <mutex>
+#include <chrono>
+#include <vector>
+#include <algorithm>
 
 namespace sample_company {
     namespace vms_server_plugins {
@@ -161,20 +164,109 @@ namespace sample_company {
                     return base64Encode(buf.data(), buf.size());
                 }
 
-                static nx::sdk::Uuid uuidFromTrackId(int trackId)
+                // Cache mapping (camera_id, track_id) -> UUID
+                // ----------------------------------------------------------------
+                // UUIDs are scoped per camera to avoid collisions when different
+                // cameras happen to emit the same numeric track ID.  The cache uses
+                // a simple TTL + max‑size eviction policy to prevent unbounded
+                // memory growth in long‑running systems.  A single mutex guards
+                // all access; cleanup runs periodically on lookup to keep overhead
+                // low.
+                using Clock = std::chrono::steady_clock;
+
+                struct TrackKey
                 {
-                    static std::mutex m;
-                    static std::unordered_map<int, nx::sdk::Uuid> map;
+                    std::string camera_id;
+                    int track_id;
+                };
 
-                    std::lock_guard<std::mutex> lk(m);
+                struct TrackKeyHash
+                {
+                    size_t operator()(TrackKey const& k) const noexcept
+                    {
+                        size_t h1 = std::hash<std::string>{}(k.camera_id);
+                        size_t h2 = std::hash<int>{}(k.track_id);
+                        // boost::hash_combine style
+                        return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1<<6) + (h1>>2));
+                    }
+                };
 
-                    auto it = map.find(trackId);
-                    if (it != map.end())
-                        return it->second;
+                struct TrackKeyEq
+                {
+                    bool operator()(TrackKey const& a, TrackKey const& b) const noexcept
+                    {
+                        return a.track_id == b.track_id && a.camera_id == b.camera_id;
+                    }
+                };
 
-                    // tạo 1 UUID mới và cache lại cho trackId này
+                struct UuidEntry
+                {
+                    nx::sdk::Uuid uuid;
+                    Clock::time_point last_seen;
+                };
+
+                static const Clock::duration kUuidCacheTTL = std::chrono::minutes(10);
+                static const size_t kUuidCacheMaxSize = 50000;
+                static const int kCleanupInterval = 1000; // lookups between cleanup runs
+
+                static std::mutex uuidCacheMutex;
+                static std::unordered_map<TrackKey, UuidEntry, TrackKeyHash, TrackKeyEq> uuidCache;
+                static int uuidCacheLookupCount = 0;
+
+                static void cleanupUuidCacheLocked(Clock::time_point now)
+                {
+                    // remove expired entries first
+                    for (auto it = uuidCache.begin(); it != uuidCache.end(); )
+                    {
+                        if (now - it->second.last_seen > kUuidCacheTTL)
+                            it = uuidCache.erase(it);
+                        else
+                            ++it;
+                    }
+
+                    if (uuidCache.size() <= kUuidCacheMaxSize)
+                        return;
+
+                    // evict least‑recently‑seen entries until under limit
+                    std::vector<std::pair<TrackKey, Clock::time_point>> items;
+                    items.reserve(uuidCache.size());
+                    for (const auto& p : uuidCache)
+                        items.emplace_back(p.first, p.second.last_seen);
+                    std::sort(items.begin(), items.end(),
+                        [](auto const& a, auto const& b)
+                        { return a.second < b.second; });
+                    size_t toRemove = uuidCache.size() - kUuidCacheMaxSize;
+                    for (size_t i = 0; i < toRemove && i < items.size(); ++i)
+                        uuidCache.erase(items[i].first);
+                }
+
+                static nx::sdk::Uuid uuidFromTrackId(const std::string& cameraId, int trackId)
+                {
+                    Clock::time_point now = Clock::now();
+                    std::lock_guard<std::mutex> lk(uuidCacheMutex);
+
+                    TrackKey key{cameraId, trackId};
+                    auto it = uuidCache.find(key);
+                    if (it != uuidCache.end())
+                    {
+                        it->second.last_seen = now;
+                        if (++uuidCacheLookupCount >= kCleanupInterval)
+                        {
+                            uuidCacheLookupCount = 0;
+                            cleanupUuidCacheLocked(now);
+                        }
+                        return it->second.uuid;
+                    }
+
                     nx::sdk::Uuid u = nx::sdk::UuidHelper::randomUuid();
-                    map.emplace(trackId, u);
+                    uuidCache.emplace(std::move(key), UuidEntry{u, now});
+
+                    if (++uuidCacheLookupCount >= kCleanupInterval)
+                    {
+                        uuidCacheLookupCount = 0;
+                        cleanupUuidCacheLocked(now);
+                    }
+
                     return u;
                 }
 
@@ -228,7 +320,12 @@ namespace sample_company {
 
                     // 2. JSON request body
                     json req;
+<<<<<<< Updated upstream
                     req["camera_id"] = cameraId;
+=======
+                    static const std::string kLegacyCameraId = "nx_camera"; // used when Frame path doesn't provide cameraId
+                    req["camera_id"] = kLegacyCameraId;  // tạm thời, sau này map đúng ID camera nếu cần
+>>>>>>> Stashed changes
                     req["image"] = b64;
 
                     // 3. HTTP client -> POST /infer
@@ -309,8 +406,12 @@ namespace sample_company {
 
                         // 🔹 Lấy track_id từ JSON -> UUID ổn định
                         const int trackId = item.value("track_id", 0);
+<<<<<<< Updated upstream
                         const bool fallDetected = item.value("fall_detected", false);
                         nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+=======
+                        nx::sdk::Uuid trackUuid = uuidFromTrackId(kLegacyCameraId, trackId);
+>>>>>>> Stashed changes
 
                         auto detection = std::make_shared<Detection>(Detection{
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
@@ -538,7 +639,16 @@ namespace sample_company {
                             
                             // Get track ID
                             const int trackId = item.value("track_id", 0);
-                            nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+                            nx::sdk::Uuid trackUuid = uuidFromTrackId(cameraId, trackId);
+
+                            // STATUS log every 1k lookups, independent counter
+                            static int s_uuidStatusLog = 0; // [DIAGNOSTIC LOG]
+                            if ((++s_uuidStatusLog % 1000) == 0)
+                            {
+                                size_t curSize = uuidCacheSize();
+                                // [DIAGNOSTIC LOG]
+                                NX_PRINT("[UUID_CACHE] STATUS | size=%zu/%zu", curSize, kUuidCacheMaxSize);
+                            }
                             
                             // FLOW 2: Include fall_detected flag
                             auto detection = std::make_shared<Detection>(Detection{
