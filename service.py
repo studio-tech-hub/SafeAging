@@ -13,6 +13,10 @@ from pydantic import BaseModel
 from ultralytics import YOLO
 import torch
 
+# Add python directory to path for imports
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'python'))
+
 # Import fall detection module
 from fall_detection import FallDetectionManager
 

@@ -196,28 +196,28 @@ bool DeviceAgent::convertFrameToBgr(const IUncompressedVideoFrame* frame, cv::Ma
     {
         if (pf == PF_BGR24)
         {
-            cv::Mat bgr(h, w, CV_8UC3, const_cast<uint8_t*>(frame->data(0)), frame->lineSize(0));
+            cv::Mat bgr(h, w, CV_8UC3, reinterpret_cast<uint8_t*>(const_cast<char*>(frame->data(0))), frame->lineSize(0));
             *outBgr = bgr.clone();
             return true;
         }
 
         if (pf == PF_BGRA32)
         {
-            cv::Mat bgra(h, w, CV_8UC4, const_cast<uint8_t*>(frame->data(0)), frame->lineSize(0));
+            cv::Mat bgra(h, w, CV_8UC4, reinterpret_cast<uint8_t*>(const_cast<char*>(frame->data(0))), frame->lineSize(0));
             cv::cvtColor(bgra, *outBgr, cv::COLOR_BGRA2BGR);
             return !outBgr->empty();
         }
 
         if (pf == PF_RGBA32)
         {
-            cv::Mat rgba(h, w, CV_8UC4, const_cast<uint8_t*>(frame->data(0)), frame->lineSize(0));
+            cv::Mat rgba(h, w, CV_8UC4, reinterpret_cast<uint8_t*>(const_cast<char*>(frame->data(0))), frame->lineSize(0));
             cv::cvtColor(rgba, *outBgr, cv::COLOR_RGBA2BGR);
             return !outBgr->empty();
         }
 
         if (pf == PF_RGB24)
         {
-            cv::Mat rgb(h, w, CV_8UC3, const_cast<uint8_t*>(frame->data(0)), frame->lineSize(0));
+            cv::Mat rgb(h, w, CV_8UC3, reinterpret_cast<uint8_t*>(const_cast<char*>(frame->data(0))), frame->lineSize(0));
             cv::cvtColor(rgb, *outBgr, cv::COLOR_RGB2BGR);
             return !outBgr->empty();
         }
@@ -524,7 +524,7 @@ float DeviceAgent::iou(const Rect& a, const Rect& b) const
     return intersection / (areaA + areaB - intersection + 1e-6F);
 }
 
-void DeviceAgent::maybeLog(const std::string& message)
+void DeviceAgent::maybeLog(const std::string& message) const
 {
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed =
