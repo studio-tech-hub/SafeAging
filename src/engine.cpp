@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "device_agent.h"
+#include "nx_print.h"
 
 namespace mycompany::yolov8_flow2 {
 
@@ -58,6 +59,7 @@ Engine::Engine(std::filesystem::path pluginHomeDir):
     m_pluginHomeDir(std::move(pluginHomeDir)),
     m_config(loadConfigFromEnvironment())
 {
+    NX_PRINT("[YOLOv8] Engine loaded");
 }
 
 Engine::~Engine() = default;

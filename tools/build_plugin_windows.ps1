@@ -1,79 +1,155 @@
 <#
 .SYNOPSIS
-Build YOLOv8 FLOW2 Nx plugin on Windows using CMake presets.
+Build Nx plugin DLL on Windows using the same flow as manual command line.
 
 .DESCRIPTION
-Configures and builds target `yolov8_flow2_plugin` with presets:
-- windows-vs2022-x64
-- windows-vs2022-x64-release
+This script reproduces the known-good manual build flow:
+1) set CONAN_VCVARS_AUTO=0
+2) call <metadataSdkDir>\call_vcvars64.bat
+3) call VS vcvars64.bat --vcvars_ver=14.29.30133
+4) cmake -S config -B build\yolov8_people_analytics_plugin ...
+5) cmake --build ...
 
-The script temporarily sets `NX_METADATA_SDK_DIR` for CMake preset resolution.
+It does not use CMake presets.
 
 .PARAMETER NxMetadataSdkDir
-Path to unpacked Nx Metadata SDK directory.
-Defaults to environment variable `NX_METADATA_SDK_DIR`.
+Path to unpacked Nx Metadata SDK directory (the folder containing call_vcvars64.bat).
+Example:
+  D:\metavms-metadata_sdk-6.0.6.41837-universal\metadata_sdk
 
-.PARAMETER ConfigurePreset
-CMake configure preset name. Default: windows-vs2022-x64
+.PARAMETER VcvarsVersion
+Optional MSVC toolset version for vcvars (example: 14.29.30133).
+If empty, use Visual Studio default toolset (recommended to match Conan VS17 profile).
 
-.PARAMETER BuildPreset
-CMake build preset name. Default: windows-vs2022-x64-release
+.PARAMETER VsVcvarsPath
+Path to Visual Studio vcvars64.bat.
+
+.PARAMETER BuildType
+CMake build type. Default: Release
+
+.PARAMETER CmakePath
+Path to cmake executable. Default: C:\Program Files\CMake\bin\cmake.exe
+
+.PARAMETER ConanRetry
+Number of Conan download retries. Default: 8
+
+.PARAMETER ConanRetryWaitSec
+Wait seconds between Conan retries. Default: 10
 #>
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory = $false)]
     [string]$NxMetadataSdkDir = $env:NX_METADATA_SDK_DIR,
-    [string]$ConfigurePreset = "windows-vs2022-x64",
-    [string]$BuildPreset = "windows-vs2022-x64-release"
+
+    [Parameter(Mandatory = $false)]
+    [string]$VcvarsVersion = "",
+
+    [Parameter(Mandatory = $false)]
+    [string]$VsVcvarsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Release", "Debug", "RelWithDebInfo", "MinSizeRel")]
+    [string]$BuildType = "Release",
+
+    [Parameter(Mandatory = $false)]
+    [string]$CmakePath = "C:\Program Files\CMake\bin\cmake.exe",
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 20)]
+    [int]$ConanRetry = 8,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 120)]
+    [int]$ConanRetryWaitSec = 10
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$buildPath = Join-Path $repoRoot "build_flow2"
-
-if (-not (Get-Command cmake -ErrorAction SilentlyContinue))
+if (-not (Test-Path $CmakePath))
 {
-    throw "cmake is not found in PATH. Install CMake and retry."
+    throw "CMake not found at '$CmakePath'. Install CMake 3.27.9 or pass -CmakePath."
+}
+$resolvedCmake = (Resolve-Path $CmakePath -ErrorAction Stop).Path
+
+$cmakeVersionLine = (& $resolvedCmake --version | Select-Object -First 1)
+if ($cmakeVersionLine -notmatch "cmake version 3\.27\.9")
+{
+    throw "Expected CMake 3.27.9 but got: '$cmakeVersionLine'. Pass -CmakePath to the 3.27.9 binary."
 }
 
 if ([string]::IsNullOrWhiteSpace($NxMetadataSdkDir))
 {
-    throw "NX_METADATA_SDK_DIR is missing. Pass -NxMetadataSdkDir or set env:NX_METADATA_SDK_DIR."
+    throw "NxMetadataSdkDir is missing. Pass -NxMetadataSdkDir or set env:NX_METADATA_SDK_DIR."
 }
+
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$srcDir = Join-Path $repoRoot "config"
+$buildDir = Join-Path $repoRoot "build\yolov8_people_analytics_plugin"
 
 $resolvedSdkDir = (Resolve-Path $NxMetadataSdkDir -ErrorAction Stop).Path
+$resolvedVsVcvars = (Resolve-Path $VsVcvarsPath -ErrorAction Stop).Path
 
-$previousSdkEnv = [Environment]::GetEnvironmentVariable("NX_METADATA_SDK_DIR", "Process")
-try
+$sdkCallVcvars = Join-Path $resolvedSdkDir "call_vcvars64.bat"
+if (-not (Test-Path $sdkCallVcvars))
 {
-    [Environment]::SetEnvironmentVariable("NX_METADATA_SDK_DIR", $resolvedSdkDir, "Process")
-
-    Write-Host "Repository: $repoRoot"
-    Write-Host "SDK path:   $resolvedSdkDir"
-    Write-Host "Build dir:  $buildPath"
-    Write-Host "Configure preset: $ConfigurePreset"
-    Write-Host "Build preset:     $BuildPreset"
-
-    & cmake --preset $ConfigurePreset
-    if ($LASTEXITCODE -ne 0) { throw "cmake configure failed for preset '$ConfigurePreset'." }
-
-    & cmake --build --preset $BuildPreset
-    if ($LASTEXITCODE -ne 0) { throw "cmake build failed for preset '$BuildPreset'." }
-}
-finally
-{
-    [Environment]::SetEnvironmentVariable("NX_METADATA_SDK_DIR", $previousSdkEnv, "Process")
+    throw "Cannot find call_vcvars64.bat under '$resolvedSdkDir'. Expected: $sdkCallVcvars"
 }
 
-$dll = Get-ChildItem -Path $buildPath -Recurse -Filter "yolov8_flow2_plugin.dll" -File -ErrorAction SilentlyContinue |
+Write-Host "Repository:       $repoRoot"
+Write-Host "Source dir:       $srcDir"
+Write-Host "Build dir:        $buildDir"
+Write-Host "SDK dir:          $resolvedSdkDir"
+Write-Host "SDK call vcvars:  $sdkCallVcvars"
+Write-Host "VS vcvars:        $resolvedVsVcvars"
+if ([string]::IsNullOrWhiteSpace($VcvarsVersion))
+{
+    Write-Host "MSVC version:     (default from vcvars64.bat)"
+}
+else
+{
+    Write-Host "MSVC version:     $VcvarsVersion"
+}
+Write-Host "Build type:       $BuildType"
+Write-Host "CMake:            $resolvedCmake"
+Write-Host "Conan retry:      $ConanRetry"
+Write-Host "Conan retry wait: $ConanRetryWaitSec sec"
+
+# Keep everything in one cmd.exe session so vcvars env is preserved.
+$vsVcvarsCmd = if ([string]::IsNullOrWhiteSpace($VcvarsVersion)) {
+    "call `"$resolvedVsVcvars`""
+} else {
+    "call `"$resolvedVsVcvars`" --vcvars_ver=$VcvarsVersion"
+}
+
+$cmdParts = @(
+    "set CONAN_VCVARS_AUTO=0",
+    "set CONAN_RETRY=$ConanRetry",
+    "set CONAN_RETRY_WAIT=$ConanRetryWaitSec",
+    "set CMAKE_POLICY_VERSION_MINIMUM=3.5",
+    "call `"$sdkCallVcvars`"",
+    $vsVcvarsCmd,
+    # "cl /Bv",
+    "`"$resolvedCmake`" -S `"$srcDir`" -B `"$buildDir`" -G Ninja -DCMAKE_BUILD_TYPE=$BuildType -DmetadataSdkDir=`"$resolvedSdkDir`" -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe",
+    "`"$resolvedCmake`" --build `"$buildDir`""
+)
+$cmdLine = $cmdParts -join " && "
+
+& cmd.exe /d /s /c $cmdLine
+if ($LASTEXITCODE -ne 0)
+{
+    throw "Build failed (exit code $LASTEXITCODE)."
+}
+
+$dll = Get-ChildItem -Path $buildDir -Recurse -Filter "yolov8_people_analytics_plugin.dll" -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 
 if (-not $dll)
 {
-    throw "Build finished but yolov8_flow2_plugin.dll was not found under $buildPath."
+    throw "Build finished but yolov8_people_analytics_plugin.dll was not found under $buildDir."
 }
 
 Write-Host "DLL ready: $($dll.FullName)"
-Write-Host "Quick command: .\\tools\\build_plugin_windows.ps1 -NxMetadataSdkDir `"<path-to-nx-metadata-sdk>`""
+Write-Host "Quick command: .\tools\build_plugin_windows.ps1 -NxMetadataSdkDir `"<path-to-nx-metadata-sdk>\metadata_sdk`" -CmakePath `"C:\Program Files\CMake\bin\cmake.exe`""
+

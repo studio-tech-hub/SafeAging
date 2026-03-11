@@ -28,6 +28,13 @@ endif()
 
 include(${CMAKE_BINARY_DIR}/conan.cmake)
 
+# CMake 4 removed compatibility with projects declaring cmake_minimum_required < 3.5.
+# Some ConanCenter recipes pulled by opencv/4.5.5 (e.g. zstd/1.5.5) still use old values.
+# Force a minimum policy version so dependency configure does not fail on modern CMake.
+if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0")
+    set(ENV{CMAKE_POLICY_VERSION_MINIMUM} "3.5")
+endif()
+
 # Patch conan.cmake to support MSVC 1944+ (VS 2022 17.4+)
 # Override _get_msvc_ide_version function to handle MSVC 1940+
 function(_get_msvc_ide_version result)
@@ -74,6 +81,10 @@ message(STATUS "Found Conan: ${CONAN_CMD}")
 
 if(WIN32)
     set(CONAN_VS_RUNTIME_MT_SETTING "compiler.runtime=MT")
+    # Nx Metadata SDK build flow uses MSVC 14.29 (v142 toolset).
+    # Force Conan dependencies to use the same toolset to avoid STL ABI/link mismatches
+    # such as unresolved __std_find_trivial_* symbols.
+    set(CONAN_VS_TOOLSET_SETTING "compiler.toolset=v142")
 endif()
 set(OPENCV_OPTIONS
     opencv:parallel=False
@@ -108,12 +119,12 @@ conan_cmake_run(BUILD_TYPE "Release")
 conan_cmake_configure(REQUIRES opencv/4.5.5
     GENERATORS cmake_find_package
     OPTIONS ${OPENCV_OPTIONS}
-    SETTINGS ${CONAN_VS_RUNTIME_MT_SETTING}
+    SETTINGS ${CONAN_VS_RUNTIME_MT_SETTING} ${CONAN_VS_TOOLSET_SETTING}
 )
 
 conan_cmake_install(PATH_OR_REFERENCE .
     OPTIONS ${OPENCV_OPTIONS}
-    SETTINGS ${CONAN_VS_RUNTIME_MT_SETTING}
+    SETTINGS ${CONAN_VS_RUNTIME_MT_SETTING} ${CONAN_VS_TOOLSET_SETTING}
     BUILD missing
 )
 
@@ -190,15 +201,27 @@ target_compile_definitions(nx_sdk PRIVATE NX_PLUGIN_API=${API_EXPORT_MACRO})
 #--------------------------------------------------------------------------------------------------
 # Define opencv_object_detection_analytics_plugin lib, dynamic, depends on nx_kit and nx_sdk.
 
-set(OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR ${CMAKE_CURRENT_LIST_DIR}/src)
-file(GLOB_RECURSE OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC
-    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/*)
+set(PROJECT_ROOT_DIR ${CMAKE_CURRENT_LIST_DIR}/..)
+set(OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR ${PROJECT_ROOT_DIR}/src)
+set(OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_3RD_PARTY_DIR ${PROJECT_ROOT_DIR}/3rd_party)
+file(GLOB_RECURSE OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC CONFIGURE_DEPENDS
+    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/*.cpp
+    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/*.c
+    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/*.cc
+    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/*.cxx
+)
+# Exclude legacy sample plugin sources to avoid signature conflicts with current Flow2 implementation.
+list(FILTER OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC EXCLUDE REGEX ".*/src/sample_company/.*")
+if(NOT OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC)
+    message(FATAL_ERROR
+        "No plugin source files found under ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}")
+endif()
 
 add_library(yolov8_people_analytics_plugin SHARED
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC})
 target_include_directories(yolov8_people_analytics_plugin PRIVATE 
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}
-    ${CMAKE_CURRENT_LIST_DIR}/3rd_party
+    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_3RD_PARTY_DIR}
 )
 target_link_libraries(yolov8_people_analytics_plugin
     nx_kit

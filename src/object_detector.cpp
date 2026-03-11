@@ -9,7 +9,7 @@
 
 #include "httplib.h"
 #include "json.hpp"
-
+#include "nx_print.h"
 #include "utils/image_codec.h"
 
 namespace mycompany::yolov8_flow2 {
@@ -120,6 +120,7 @@ DetectionList ObjectDetector::callService(const std::string& cameraId, const cv:
         m_config.writeTimeoutMs / 1000,
         (m_config.writeTimeoutMs % 1000) * 1000);
 
+    NX_PRINT("[YOLOv8] Sending frame to AI service");
     const auto res = client.Post(m_endpoint.inferPath.c_str(), req.dump(), "application/json");
     if (!res)
         throw std::runtime_error("AI service did not respond");
@@ -167,6 +168,7 @@ DetectionList ObjectDetector::callService(const std::string& cameraId, const cv:
         detections.push_back(std::move(detection));
     }
 
+    NX_PRINT("[YOLOv8] AI response detections=%zu", detections.size());
     return detections;
 }
 

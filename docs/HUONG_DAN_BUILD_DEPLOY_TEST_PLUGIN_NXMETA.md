@@ -20,7 +20,7 @@ Tài liệu này hướng dẫn từng bước để:
 - Windows 10/11.
 - Đã cài Nx Meta Media Server.
 - Đã cài Visual Studio 2022 Build Tools (C++).
-- Đã cài CMake và có trong PATH.
+<!-- - Đã cài CMake và có trong PATH. -->
 - Đã cài Python 3.10+.
 - Đã có Nx Metadata SDK (thư mục SDK phải có `src` và `nx_kit`).
 
