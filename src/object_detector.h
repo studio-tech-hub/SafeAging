@@ -48,7 +48,6 @@ private:
     int m_consecutiveFailures = 0;
     bool m_circuitOpen = false;
     std::chrono::steady_clock::time_point m_circuitRetryAt{};
-    std::chrono::steady_clock::time_point m_lastLogAt{};
 };
 
 } // namespace mycompany::yolov8_flow2

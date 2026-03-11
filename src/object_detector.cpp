@@ -3,13 +3,12 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <iostream>
 #include <stdexcept>
 #include <utility>
 
 #include "httplib.h"
 #include "json.hpp"
-#include "nx_print.h"
+#include "logging.h"
 #include "utils/image_codec.h"
 
 namespace mycompany::yolov8_flow2 {
@@ -120,7 +119,6 @@ DetectionList ObjectDetector::callService(const std::string& cameraId, const cv:
         m_config.writeTimeoutMs / 1000,
         (m_config.writeTimeoutMs % 1000) * 1000);
 
-    NX_PRINT("[YOLOv8] Sending frame to AI service");
     const auto res = client.Post(m_endpoint.inferPath.c_str(), req.dump(), "application/json");
     if (!res)
         throw std::runtime_error("AI service did not respond");
@@ -168,7 +166,6 @@ DetectionList ObjectDetector::callService(const std::string& cameraId, const cv:
         detections.push_back(std::move(detection));
     }
 
-    NX_PRINT("[YOLOv8] AI response detections=%zu", detections.size());
     return detections;
 }
 
@@ -230,17 +227,15 @@ void ObjectDetector::onFailure(const std::string& reason)
             std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, m_config.circuitOpenMs));
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    const auto sinceLastLog =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastLogAt).count();
-    if (m_lastLogAt.time_since_epoch().count() == 0 || sinceLastLog >= m_config.logThrottleMs)
-    {
-        std::cerr << "[ObjectDetector] inference failure: " << reason
-                  << " (consecutive_failures=" << m_consecutiveFailures
-                  << ", circuit_open=" << (m_circuitOpen ? "true" : "false") << ")"
-                  << std::endl;
-        m_lastLogAt = now;
-    }
+    std::string msg = "inference failure: " + reason;
+    msg += " (consecutive_failures=" + std::to_string(m_consecutiveFailures);
+    msg += ", circuit_open=" + std::string(m_circuitOpen ? "true" : "false") + ")";
+    logThrottled(
+        LogLevel::Error,
+        "ObjectDetector",
+        "infer_failure",
+        std::chrono::milliseconds(m_config.logThrottleMs),
+        msg);
 }
 
 void ObjectDetector::onSuccess()

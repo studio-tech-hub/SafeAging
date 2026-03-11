@@ -1,9 +1,9 @@
 #include "device_agent.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -12,6 +12,8 @@
 #include <opencv2/imgproc.hpp>
 
 #include <nx/sdk/analytics/helpers/event_metadata.h>
+
+#include "logging.h"
 #include <nx/sdk/analytics/helpers/event_metadata_packet.h>
 #include <nx/sdk/analytics/helpers/object_metadata.h>
 #include <nx/sdk/analytics/helpers/object_metadata_packet.h>
@@ -244,11 +246,23 @@ bool DeviceAgent::convertFrameToBgr(const IUncompressedVideoFrame* frame, cv::Ma
     }
     catch (const std::exception& e)
     {
-        maybeLog(std::string("frame conversion failed: ") + e.what());
+        const std::string msg = "frame conversion failed: " + std::string(e.what());
+        logThrottled(
+            LogLevel::Error,
+            "DeviceAgent[" + m_cameraId + "]",
+            "frame_conversion_failed",
+            std::chrono::milliseconds(m_config.logThrottleMs),
+            msg);
         return false;
     }
 
-    maybeLog("unsupported frame pixel format: " + std::to_string(pf));
+    const std::string msg = "unsupported frame pixel format: " + std::to_string(pf);
+    logThrottled(
+        LogLevel::Warn,
+        "DeviceAgent[" + m_cameraId + "]",
+        "unsupported_pixel_format:" + std::to_string(pf),
+        std::chrono::milliseconds(m_config.logThrottleMs),
+        msg);
     return false;
 }
 
@@ -522,18 +536,6 @@ float DeviceAgent::iou(const Rect& a, const Rect& b) const
         return 0.0F;
 
     return intersection / (areaA + areaB - intersection + 1e-6F);
-}
-
-void DeviceAgent::maybeLog(const std::string& message) const
-{
-    const auto now = std::chrono::steady_clock::now();
-    const auto elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastLogAt).count();
-    if (m_lastLogAt.time_since_epoch().count() == 0 || elapsed >= m_config.logThrottleMs)
-    {
-        std::cerr << "[DeviceAgent][" << m_cameraId << "] " << message << std::endl;
-        m_lastLogAt = now;
-    }
 }
 
 } // namespace mycompany::yolov8_flow2

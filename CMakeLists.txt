@@ -48,6 +48,7 @@ add_library(yolov8_flow2_plugin SHARED
     src/engine.cpp
     src/device_agent.cpp
     src/object_detector.cpp
+    src/logging.cpp
     src/utils/base64.cpp
     src/utils/image_codec.cpp
 )

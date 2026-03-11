@@ -94,7 +94,6 @@ private:
     MetadataPacketList makeFallEventPackets(const DetectionList& detections, int64_t timestampUs);
 
     float iou(const nx::sdk::analytics::Rect& a, const nx::sdk::analytics::Rect& b) const;
-    void maybeLog(const std::string& message) const;
 
 private:
     static constexpr const char* kPersonObjectType = "mycompany.yolov8.person";
@@ -141,8 +140,6 @@ private:
 
     std::map<TrackKey, UuidEntry> m_trackUuidByKey;
     std::map<nx::sdk::Uuid, FallTrackState> m_activeFallTracks;
-
-    mutable std::chrono::steady_clock::time_point m_lastLogAt{};
 };
 
 } // namespace mycompany::yolov8_flow2
