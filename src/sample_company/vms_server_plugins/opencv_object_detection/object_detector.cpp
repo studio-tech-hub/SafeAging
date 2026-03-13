@@ -17,6 +17,9 @@
 #endif
 
 #include "json.hpp"
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <unordered_map>
 #include <mutex>
 
@@ -160,22 +163,180 @@ namespace sample_company {
                     
                     return base64Encode(buf.data(), buf.size());
                 }
+                using SteadyClock = std::chrono::steady_clock;
 
-                static nx::sdk::Uuid uuidFromTrackId(int trackId)
+                struct TrackUuidEntry
                 {
-                    static std::mutex m;
-                    static std::unordered_map<int, nx::sdk::Uuid> map;
+                    nx::sdk::Uuid uuid;
+                    SteadyClock::time_point lastSeen;
+                };
 
-                    std::lock_guard<std::mutex> lk(m);
+                struct TrackUuidCache
+                {
+                    std::mutex mutex;
+                    std::unordered_map<std::string, std::unordered_map<int, TrackUuidEntry>> entriesByCamera;
+                    size_t totalEntries = 0;
+                    SteadyClock::time_point lastCleanup = SteadyClock::now();
+                };
 
-                    auto it = map.find(trackId);
-                    if (it != map.end())
-                        return it->second;
+                TrackUuidCache& trackUuidCache()
+                {
+                    static TrackUuidCache cache;
+                    return cache;
+                }
 
-                    // tạo 1 UUID mới và cache lại cho trackId này
-                    nx::sdk::Uuid u = nx::sdk::UuidHelper::randomUuid();
-                    map.emplace(trackId, u);
-                    return u;
+                std::string normalizeCameraId(const std::string& cameraId)
+                {
+                    if (cameraId.empty())
+                        return "__default_camera__";
+                    return cameraId;
+                }
+
+                void cleanupTrackUuidCacheLocked(
+                    TrackUuidCache* cache,
+                    SteadyClock::time_point now,
+                    std::chrono::seconds ttl,
+                    size_t maxEntries)
+                {
+                    // Step 1: remove stale entries by TTL.
+                    for (auto cameraIt = cache->entriesByCamera.begin();
+                        cameraIt != cache->entriesByCamera.end();)
+                    {
+                        auto& trackMap = cameraIt->second;
+                        for (auto trackIt = trackMap.begin(); trackIt != trackMap.end();)
+                        {
+                            if (now - trackIt->second.lastSeen > ttl)
+                            {
+                                trackIt = trackMap.erase(trackIt);
+                                if (cache->totalEntries > 0)
+                                    --cache->totalEntries;
+                            }
+                            else
+                            {
+                                ++trackIt;
+                            }
+                        }
+
+                        if (trackMap.empty())
+                            cameraIt = cache->entriesByCamera.erase(cameraIt);
+                        else
+                            ++cameraIt;
+                    }
+
+                    // Step 2: if still above capacity, evict oldest entries first.
+                    if (cache->totalEntries <= maxEntries)
+                        return;
+
+                    struct Candidate
+                    {
+                        std::string cameraId;
+                        int trackId = 0;
+                        SteadyClock::time_point lastSeen;
+                    };
+
+                    std::vector<Candidate> candidates;
+                    candidates.reserve(cache->totalEntries);
+
+                    for (const auto& cameraPair: cache->entriesByCamera)
+                    {
+                        const auto& cameraId = cameraPair.first;
+                        const auto& trackMap = cameraPair.second;
+                        for (const auto& trackPair: trackMap)
+                        {
+                            candidates.push_back(Candidate{
+                                cameraId,
+                                trackPair.first,
+                                trackPair.second.lastSeen});
+                        }
+                    }
+
+                    std::sort(
+                        candidates.begin(),
+                        candidates.end(),
+                        [](const Candidate& a, const Candidate& b)
+                        {
+                            return a.lastSeen < b.lastSeen;
+                        });
+
+                    const size_t toRemove = cache->totalEntries - maxEntries;
+                    for (size_t i = 0; i < toRemove && i < candidates.size(); ++i)
+                    {
+                        const Candidate& candidate = candidates[i];
+                        auto cameraIt = cache->entriesByCamera.find(candidate.cameraId);
+                        if (cameraIt == cache->entriesByCamera.end())
+                            continue;
+
+                        auto& trackMap = cameraIt->second;
+                        auto trackIt = trackMap.find(candidate.trackId);
+                        if (trackIt == trackMap.end())
+                            continue;
+
+                        trackMap.erase(trackIt);
+                        if (cache->totalEntries > 0)
+                            --cache->totalEntries;
+
+                        if (trackMap.empty())
+                            cache->entriesByCamera.erase(cameraIt);
+                    }
+                }
+
+                static nx::sdk::Uuid uuidFromTrackId(const std::string& cameraId, int trackId)
+                {
+                    // track_id <= 0 is invalid/unknown; do not cache it.
+                    if (trackId <= 0)
+                        return nx::sdk::UuidHelper::randomUuid();
+
+                    constexpr auto kUuidCacheTtl = std::chrono::minutes(5);
+                    constexpr auto kCleanupInterval = std::chrono::seconds(30);
+                    constexpr size_t kUuidCacheMaxEntries = 20000;
+
+                    TrackUuidCache& cache = trackUuidCache();
+                    const auto now = SteadyClock::now();
+                    const std::string normalizedCameraId = normalizeCameraId(cameraId);
+
+                    std::lock_guard<std::mutex> lk(cache.mutex);
+
+                    if (now - cache.lastCleanup >= kCleanupInterval ||
+                        cache.totalEntries > kUuidCacheMaxEntries)
+                    {
+                        cleanupTrackUuidCacheLocked(
+                            &cache,
+                            now,
+                            kUuidCacheTtl,
+                            kUuidCacheMaxEntries);
+                        cache.lastCleanup = now;
+                    }
+
+                    auto& perCameraMap = cache.entriesByCamera[normalizedCameraId];
+                    auto entryIt = perCameraMap.find(trackId);
+                    if (entryIt != perCameraMap.end())
+                    {
+                        if (now - entryIt->second.lastSeen <= kUuidCacheTtl)
+                        {
+                            entryIt->second.lastSeen = now;
+                            return entryIt->second.uuid;
+                        }
+
+                        perCameraMap.erase(entryIt);
+                        if (cache.totalEntries > 0)
+                            --cache.totalEntries;
+                    }
+
+                    const nx::sdk::Uuid newUuid = nx::sdk::UuidHelper::randomUuid();
+                    perCameraMap.emplace(trackId, TrackUuidEntry{newUuid, now});
+                    ++cache.totalEntries;
+
+                    if (cache.totalEntries > kUuidCacheMaxEntries)
+                    {
+                        cleanupTrackUuidCacheLocked(
+                            &cache,
+                            now,
+                            kUuidCacheTtl,
+                            kUuidCacheMaxEntries);
+                        cache.lastCleanup = now;
+                    }
+
+                    return newUuid;
                 }
 
                 // Gọi Python service, trả về DetectionList (danh sách Detection của plugin)
@@ -237,7 +398,8 @@ namespace sample_company {
 
                     // 2. JSON request body
                     json req;
-                    req["camera_id"] = "nx_camera";  // tạm thời, sau này map đúng ID camera nếu cần
+                    const std::string requestCameraId = "nx_camera";  // Legacy path has no per-device camera id.
+                    req["camera_id"] = requestCameraId;
                     req["image"] = b64;
 
                     // 3. HTTP client -> POST /infer
@@ -325,7 +487,7 @@ namespace sample_company {
 
                         // 🔹 Lấy track_id từ JSON -> UUID ổn định
                         const int trackId = item.value("track_id", 0);
-                        nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+                        nx::sdk::Uuid trackUuid = uuidFromTrackId(requestCameraId, trackId);
 
                         auto detection = std::make_shared<Detection>(Detection{
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
@@ -551,7 +713,7 @@ namespace sample_company {
                             
                             // Get track ID
                             const int trackId = item.value("track_id", 0);
-                            nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+                            nx::sdk::Uuid trackUuid = uuidFromTrackId(cameraId, trackId);
                             
                             // FLOW 2: Include fall_detected flag
                             auto detection = std::make_shared<Detection>(Detection{
