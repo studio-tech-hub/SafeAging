@@ -26,6 +26,7 @@
 #include "detection.h"
 #include "exceptions.h"
 #include "frame.h"
+#include "logging.h"
 
 namespace sample_company
 {
@@ -114,22 +115,21 @@ namespace sample_company
 
                 if (m_frameIndex % 200 == 0)
                 {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "pixel_format",
+                        std::chrono::seconds(30),
+                        "[DBG] pixelFormat=" + std::to_string((int)videoFrame->pixelFormat()) +
+                        " w=" + std::to_string(videoFrame->width()) +
+                        " h=" + std::to_string(videoFrame->height()) +
+                        " lineSize0=" + std::to_string(videoFrame->lineSize(0)));
                 }
 
                 if (m_frameIndex % 200 == 0)
                 {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::info,
-                        "Frame arrived",
-                        ("frame#" + std::to_string(m_frameIndex) +
-                         " w=" + std::to_string(videoFrame->width()) +
-                         " h=" + std::to_string(videoFrame->height()))
-                            .c_str());
+                    Logger::logThrottled(LogLevel::Debug, "frame_arrived",
+                        std::chrono::seconds(30),
+                        "Frame arrived frame#" + std::to_string(m_frameIndex) +
+                        " w=" + std::to_string(videoFrame->width()) +
+                        " h=" + std::to_string(videoFrame->height()));
                 }
 
                 // Nếu detector đã bị terminate cứng (hiếm), chỉ báo 1 lần rồi bỏ qua frame.
@@ -181,12 +181,15 @@ namespace sample_company
                             {
                                 // Drop oldest (front) frame to make room
                                 m_frameQueue.pop_front();
-                                if (m_frameIndex % 20 == 0)
+                                if (!m_frameQueueFullReported)
                                 {
+                                    Logger::log(LogLevel::Warn,
+                                        "Frame queue full - dropping old frames. Worker thread may be slow; increase queue or reduce FPS");
                                     pushPluginDiagnosticEvent(
                                         nx::sdk::IPluginDiagnosticEvent::Level::warning,
                                         "Frame queue full - dropping old frames",
                                         "Worker thread may be slow; increase queue or reduce FPS");
+                                    m_frameQueueFullReported = true;
                                 }
                             }
                             m_frameQueue.push_back(std::move(job));
@@ -611,11 +614,12 @@ namespace sample_company
             {
                 if (m_frameIndex % 200 == 0)
                 {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "process_frame_pixel_format",
+                        std::chrono::seconds(30),
+                        "[DBG] pixelFormat=" + std::to_string((int)videoFrame->pixelFormat()) +
+                        " w=" + std::to_string(videoFrame->width()) +
+                        " h=" + std::to_string(videoFrame->height()) +
+                        " lineSize0=" + std::to_string(videoFrame->lineSize(0)));
                 }
 
                 try
@@ -626,10 +630,9 @@ namespace sample_company
 
                     if (m_frameIndex % 200 == 0)
                     {
-                        pushPluginDiagnosticEvent(
-                            nx::sdk::IPluginDiagnosticEvent::Level::info,
-                            "Calling detector",
-                            "About to call Python /infer endpoint");
+                        Logger::logThrottled(LogLevel::Debug, "calling_detector",
+                            std::chrono::seconds(30),
+                            "Calling detector: about to call Python /infer endpoint");
                     }
 
                     // 1) Gọi Python service -> lấy detections đã có track_id

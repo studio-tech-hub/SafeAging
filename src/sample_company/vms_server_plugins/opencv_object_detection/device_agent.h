@@ -111,6 +111,7 @@ private:
 private:
     bool m_terminated = false;
     bool m_terminatedPrevious = false;
+    bool m_frameQueueFullReported = false;
 
     std::filesystem::path m_pluginHomeDir;
     std::filesystem::path m_modelPath;

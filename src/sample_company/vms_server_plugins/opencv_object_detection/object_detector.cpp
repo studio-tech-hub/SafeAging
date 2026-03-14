@@ -17,6 +17,7 @@
 #endif
 
 #include "json.hpp"
+#include "logging.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -130,8 +131,10 @@ namespace sample_company {
                     const uint8_t* data = bgr.data;
                     size_t dataSize = bgr.total() * bgr.elemSize();
                     
-                    std::cerr << "[C++ encode] Using RAW_BGR: " << bgr.cols << "x" << bgr.rows 
-                              << " data=" << dataSize << " bytes" << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "encode_raw_bgr",
+                        std::chrono::seconds(30),
+                        "[C++ encode] Using RAW_BGR: " + std::to_string(bgr.cols) + "x" + std::to_string(bgr.rows) +
+                        " data=" + std::to_string(dataSize) + " bytes");
                     
                     // Simple format: magic + width + height + raw BGR data
                     std::vector<uchar> buf;
@@ -156,13 +159,16 @@ namespace sample_company {
                     // Add raw BGR data
                     buf.insert(buf.end(), data, data + dataSize);
                     
-                    std::cerr << "[C++ encode] Total buffer: " << buf.size() << " bytes (header=11)" << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "encode_buffer_size",
+                        std::chrono::seconds(30),
+                        "[C++ encode] Total buffer: " + std::to_string(buf.size()) + " bytes (header=11)");
                     
                     if (buf.empty())
                         throw ObjectDetectionError("Encoded buffer is empty");
                     
                     return base64Encode(buf.data(), buf.size());
                 }
+
                 using SteadyClock = std::chrono::steady_clock;
 
                 struct TrackUuidEntry
@@ -371,29 +377,41 @@ namespace sample_company {
                     const int imgW = sendImg.cols;
                     const int imgH = sendImg.rows;
                     
-                    std::cerr << "[C++ infer] Encoding sendImg " << imgW << "x" << imgH 
-                              << " type=" << sendImg.type() << " continuous=" << sendImg.isContinuous() << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "infer_encode_img",
+                        std::chrono::seconds(30),
+                        "[C++ infer] Encoding sendImg " + std::to_string(imgW) + "x" + std::to_string(imgH) +
+                        " type=" + std::to_string(sendImg.type()) + " continuous=" + std::to_string(sendImg.isContinuous()));
                     
                     std::string b64;
                     try
                     {
-                        std::cerr << "[C++ infer] Calling matToBase64Jpeg..." << std::endl;
+                        Logger::logThrottled(LogLevel::Debug, "infer_call_jpeg",
+                            std::chrono::seconds(30),
+                            "[C++ infer] Calling matToBase64Jpeg...");
                         b64 = matToBase64Jpeg(sendImg);
-                        std::cerr << "[C++ infer] matToBase64Jpeg returned, b64 size=" << b64.size() << std::endl;
+                        Logger::logThrottled(LogLevel::Debug, "infer_jpeg_returned",
+                            std::chrono::seconds(30),
+                            "[C++ infer] matToBase64Jpeg returned, b64 size=" + std::to_string(b64.size()));
                     }
                     catch (const std::exception& e)
                     {
-                        std::cerr << "[C++ infer] matToBase64Jpeg threw exception: " << e.what() << std::endl;
+                        Logger::logThrottled(LogLevel::Error, "infer_encode_exception",
+                            std::chrono::seconds(60),
+                            "[C++ infer] matToBase64Jpeg threw exception: " + std::string(e.what()));
                         throw ObjectDetectionError(std::string("Failed to encode image to base64: ") + e.what());
                     }
 
                     if (b64.empty())
                     {
-                        std::cerr << "[C++ infer] ERROR: b64 is empty after encoding!" << std::endl;
+                        Logger::logThrottled(LogLevel::Error, "infer_b64_empty",
+                            std::chrono::seconds(60),
+                            "[C++ infer] ERROR: b64 is empty after encoding!");
                         throw ObjectDetectionError("b64 empty after imencode - image may be invalid");
                     }
                     
-                    std::cerr << "[C++ infer] b64 size OK: " << b64.size() << " bytes" << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "infer_b64_ok",
+                        std::chrono::seconds(30),
+                        "[C++ infer] b64 size OK: " + std::to_string(b64.size()) + " bytes");
 
 
                     // 2. JSON request body
@@ -416,7 +434,7 @@ namespace sample_company {
                     static int s_reqCount = 0;
                     if ((++s_reqCount % 20) == 0)
                     {
-                        std::cerr << "[C++] calling /infer count=" << s_reqCount << std::endl;
+                        Logger::log(LogLevel::Info, "[C++] calling /infer count=" + std::to_string(s_reqCount));
                     }
 
                     auto res = cli.Post("/infer", req.dump(), "application/json");
@@ -427,8 +445,9 @@ namespace sample_company {
                         static int s_fail = 0;
                         if ((++s_fail % 200) == 0)
                         {
-                            std::cerr << "[C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
+                            Logger::log(LogLevel::Error, "[C++] /infer failed (no response)");
+                            Logger::log(LogLevel::Error, "[C++] Python service at 127.0.0.1:18000 may not be running.");
+                        }
                         }
                         return {};
                     }
@@ -437,8 +456,8 @@ namespace sample_company {
                     {
                         static int s_bad = 0;
                         if ((++s_bad % 200) == 0)
-                            std::cerr << "[C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
+                            Logger::log(LogLevel::Error, "[C++] /infer status=" + std::to_string(res->status) +
+                                " body=" + res->body.substr(0, 100));
                         return {};
                     }
 
@@ -502,8 +521,8 @@ namespace sample_company {
                     static int s_log = 0;
                     if ((++s_log % 100) == 0)
                     {
-                        std::cerr << "[C++] detections=" << result.size()
-                            << " img=" << imgW << "x" << imgH << std::endl;
+                        Logger::log(LogLevel::Info, "[C++] detections=" + std::to_string(result.size()) +
+                            " img=" + std::to_string(imgW) + "x" + std::to_string(imgH));
                     }
 
                     return result;
@@ -627,8 +646,8 @@ namespace sample_company {
                     static int s_reqCount = 0;
                     if ((++s_reqCount % 20) == 0)
                     {
-                        std::cerr << "[FLOW2 C++] Calling /infer with JPEG, count=" << s_reqCount 
-                                  << " jpegSize=" << jpegBytes.size() << " bytes" << std::endl;
+                        Logger::log(LogLevel::Info, "[FLOW2 C++] Calling /infer with JPEG, count=" + std::to_string(s_reqCount) +
+                            " jpegSize=" + std::to_string(jpegBytes.size()) + " bytes");
                     }
                     
                     // POST /infer endpoint
@@ -639,8 +658,8 @@ namespace sample_company {
                         static int s_fail = 0;
                         if ((++s_fail % 200) == 0)
                         {
-                            std::cerr << "[FLOW2 C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[FLOW2 C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
+                            Logger::log(LogLevel::Error, "[FLOW2 C++] /infer failed (no response)");
+                            Logger::log(LogLevel::Error, "[FLOW2 C++] Python service at 127.0.0.1:18000 may not be running.");
                         }
                         throw ObjectDetectionError("No response from /infer endpoint");
                     }
@@ -650,8 +669,8 @@ namespace sample_company {
                         static int s_bad = 0;
                         if ((++s_bad % 200) == 0)
                         {
-                            std::cerr << "[FLOW2 C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
+                            Logger::log(LogLevel::Error, "[FLOW2 C++] /infer status=" + std::to_string(res->status) +
+                                " body=" + res->body.substr(0, 100));
                         }
                         throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
                     }
@@ -728,7 +747,9 @@ namespace sample_company {
                         }
                         catch (const std::exception& e)
                         {
-                            std::cerr << "[FLOW2 C++] Error parsing detection item: " << e.what() << std::endl;
+                            Logger::logThrottled(LogLevel::Error, "flow2_parse_error",
+                                std::chrono::seconds(60),
+                                "[FLOW2 C++] Error parsing detection item: " + std::string(e.what()));
                             continue;  // Skip bad items
                         }
                     }
@@ -736,7 +757,7 @@ namespace sample_company {
                     static int s_log = 0;
                     if ((++s_log % 100) == 0)
                     {
-                        std::cerr << "[FLOW2 C++] detections=" << result.size() << std::endl;
+                        Logger::log(LogLevel::Info, "[FLOW2 C++] detections=" + std::to_string(result.size()));
                     }
                     
                     return result;
