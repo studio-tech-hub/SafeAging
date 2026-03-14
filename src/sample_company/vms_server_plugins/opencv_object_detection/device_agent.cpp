@@ -46,6 +46,7 @@ namespace sample_company
                 : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
                   m_pluginHomeDir(std::move(pluginHomeDir)),
                   m_modelPath(std::move(modelPath)),
+                  m_cameraId(getCameraIdFromDeviceInfo(deviceInfo)),
                   m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
                   m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
@@ -65,6 +66,31 @@ namespace sample_company
                 {
                     m_workerThread.join();
                 }
+            }
+
+            std::string DeviceAgent::getCameraIdFromDeviceInfo(const nx::sdk::IDeviceInfo* deviceInfo)
+            {
+                if (!deviceInfo)
+                    return "unknown_camera";
+
+                // Get the device ID from NX SDK
+                std::string deviceId = deviceInfo->id();
+
+                // Normalize: replace non-alphanumeric with underscores, lowercase
+                std::string normalizedId;
+                for (char c : deviceId)
+                {
+                    if (std::isalnum(c))
+                        normalizedId += std::tolower(c);
+                    else
+                        normalizedId += '_';
+                }
+
+                // Ensure not empty
+                if (normalizedId.empty())
+                    normalizedId = "camera_" + std::to_string(reinterpret_cast<uintptr_t>(deviceInfo));
+
+                return normalizedId;
             }
 
             std::string DeviceAgent::manifestString() const
@@ -169,7 +195,7 @@ namespace sample_company
                         // Create frame job
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
-                        job.cameraId = "nx_camera"; // TODO: Get from device info
+                        job.cameraId = m_cameraId;
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 

@@ -66,6 +66,8 @@ protected:
 private:
     void reinitializeObjectTrackerOnFrameSizeChanges(const Frame& frame);
 
+    std::string getCameraIdFromDeviceInfo(const nx::sdk::IDeviceInfo* deviceInfo);
+
     nx::sdk::Ptr<nx::sdk::analytics::ObjectMetadataPacket> detectionsToObjectMetadataPacket(
         const DetectionList& detections,
         int64_t timestampUs);
@@ -115,6 +117,7 @@ private:
 
     std::filesystem::path m_pluginHomeDir;
     std::filesystem::path m_modelPath;
+    std::string m_cameraId;
 
     const std::unique_ptr<ObjectDetector> m_objectDetector;
     std::unique_ptr<ObjectTracker> m_objectTracker;
