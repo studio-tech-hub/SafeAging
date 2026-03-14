@@ -3,6 +3,8 @@
 // Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
 
 #include "device_agent.h"
+#include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <iostream>
 #include <chrono>
@@ -52,6 +54,8 @@ namespace sample_company
                   m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
                   m_workerShouldStop(false)
             {
+                loadRuntimeConfig(deviceInfo);
+                m_lastQueueDiagnosticsTime = std::chrono::steady_clock::now();
             }
 
             std::string DeviceAgent::getCameraIdFromDeviceInfo(const nx::sdk::IDeviceInfo* deviceInfo)
@@ -110,6 +114,75 @@ namespace sample_company
 
                 // Ultimate fallback
                 return "fallback_camera";
+            }
+
+            void DeviceAgent::loadRuntimeConfig(const nx::sdk::IDeviceInfo* deviceInfo)
+            {
+                // Read settings from environment variables for runtime tuning.
+                // TODO: If NX SDK provides a direct settings API, replace with it.
+
+                int framePeriod = kDetectionFramePeriodDefault;
+                size_t queueMax = kFrameQueueMaxSizeDefault;
+                int diagInterval = kQueueDiagnosticsIntervalSecDefault;
+
+                if (const char* env = std::getenv("FRAME_DETECTION_PERIOD"))
+                    framePeriod = std::atoi(env);
+                if (const char* env = std::getenv("FRAME_QUEUE_MAX_SIZE"))
+                    queueMax = static_cast<size_t>(std::atoi(env));
+                if (const char* env = std::getenv("QUEUE_DIAGNOSTICS_INTERVAL_SEC"))
+                    diagInterval = std::atoi(env);
+
+                if (deviceInfo)
+                {
+                    // Optional: SDK-specific setting access path if available.
+                    // Example placeholders (uncomment and adapt when SDK API is known):
+                    // auto settings = deviceInfo->settings();
+                    // if (settings) { ... }
+                }
+
+                m_detectionFramePeriod = clampConfigValue(framePeriod, kDetectionFramePeriodMin, kDetectionFramePeriodMax);
+                m_frameQueueMaxSize = clampConfigValue(queueMax, kFrameQueueMaxSizeMin, kFrameQueueMaxSizeMax);
+                m_queueDiagnosticsIntervalSec = clampConfigValue(diagInterval, kQueueDiagnosticsIntervalSecMin, kQueueDiagnosticsIntervalSecMax);
+
+                Logger::log(LogLevel::Info, "queue_config",
+                    "framePeriod=" + std::to_string(m_detectionFramePeriod.load()) +
+                    " queueMax=" + std::to_string(m_frameQueueMaxSize.load()) +
+                    " diagnosticsSec=" + std::to_string(m_queueDiagnosticsIntervalSec.load()));
+            }
+
+            template<typename T>
+            T DeviceAgent::clampConfigValue(T value, T minValue, T maxValue) const
+            {
+                if (value < minValue) return minValue;
+                if (value > maxValue) return maxValue;
+                return value;
+            }
+
+            void DeviceAgent::emitQueueDiagnosticsIfNeeded(size_t currentDepth)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const int intervalSec = m_queueDiagnosticsIntervalSec.load();
+                if (intervalSec <= 0)
+                    return;
+
+                const auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastQueueDiagnosticsTime);
+                if (duration.count() < intervalSec)
+                    return;
+
+                m_lastQueueDiagnosticsTime = now;
+
+                const std::string message =
+                    "cameraId=" + m_cameraId +
+                    " enqueued=" + std::to_string(m_enqueuedCount.load()) +
+                    " dropped=" + std::to_string(m_droppedCount.load()) +
+                    " processed=" + std::to_string(m_processedCount.load()) +
+                    " maxDepth=" + std::to_string(m_maxQueueDepth.load()) +
+                    " currentDepth=" + std::to_string(currentDepth);
+
+                Logger::log(LogLevel::Info, "queue_diagnostics", message);
+                pushPluginDiagnosticEvent(nx::sdk::IPluginDiagnosticEvent::Level::info,
+                    "Queue diagnostics",
+                    message);
             }
 
             DeviceAgent::~DeviceAgent()
@@ -213,8 +286,11 @@ namespace sample_company
                 // ============================================================
 
                 // 🔻 Process detection frames regularly:
-                const int kPeriod = kDetectionFramePeriod;
-                if (m_frameIndex % kPeriod == 0)
+                const int framePeriod = m_detectionFramePeriod.load();
+                if (framePeriod <= 0 || framePeriod > kDetectionFramePeriodMax)
+                    framePeriod = kDetectionFramePeriodDefault;
+
+                if (m_frameIndex % framePeriod == 0)
                 {
                     try
                     {
@@ -232,14 +308,20 @@ namespace sample_company
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 
-                        // ⚠️ BACKPRESSURE: bounded queue (size 3)
-                        // If queue is full, drop oldest frame and add newest
+                        // ⚠️ BACKPRESSURE: bounded queue.
+                        // If queue is full, drop oldest frame and add newest.
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
-                            if (m_frameQueue.size() >= kFrameQueueMaxSize)
+                            const auto queueMax = m_frameQueueMaxSize.load();
+                            if (queueMax <= 0)
+                                queueMax = kFrameQueueMaxSizeDefault;
+
+                            if (m_frameQueue.size() >= queueMax)
                             {
                                 // Drop oldest (front) frame to make room
                                 m_frameQueue.pop_front();
+                                ++m_droppedCount;
+
                                 if (!m_frameQueueFullReported)
                                 {
                                     Logger::log(LogLevel::Warn,
@@ -247,6 +329,32 @@ namespace sample_company
                                     pushPluginDiagnosticEvent(
                                         nx::sdk::IPluginDiagnosticEvent::Level::warning,
                                         "Frame queue full - dropping old frames",
+                                        "Worker thread may be slow; increase queue or reduce FPS");
+                                    m_frameQueueFullReported = true;
+                                }
+                            }
+
+                            m_frameQueue.push_back(std::move(job));
+                            ++m_enqueuedCount;
+                            m_maxQueueDepth.store(std::max(m_maxQueueDepth.load(), m_frameQueue.size()));
+
+                            emitQueueDiagnosticsIfNeeded(m_frameQueue.size());
+                        }
+
+                        m_frameQueueCV.notify_one(); // Wake up worker thread
+                    }
+                    catch (const std::exception &e)
+                    {
+                        pushPluginDiagnosticEvent(
+                            nx::sdk::IPluginDiagnosticEvent::Level::error,
+                            "Frame encoding error",
+                            e.what());
+                    }
+                }
+
+                ++m_frameIndex;
+                return true; // ✓ Frame callback returns immediately
+            }
                                         "Worker thread may be slow; increase queue or reduce FPS");
                                     m_frameQueueFullReported = true;
                                 }
@@ -341,6 +449,7 @@ namespace sample_company
                     try
                     {
                         MetadataPacketList metadataPackets = processFrameJob(job);
+                        ++m_processedCount;
 
                         // Enqueue metadata packets for Nx to pull
                         {

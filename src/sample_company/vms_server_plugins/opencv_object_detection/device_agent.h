@@ -4,15 +4,17 @@
 
 #pragma once
 
-#include <filesystem>
-#include <memory>
-#include <vector>
-#include <set>
-#include <queue>
-#include <thread>
-#include <mutex>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <set>
+#include <thread>
+#include <vector>
 
 #include <nx/sdk/analytics/helpers/event_metadata_packet.h>
 #include <nx/sdk/analytics/helpers/object_metadata_packet.h>
@@ -65,6 +67,9 @@ protected:
 
 private:
     std::string getCameraIdFromDeviceInfo(const nx::sdk::IDeviceInfo* deviceInfo);
+    void loadRuntimeConfig(const nx::sdk::IDeviceInfo* deviceInfo);
+    template<typename T> T clampConfigValue(T value, T minValue, T maxValue) const;
+    void emitQueueDiagnosticsIfNeeded(size_t currentDepth);
     void reinitializeObjectTrackerOnFrameSizeChanges(const Frame& frame);
 
     nx::sdk::Ptr<nx::sdk::analytics::ObjectMetadataPacket> detectionsToObjectMetadataPacket(
@@ -103,11 +108,20 @@ private:
     // FLOW 2: Fall Detection Event
     const std::string kFallDetectedEventType = "mycompany.yolov8_people_analytics.fallDetected";
 
-    /** Process every 2nd frame for better detection frequency (reasonable balance). */
-    static constexpr int kDetectionFramePeriod = 2;
-    
-    // ============ FLOW 2: Frame queue config ============
-    static constexpr size_t kFrameQueueMaxSize = 3;  // Drop old frames if queue full
+    // ----------------------------------------------
+    // Runtime-configurable per-camera queue settings
+    // ----------------------------------------------
+    static constexpr int kDetectionFramePeriodDefault = 2;
+    static constexpr int kDetectionFramePeriodMin = 1;
+    static constexpr int kDetectionFramePeriodMax = 30;
+
+    static constexpr size_t kFrameQueueMaxSizeDefault = 3;
+    static constexpr size_t kFrameQueueMaxSizeMin = 1;
+    static constexpr size_t kFrameQueueMaxSizeMax = 100;
+
+    static constexpr int kQueueDiagnosticsIntervalSecDefault = 30;
+    static constexpr int kQueueDiagnosticsIntervalSecMin = 5;
+    static constexpr int kQueueDiagnosticsIntervalSecMax = 300;
 
 private:
     bool m_terminated = false;
@@ -119,6 +133,18 @@ private:
     std::string m_cameraId;
     std::unique_ptr<ObjectTracker> m_objectTracker;
     int m_frameIndex = 0;
+
+    // Runtime-configurable values (from settings)
+    std::atomic<int> m_detectionFramePeriod{ kDetectionFramePeriodDefault };
+    std::atomic<size_t> m_frameQueueMaxSize{ kFrameQueueMaxSizeDefault };
+    std::atomic<int> m_queueDiagnosticsIntervalSec{ kQueueDiagnosticsIntervalSecDefault };
+
+    // Queue telemetry counters (thread-safe)
+    std::atomic<uint64_t> m_enqueuedCount{0};
+    std::atomic<uint64_t> m_droppedCount{0};
+    std::atomic<uint64_t> m_processedCount{0};
+    std::atomic<size_t> m_maxQueueDepth{0};
+    std::chrono::steady_clock::time_point m_lastQueueDiagnosticsTime = std::chrono::steady_clock::now();
 
     int m_previousFrameWidth = 0;
     int m_previousFrameHeight = 0;

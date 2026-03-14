@@ -16,6 +16,30 @@
                 "name": "enabled",
                 "caption": "Enable Detection",
                 "defaultValue": true
+            },
+            {
+                "type": "Number",
+                "name": "frameQueueMaxSize",
+                "caption": "Frame queue max size",
+                "defaultValue": 3,
+                "minimum": 1,
+                "maximum": 100
+            },
+            {
+                "type": "Number",
+                "name": "detectionFramePeriod",
+                "caption": "Detection frame period",
+                "defaultValue": 2,
+                "minimum": 1,
+                "maximum": 30
+            },
+            {
+                "type": "Number",
+                "name": "queueDiagnosticsIntervalSec",
+                "caption": "Queue diagnostics interval (sec)",
+                "defaultValue": 30,
+                "minimum": 5,
+                "maximum": 300
             }
         ]
     },
