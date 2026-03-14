@@ -54,6 +54,64 @@ namespace sample_company
             {
             }
 
+            std::string DeviceAgent::getCameraIdFromDeviceInfo(const nx::sdk::IDeviceInfo* deviceInfo)
+            {
+                if (!deviceInfo)
+                    return "unknown_camera";
+
+                // Try to get the device ID from NX SDK
+                std::string deviceId = deviceInfo->id();
+                if (!deviceId.empty())
+                {
+                    // Normalize: replace non-alphanumeric chars with underscores, lowercase
+                    std::string normalized;
+                    for (char c : deviceId)
+                    {
+                        if (std::isalnum(c))
+                            normalized += std::tolower(c);
+                        else
+                            normalized += '_';
+                    }
+                    return normalized;
+                }
+
+                // Fallback: use logical ID if available
+                if (deviceInfo->logicalId() != nullptr)
+                {
+                    std::string logicalId = deviceInfo->logicalId();
+                    if (!logicalId.empty())
+                    {
+                        std::string normalized;
+                        for (char c : logicalId)
+                        {
+                            if (std::isalnum(c))
+                                normalized += std::tolower(c);
+                            else
+                                normalized += '_';
+                        }
+                        return "logical_" + normalized;
+                    }
+                }
+
+                // Last resort: deterministic fallback based on name or other info
+                std::string name = deviceInfo->name();
+                if (!name.empty())
+                {
+                    std::string normalized;
+                    for (char c : name)
+                    {
+                        if (std::isalnum(c))
+                            normalized += std::tolower(c);
+                        else
+                            normalized += '_';
+                    }
+                    return "name_" + normalized;
+                }
+
+                // Ultimate fallback
+                return "fallback_camera";
+            }
+
             DeviceAgent::~DeviceAgent()
             {
                 // FLOW 2: Signal worker thread to stop and wait for it
@@ -66,31 +124,6 @@ namespace sample_company
                 {
                     m_workerThread.join();
                 }
-            }
-
-            std::string DeviceAgent::getCameraIdFromDeviceInfo(const nx::sdk::IDeviceInfo* deviceInfo)
-            {
-                if (!deviceInfo)
-                    return "unknown_camera";
-
-                // Get the device ID from NX SDK
-                std::string deviceId = deviceInfo->id();
-
-                // Normalize: replace non-alphanumeric with underscores, lowercase
-                std::string normalizedId;
-                for (char c : deviceId)
-                {
-                    if (std::isalnum(c))
-                        normalizedId += std::tolower(c);
-                    else
-                        normalizedId += '_';
-                }
-
-                // Ensure not empty
-                if (normalizedId.empty())
-                    normalizedId = "camera_" + std::to_string(reinterpret_cast<uintptr_t>(deviceInfo));
-
-                return normalizedId;
             }
 
             std::string DeviceAgent::manifestString() const
