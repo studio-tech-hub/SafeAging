@@ -1,4 +1,4 @@
-// device_agent.h
+﻿// device_agent.h
 // Copyright 2018-present Network Optix, Inc.
 // Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
 
@@ -114,6 +114,7 @@ private:
 
     std::filesystem::path m_pluginHomeDir;
     std::filesystem::path m_modelPath;
+    std::string m_cameraId;
 
     const std::unique_ptr<ObjectDetector> m_objectDetector;
     std::unique_ptr<ObjectTracker> m_objectTracker;
@@ -122,11 +123,11 @@ private:
     int m_previousFrameWidth = 0;
     int m_previousFrameHeight = 0;
 
-    // ====== ĐẾM NGƯỜI ======
-    // Số người trong frame hiện tại (persons đang thấy trên màn hình).
+    // ====== Äáº¾M NGÆ¯á»œI ======
+    // Sá»‘ ngÆ°á»i trong frame hiá»‡n táº¡i (persons Ä‘ang tháº¥y trÃªn mÃ n hÃ¬nh).
     int m_currentPersons = 0;
 
-    // Tập các trackId person đã từng xuất hiện (đếm không trùng).
+    // Táº­p cÃ¡c trackId person Ä‘Ã£ tá»«ng xuáº¥t hiá»‡n (Ä‘áº¿m khÃ´ng trÃ¹ng).
     std::set<nx::sdk::Uuid> m_seenPersonIds;
     
     // ============ FLOW 2: Async frame processing ============
@@ -153,3 +154,4 @@ private:
 } // namespace opencv_object_detection
 } // namespace vms_server_plugins
 } // namespace sample_company
+

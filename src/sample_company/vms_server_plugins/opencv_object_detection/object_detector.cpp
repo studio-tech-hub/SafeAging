@@ -1,4 +1,4 @@
-#include "object_detector.h"
+﻿#include "object_detector.h"
 #include "exceptions.h"
 #include "frame.h"
 
@@ -17,6 +17,7 @@
 #endif
 
 #include "json.hpp"
+#include <cstdlib>
 #include <unordered_map>
 #include <mutex>
 
@@ -32,7 +33,7 @@ namespace sample_company {
             //-------------------------------------------------------------------------------------------------
             // Base64 helper (encode buffer -> base64 string)
 
-            // (có thể để trong anonymous namespace)
+            // (cÃ³ thá»ƒ Ä‘á»ƒ trong anonymous namespace)
             namespace {
 
                 static const std::string kBase64Chars =
@@ -87,6 +88,19 @@ namespace sample_company {
                     }
 
                     return out;
+                }
+
+                std::string getInferApiKeyFromEnv()
+                {
+                    const char* aiApiKey = std::getenv("AI_API_KEY");
+                    if (aiApiKey && *aiApiKey)
+                        return std::string(aiApiKey);
+
+                    const char* apiKey = std::getenv("API_KEY");
+                    if (apiKey && *apiKey)
+                        return std::string(apiKey);
+
+                    return {};
                 }
 
                 std::string matToBase64Jpeg(const cv::Mat& frame)
@@ -172,13 +186,13 @@ namespace sample_company {
                     if (it != map.end())
                         return it->second;
 
-                    // tạo 1 UUID mới và cache lại cho trackId này
+                    // táº¡o 1 UUID má»›i vÃ  cache láº¡i cho trackId nÃ y
                     nx::sdk::Uuid u = nx::sdk::UuidHelper::randomUuid();
                     map.emplace(trackId, u);
                     return u;
                 }
 
-                // Gọi Python service, trả về DetectionList (danh sách Detection của plugin)
+                // Gá»i Python service, tráº£ vá» DetectionList (danh sÃ¡ch Detection cá»§a plugin)
                 DetectionList callPythonService(const Frame& frame)
                 {
                     DetectionList result;
@@ -191,14 +205,14 @@ namespace sample_company {
                     auto now = std::chrono::steady_clock::now();
                     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCall).count();
 
-                    // ví dụ: chỉ gọi tối đa 5 lần/giây
+                    // vÃ­ dá»¥: chá»‰ gá»i tá»‘i Ä‘a 5 láº§n/giÃ¢y
                     if (ms < 200)
                         return {};
                     lastCall = now;
 
-                // Resize để giảm thời gian imencode/base64 và tăng FPS tổng
+                // Resize Ä‘á»ƒ giáº£m thá»i gian imencode/base64 vÃ  tÄƒng FPS tá»•ng
                     cv::Mat sendImg = image;
-                    const int targetW = 640; // bạn có thể thử 416 nếu máy yếu
+                    const int targetW = 640; // báº¡n cÃ³ thá»ƒ thá»­ 416 náº¿u mÃ¡y yáº¿u
                     if (image.cols > targetW)
                     {
                         float scale = (float)targetW / (float)image.cols;
@@ -237,15 +251,17 @@ namespace sample_company {
 
                     // 2. JSON request body
                     json req;
-                    req["camera_id"] = "nx_camera";  // tạm thời, sau này map đúng ID camera nếu cần
+                                        thread_local const std::string kFallbackCameraId =
+                        "nx_camera_legacy_" + nx::sdk::UuidHelper::toStdString(nx::sdk::UuidHelper::randomUuid());
+                    req["camera_id"] = kFallbackCameraId;  // fallback legacy path
                     req["image"] = b64;
 
                     // 3. HTTP client -> POST /infer
-                    // Reuse client để đỡ tạo kết nối liên tục mỗi frame
+                    // Reuse client Ä‘á»ƒ Ä‘á»¡ táº¡o káº¿t ná»‘i liÃªn tá»¥c má»—i frame
                     thread_local httplib::Client cli("127.0.0.1", 18000);
-                    cli.set_keep_alive(true); // Keep connection alive để tái sử dụng
+                    cli.set_keep_alive(true); // Keep connection alive Ä‘á»ƒ tÃ¡i sá»­ dá»¥ng
 
-                    // Tăng timeout để Python service có thời gian xử lý
+                    // TÄƒng timeout Ä‘á»ƒ Python service cÃ³ thá»i gian xá»­ lÃ½
                     cli.set_connection_timeout(1, 500000); // 1.5s (1s + 500ms)
                     cli.set_read_timeout(2, 500000);       // 2.5s (2s + 500ms)
                     cli.set_write_timeout(1, 0);           // 1s
@@ -257,9 +273,15 @@ namespace sample_company {
                         std::cerr << "[C++] calling /infer count=" << s_reqCount << std::endl;
                     }
 
-                    auto res = cli.Post("/infer", req.dump(), "application/json");
+                    const std::string apiKey = getInferApiKeyFromEnv();
+                    httplib::Headers headers;
+                    if (!apiKey.empty())
+                        headers.emplace("X-API-Key", apiKey);
+                    auto res = headers.empty()
+                        ? cli.Post("/infer", req.dump(), "application/json")
+                        : cli.Post("/infer", headers, req.dump(), "application/json");
 
-                    // ❗ res là pointer-like
+                    // â— res lÃ  pointer-like
                     if (!res)
                     {
                         static int s_fail = 0;
@@ -293,7 +315,7 @@ namespace sample_company {
                     if (!j.is_array())
                         return {};
 
-                    // 5. Mỗi phần tử là 1 detection:
+                    // 5. Má»—i pháº§n tá»­ lÃ  1 detection:
                     //    { "cls": "person", "score": 0.9, "x": 180.0, "y": 270.6, "w": 120.0, "h": 360.8, "track_id": 1 }
                     for (const auto& item : j)
                     {
@@ -308,13 +330,13 @@ namespace sample_company {
                         if (w <= 0.0f || h <= 0.0f)
                             continue;
 
-                        // Chuyển từ toạ độ pixel sang normalized [0..1]
+                        // Chuyá»ƒn tá»« toáº¡ Ä‘á»™ pixel sang normalized [0..1]
                         float xNorm = x / static_cast<float>(imgW);
                         float yNorm = y / static_cast<float>(imgH);
                         float wNorm = w / static_cast<float>(imgW);
                         float hNorm = h / static_cast<float>(imgH);
 
-                        // Clamp lại cho chắc
+                        // Clamp láº¡i cho cháº¯c
                         if (xNorm < 0.0f) xNorm = 0.0f;
                         if (yNorm < 0.0f) yNorm = 0.0f;
                         if (xNorm + wNorm > 1.0f) wNorm = 1.0f - xNorm;
@@ -323,7 +345,7 @@ namespace sample_company {
                         if (wNorm <= 0.0f || hNorm <= 0.0f)
                             continue;
 
-                        // 🔹 Lấy track_id từ JSON -> UUID ổn định
+                        // ðŸ”¹ Láº¥y track_id tá»« JSON -> UUID á»•n Ä‘á»‹nh
                         const int trackId = item.value("track_id", 0);
                         nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
 
@@ -365,7 +387,7 @@ namespace sample_company {
                         "Object detector initialization error: object detector is terminated.");
                 }
 
-                // Không load model trong C++ nữa, chỉ cần đánh dấu là "loaded".
+                // KhÃ´ng load model trong C++ ná»¯a, chá»‰ cáº§n Ä‘Ã¡nh dáº¥u lÃ  "loaded".
                 m_netLoaded = true;
             }
 
@@ -390,7 +412,7 @@ namespace sample_company {
                 }
                 catch (const ObjectDetectionError&)
                 {
-                    // ĐỂ CHO device_agent.cpp bắt và push event
+                    // Äá»‚ CHO device_agent.cpp báº¯t vÃ  push event
                     throw;
                 }
                 catch (const cv::Exception& e)
@@ -470,7 +492,13 @@ namespace sample_company {
                     }
                     
                     // POST /infer endpoint
-                    auto res = cli.Post("/infer", jsonBody, "application/json");
+                    const std::string apiKey = getInferApiKeyFromEnv();
+                    httplib::Headers headers;
+                    if (!apiKey.empty())
+                        headers.emplace("X-API-Key", apiKey);
+                    auto res = headers.empty()
+                        ? cli.Post("/infer", jsonBody, "application/json")
+                        : cli.Post("/infer", headers, jsonBody, "application/json");
                     
                     if (!res)
                     {
@@ -592,10 +620,10 @@ namespace sample_company {
             //-------------------------------------------------------------------------------------------------
             // private
 
-            // Hàm loadModel() cũ không còn dùng nữa, nhưng giữ lại cho đủ định nghĩa (nếu header còn khai báo).
+            // HÃ m loadModel() cÅ© khÃ´ng cÃ²n dÃ¹ng ná»¯a, nhÆ°ng giá»¯ láº¡i cho Ä‘á»§ Ä‘á»‹nh nghÄ©a (náº¿u header cÃ²n khai bÃ¡o).
             void ObjectDetector::loadModel()
             {
-                // KHÔNG còn dùng OpenCV DNN / ONNX nữa.
+                // KHÃ”NG cÃ²n dÃ¹ng OpenCV DNN / ONNX ná»¯a.
             }
 
             DetectionList ObjectDetector::runImpl(const Frame& frame)
@@ -606,10 +634,12 @@ namespace sample_company {
                         "Object detection error: object detector is terminated.");
                 }
 
-                // Thay toàn bộ logic ONNX cũ bằng gọi Python service:
+                // Thay toÃ n bá»™ logic ONNX cÅ© báº±ng gá»i Python service:
                 return callPythonService(frame);
             }
 
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins
 } // namespace sample_company
+
+

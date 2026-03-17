@@ -1,4 +1,4 @@
-// device_agent.cpp
+﻿// device_agent.cpp
 // Copyright 2018-present Network Optix, Inc.
 // Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
 
@@ -45,6 +45,7 @@ namespace sample_company
                 : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
                   m_pluginHomeDir(std::move(pluginHomeDir)),
                   m_modelPath(std::move(modelPath)),
+                  m_cameraId("nx_camera_" + nx::sdk::UuidHelper::toStdString(nx::sdk::UuidHelper::randomUuid())),
                   m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
                   m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
@@ -132,7 +133,7 @@ namespace sample_company
                             .c_str());
                 }
 
-                // Nếu detector đã bị terminate cứng (hiếm), chỉ báo 1 lần rồi bỏ qua frame.
+                // Náº¿u detector Ä‘Ã£ bá»‹ terminate cá»©ng (hiáº¿m), chá»‰ bÃ¡o 1 láº§n rá»“i bá» qua frame.
                 m_terminated = m_terminated || m_objectDetector->isTerminated();
                 if (m_terminated)
                 {
@@ -153,7 +154,7 @@ namespace sample_company
                 //         This callback returns immediately (NON-BLOCKING).
                 // ============================================================
 
-                // 🔻 Process detection frames regularly:
+                // ðŸ”» Process detection frames regularly:
                 const int kPeriod = kDetectionFramePeriod;
                 if (m_frameIndex % kPeriod == 0)
                 {
@@ -169,11 +170,11 @@ namespace sample_company
                         // Create frame job
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
-                        job.cameraId = "nx_camera"; // TODO: Get from device info
+                        job.cameraId = m_cameraId;
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 
-                        // ⚠️ BACKPRESSURE: bounded queue (size 3)
+                        // âš ï¸ BACKPRESSURE: bounded queue (size 3)
                         // If queue is full, drop oldest frame and add newest
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
@@ -203,7 +204,7 @@ namespace sample_company
                 }
 
                 ++m_frameIndex;
-                return true; // ✓ Frame callback returns immediately
+                return true; // âœ“ Frame callback returns immediately
             }
 
             bool DeviceAgent::pullMetadataPackets(
@@ -520,7 +521,7 @@ namespace sample_company
 
                 const auto objectMetadataPacket = makePtr<ObjectMetadataPacket>();
 
-                // --- PASS 1: đếm số person trong frame, gom trackId ---
+                // --- PASS 1: Ä‘áº¿m sá»‘ person trong frame, gom trackId ---
                 m_currentPersons = 0;
                 std::set<nx::sdk::Uuid> framePersonIds;
 
@@ -533,11 +534,11 @@ namespace sample_company
                     }
                 }
 
-                // Cập nhật tập trackId đã từng xuất hiện (đếm không trùng)
+                // Cáº­p nháº­t táº­p trackId Ä‘Ã£ tá»«ng xuáº¥t hiá»‡n (Ä‘áº¿m khÃ´ng trÃ¹ng)
                 m_seenPersonIds.insert(framePersonIds.begin(), framePersonIds.end());
                 const int totalUniquePersons = static_cast<int>(m_seenPersonIds.size());
 
-                // --- PASS 2: tạo ObjectMetadata + gắn attribute + caption ---
+                // --- PASS 2: táº¡o ObjectMetadata + gáº¯n attribute + caption ---
                 for (const std::shared_ptr<Detection> &detection : detections)
                 {
                     auto objectMetadata = makePtr<ObjectMetadata>();
@@ -550,19 +551,19 @@ namespace sample_company
                     {
                         objectMetadata->setTypeId(kPersonObjectType);
 
-                        // 1) id từng người (trackId)
+                        // 1) id tá»«ng ngÆ°á»i (trackId)
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::string,
                             "yolov8_person_id",
                             nx::sdk::UuidHelper::toStdString(detection->trackId)));
 
-                        // 2) số người đang có trong frame hiện tại
+                        // 2) sá»‘ ngÆ°á»i Ä‘ang cÃ³ trong frame hiá»‡n táº¡i
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::number,
                             "yolov8_person_count_frame",
                             std::to_string(m_currentPersons)));
 
-                        // 3) tổng số người khác nhau đã đi qua (đếm không trùng)
+                        // 3) tá»•ng sá»‘ ngÆ°á»i khÃ¡c nhau Ä‘Ã£ Ä‘i qua (Ä‘áº¿m khÃ´ng trÃ¹ng)
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::number,
                             "yolov8_person_count_unique",
@@ -620,7 +621,7 @@ namespace sample_company
 
                 try
                 {
-                    // ⚠️ Frame constructor có thể ném exception (unsupported pixel format, cvtColor fail, etc)
+                    // âš ï¸ Frame constructor cÃ³ thá»ƒ nÃ©m exception (unsupported pixel format, cvtColor fail, etc)
                     Frame frame(videoFrame, m_frameIndex);
                     reinitializeObjectTrackerOnFrameSizeChanges(frame);
 
@@ -632,14 +633,14 @@ namespace sample_company
                             "About to call Python /infer endpoint");
                     }
 
-                    // 1) Gọi Python service -> lấy detections đã có track_id
+                    // 1) Gá»i Python service -> láº¥y detections Ä‘Ã£ cÃ³ track_id
                     DetectionList detections = m_objectDetector->run(frame);
 
-                    // 2) Dùng trực tiếp detections từ Python để tạo ObjectMetadata
+                    // 2) DÃ¹ng trá»±c tiáº¿p detections tá»« Python Ä‘á»ƒ táº¡o ObjectMetadata
                     const auto &objectMetadataPacket =
                         detectionsToObjectMetadataPacket(detections, frame.timestampUs);
 
-                    // 3) Không còn events từ tracking, nên truyền EventList rỗng
+                    // 3) KhÃ´ng cÃ²n events tá»« tracking, nÃªn truyá»n EventList rá»—ng
                     EventList emptyEvents;
                     const auto &eventMetadataPacketList =
                         eventsToEventMetadataPacketList(emptyEvents, frame.timestampUs);
@@ -657,8 +658,8 @@ namespace sample_company
                 }
                 catch (const ObjectDetectionError &e)
                 {
-                    // Log error nhưng KHÔNG terminate plugin
-                    // Plugin sẽ tiếp tục chạy và retry lần sau
+                    // Log error nhÆ°ng KHÃ”NG terminate plugin
+                    // Plugin sáº½ tiáº¿p tá»¥c cháº¡y vÃ  retry láº§n sau
                     pushPluginDiagnosticEvent(
                         nx::sdk::IPluginDiagnosticEvent::Level::error,
                         "Object detection failed - will retry next frame",
@@ -700,3 +701,4 @@ namespace sample_company
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins
 } // namespace sample_company
+
