@@ -3,11 +3,15 @@
 // Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
 
 #include "device_agent.h"
+#include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <iostream>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <cctype>
+#include <typeinfo>
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn/dnn.hpp>
@@ -26,6 +30,7 @@
 #include "detection.h"
 #include "exceptions.h"
 #include "frame.h"
+#include "logging.h"
 
 namespace sample_company
 {
@@ -45,11 +50,142 @@ namespace sample_company
                 : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
                   m_pluginHomeDir(std::move(pluginHomeDir)),
                   m_modelPath(std::move(modelPath)),
+                  m_cameraId(getCameraIdFromDeviceInfo(deviceInfo)),
                   m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
                   m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
                   m_workerShouldStop(false)
             {
+                loadRuntimeConfig(deviceInfo);
+                m_lastQueueDiagnosticsTime = std::chrono::steady_clock::now();
+            }
+
+            std::string DeviceAgent::getCameraIdFromDeviceInfo(const nx::sdk::IDeviceInfo* deviceInfo)
+            {
+                if (!deviceInfo)
+                    return "unknown_camera";
+
+                // Try to get the device ID from NX SDK
+                std::string deviceId = deviceInfo->id();
+                if (!deviceId.empty())
+                {
+                    // Normalize: replace non-alphanumeric chars with underscores, lowercase
+                    std::string normalized;
+                    for (char c : deviceId)
+                    {
+                        if (std::isalnum(c))
+                            normalized += std::tolower(c);
+                        else
+                            normalized += '_';
+                    }
+                    return normalized;
+                }
+
+                // Fallback: use logical ID if available
+                if (deviceInfo->logicalId() != nullptr)
+                {
+                    std::string logicalId = deviceInfo->logicalId();
+                    if (!logicalId.empty())
+                    {
+                        std::string normalized;
+                        for (char c : logicalId)
+                        {
+                            if (std::isalnum(c))
+                                normalized += std::tolower(c);
+                            else
+                                normalized += '_';
+                        }
+                        return "logical_" + normalized;
+                    }
+                }
+
+                // Last resort: deterministic fallback based on name or other info
+                std::string name = deviceInfo->name();
+                if (!name.empty())
+                {
+                    std::string normalized;
+                    for (char c : name)
+                    {
+                        if (std::isalnum(c))
+                            normalized += std::tolower(c);
+                        else
+                            normalized += '_';
+                    }
+                    return "name_" + normalized;
+                }
+
+                // Ultimate fallback
+                return "fallback_camera";
+            }
+
+            void DeviceAgent::loadRuntimeConfig(const nx::sdk::IDeviceInfo* deviceInfo)
+            {
+                // Read settings from environment variables for runtime tuning.
+                // TODO: If NX SDK provides a direct settings API, replace with it.
+
+                int framePeriod = kDetectionFramePeriodDefault;
+                size_t queueMax = kFrameQueueMaxSizeDefault;
+                int diagInterval = kQueueDiagnosticsIntervalSecDefault;
+
+                if (const char* env = std::getenv("FRAME_DETECTION_PERIOD"))
+                    framePeriod = std::atoi(env);
+                if (const char* env = std::getenv("FRAME_QUEUE_MAX_SIZE"))
+                    queueMax = static_cast<size_t>(std::atoi(env));
+                if (const char* env = std::getenv("QUEUE_DIAGNOSTICS_INTERVAL_SEC"))
+                    diagInterval = std::atoi(env);
+
+                if (deviceInfo)
+                {
+                    // Optional: SDK-specific setting access path if available.
+                    // Example placeholders (uncomment and adapt when SDK API is known):
+                    // auto settings = deviceInfo->settings();
+                    // if (settings) { ... }
+                }
+
+                m_detectionFramePeriod = clampConfigValue(framePeriod, kDetectionFramePeriodMin, kDetectionFramePeriodMax);
+                m_frameQueueMaxSize = clampConfigValue(queueMax, kFrameQueueMaxSizeMin, kFrameQueueMaxSizeMax);
+                m_queueDiagnosticsIntervalSec = clampConfigValue(diagInterval, kQueueDiagnosticsIntervalSecMin, kQueueDiagnosticsIntervalSecMax);
+
+                Logger::log(
+                    LogLevel::Info,
+                    "[queue_config] framePeriod=" + std::to_string(m_detectionFramePeriod.load()) +
+                        " queueMax=" + std::to_string(m_frameQueueMaxSize.load()) +
+                        " diagnosticsSec=" + std::to_string(m_queueDiagnosticsIntervalSec.load()));
+            }
+
+            template<typename T>
+            T DeviceAgent::clampConfigValue(T value, T minValue, T maxValue) const
+            {
+                if (value < minValue) return minValue;
+                if (value > maxValue) return maxValue;
+                return value;
+            }
+
+            void DeviceAgent::emitQueueDiagnosticsIfNeeded(size_t currentDepth)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const int intervalSec = m_queueDiagnosticsIntervalSec.load();
+                if (intervalSec <= 0)
+                    return;
+
+                const auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastQueueDiagnosticsTime);
+                if (duration.count() < intervalSec)
+                    return;
+
+                m_lastQueueDiagnosticsTime = now;
+
+                const std::string message =
+                    "cameraId=" + m_cameraId +
+                    " enqueued=" + std::to_string(m_enqueuedCount.load()) +
+                    " dropped=" + std::to_string(m_droppedCount.load()) +
+                    " processed=" + std::to_string(m_processedCount.load()) +
+                    " maxDepth=" + std::to_string(m_maxQueueDepth.load()) +
+                    " currentDepth=" + std::to_string(currentDepth);
+
+                Logger::log(LogLevel::Info, "[queue_diagnostics] " + message);
+                pushPluginDiagnosticEvent(nx::sdk::IPluginDiagnosticEvent::Level::info,
+                    "Queue diagnostics",
+                    message);
             }
 
             DeviceAgent::~DeviceAgent()
@@ -114,22 +250,21 @@ namespace sample_company
 
                 if (m_frameIndex % 200 == 0)
                 {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "pixel_format",
+                        std::chrono::seconds(30),
+                        "[DBG] pixelFormat=" + std::to_string((int)videoFrame->pixelFormat()) +
+                        " w=" + std::to_string(videoFrame->width()) +
+                        " h=" + std::to_string(videoFrame->height()) +
+                        " lineSize0=" + std::to_string(videoFrame->lineSize(0)));
                 }
 
                 if (m_frameIndex % 200 == 0)
                 {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::info,
-                        "Frame arrived",
-                        ("frame#" + std::to_string(m_frameIndex) +
-                         " w=" + std::to_string(videoFrame->width()) +
-                         " h=" + std::to_string(videoFrame->height()))
-                            .c_str());
+                    Logger::logThrottled(LogLevel::Debug, "frame_arrived",
+                        std::chrono::seconds(30),
+                        "Frame arrived frame#" + std::to_string(m_frameIndex) +
+                        " w=" + std::to_string(videoFrame->width()) +
+                        " h=" + std::to_string(videoFrame->height()));
                 }
 
                 // Nếu detector đã bị terminate cứng (hiếm), chỉ báo 1 lần rồi bỏ qua frame.
@@ -154,8 +289,11 @@ namespace sample_company
                 // ============================================================
 
                 // 🔻 Process detection frames regularly:
-                const int kPeriod = kDetectionFramePeriod;
-                if (m_frameIndex % kPeriod == 0)
+                int framePeriod = m_detectionFramePeriod.load();
+                if (framePeriod <= 0 || framePeriod > kDetectionFramePeriodMax)
+                    framePeriod = kDetectionFramePeriodDefault;
+
+                if (m_frameIndex % framePeriod == 0)
                 {
                     try
                     {
@@ -169,28 +307,43 @@ namespace sample_company
                         // Create frame job
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
-                        job.cameraId = "nx_camera"; // TODO: Get from device info
+                        job.cameraId = m_cameraId;
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 
-                        // ⚠️ BACKPRESSURE: bounded queue (size 3)
-                        // If queue is full, drop oldest frame and add newest
+                        // ⚠️ BACKPRESSURE: bounded queue.
+                        // If queue is full, drop oldest frame and add newest.
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
-                            if (m_frameQueue.size() >= kFrameQueueMaxSize)
+                            auto queueMax = m_frameQueueMaxSize.load();
+                            if (queueMax <= 0)
+                                queueMax = kFrameQueueMaxSizeDefault;
+
+                            if (m_frameQueue.size() >= queueMax)
                             {
                                 // Drop oldest (front) frame to make room
                                 m_frameQueue.pop_front();
-                                if (m_frameIndex % 20 == 0)
+                                ++m_droppedCount;
+
+                                if (!m_frameQueueFullReported)
                                 {
+                                    Logger::log(LogLevel::Warn,
+                                        "Frame queue full - dropping old frames. Worker thread may be slow; increase queue or reduce FPS");
                                     pushPluginDiagnosticEvent(
                                         nx::sdk::IPluginDiagnosticEvent::Level::warning,
                                         "Frame queue full - dropping old frames",
                                         "Worker thread may be slow; increase queue or reduce FPS");
+                                    m_frameQueueFullReported = true;
                                 }
                             }
+
                             m_frameQueue.push_back(std::move(job));
+                            ++m_enqueuedCount;
+                            m_maxQueueDepth.store(std::max(m_maxQueueDepth.load(), m_frameQueue.size()));
+
+                            emitQueueDiagnosticsIfNeeded(m_frameQueue.size());
                         }
+
                         m_frameQueueCV.notify_one(); // Wake up worker thread
                     }
                     catch (const std::exception &e)
@@ -205,7 +358,6 @@ namespace sample_company
                 ++m_frameIndex;
                 return true; // ✓ Frame callback returns immediately
             }
-
             bool DeviceAgent::pullMetadataPackets(
                 std::vector<nx::sdk::analytics::IMetadataPacket *> *metadataPackets)
             {
@@ -279,6 +431,7 @@ namespace sample_company
                     try
                     {
                         MetadataPacketList metadataPackets = processFrameJob(job);
+                        ++m_processedCount;
 
                         // Enqueue metadata packets for Nx to pull
                         {
@@ -611,11 +764,12 @@ namespace sample_company
             {
                 if (m_frameIndex % 200 == 0)
                 {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "process_frame_pixel_format",
+                        std::chrono::seconds(30),
+                        "[DBG] pixelFormat=" + std::to_string((int)videoFrame->pixelFormat()) +
+                        " w=" + std::to_string(videoFrame->width()) +
+                        " h=" + std::to_string(videoFrame->height()) +
+                        " lineSize0=" + std::to_string(videoFrame->lineSize(0)));
                 }
 
                 try
@@ -626,10 +780,9 @@ namespace sample_company
 
                     if (m_frameIndex % 200 == 0)
                     {
-                        pushPluginDiagnosticEvent(
-                            nx::sdk::IPluginDiagnosticEvent::Level::info,
-                            "Calling detector",
-                            "About to call Python /infer endpoint");
+                        Logger::logThrottled(LogLevel::Debug, "calling_detector",
+                            std::chrono::seconds(30),
+                            "Calling detector: about to call Python /infer endpoint");
                     }
 
                     // 1) Gọi Python service -> lấy detections đã có track_id

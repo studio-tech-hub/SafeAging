@@ -17,6 +17,11 @@
 #endif
 
 #include "json.hpp"
+#include "logging.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <unordered_map>
 #include <mutex>
 
@@ -127,8 +132,10 @@ namespace sample_company {
                     const uint8_t* data = bgr.data;
                     size_t dataSize = bgr.total() * bgr.elemSize();
                     
-                    std::cerr << "[C++ encode] Using RAW_BGR: " << bgr.cols << "x" << bgr.rows 
-                              << " data=" << dataSize << " bytes" << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "encode_raw_bgr",
+                        std::chrono::seconds(30),
+                        "[C++ encode] Using RAW_BGR: " + std::to_string(bgr.cols) + "x" + std::to_string(bgr.rows) +
+                        " data=" + std::to_string(dataSize) + " bytes");
                     
                     // Simple format: magic + width + height + raw BGR data
                     std::vector<uchar> buf;
@@ -153,7 +160,9 @@ namespace sample_company {
                     // Add raw BGR data
                     buf.insert(buf.end(), data, data + dataSize);
                     
-                    std::cerr << "[C++ encode] Total buffer: " << buf.size() << " bytes (header=11)" << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "encode_buffer_size",
+                        std::chrono::seconds(30),
+                        "[C++ encode] Total buffer: " + std::to_string(buf.size()) + " bytes (header=11)");
                     
                     if (buf.empty())
                         throw ObjectDetectionError("Encoded buffer is empty");
@@ -161,21 +170,180 @@ namespace sample_company {
                     return base64Encode(buf.data(), buf.size());
                 }
 
-                static nx::sdk::Uuid uuidFromTrackId(int trackId)
+                using SteadyClock = std::chrono::steady_clock;
+
+                struct TrackUuidEntry
                 {
-                    static std::mutex m;
-                    static std::unordered_map<int, nx::sdk::Uuid> map;
+                    nx::sdk::Uuid uuid;
+                    SteadyClock::time_point lastSeen;
+                };
 
-                    std::lock_guard<std::mutex> lk(m);
+                struct TrackUuidCache
+                {
+                    std::mutex mutex;
+                    std::unordered_map<std::string, std::unordered_map<int, TrackUuidEntry>> entriesByCamera;
+                    size_t totalEntries = 0;
+                    SteadyClock::time_point lastCleanup = SteadyClock::now();
+                };
 
-                    auto it = map.find(trackId);
-                    if (it != map.end())
-                        return it->second;
+                TrackUuidCache& trackUuidCache()
+                {
+                    static TrackUuidCache cache;
+                    return cache;
+                }
 
-                    // tạo 1 UUID mới và cache lại cho trackId này
-                    nx::sdk::Uuid u = nx::sdk::UuidHelper::randomUuid();
-                    map.emplace(trackId, u);
-                    return u;
+                std::string normalizeCameraId(const std::string& cameraId)
+                {
+                    if (cameraId.empty())
+                        return "__default_camera__";
+                    return cameraId;
+                }
+
+                void cleanupTrackUuidCacheLocked(
+                    TrackUuidCache* cache,
+                    SteadyClock::time_point now,
+                    std::chrono::seconds ttl,
+                    size_t maxEntries)
+                {
+                    // Step 1: remove stale entries by TTL.
+                    for (auto cameraIt = cache->entriesByCamera.begin();
+                        cameraIt != cache->entriesByCamera.end();)
+                    {
+                        auto& trackMap = cameraIt->second;
+                        for (auto trackIt = trackMap.begin(); trackIt != trackMap.end();)
+                        {
+                            if (now - trackIt->second.lastSeen > ttl)
+                            {
+                                trackIt = trackMap.erase(trackIt);
+                                if (cache->totalEntries > 0)
+                                    --cache->totalEntries;
+                            }
+                            else
+                            {
+                                ++trackIt;
+                            }
+                        }
+
+                        if (trackMap.empty())
+                            cameraIt = cache->entriesByCamera.erase(cameraIt);
+                        else
+                            ++cameraIt;
+                    }
+
+                    // Step 2: if still above capacity, evict oldest entries first.
+                    if (cache->totalEntries <= maxEntries)
+                        return;
+
+                    struct Candidate
+                    {
+                        std::string cameraId;
+                        int trackId = 0;
+                        SteadyClock::time_point lastSeen;
+                    };
+
+                    std::vector<Candidate> candidates;
+                    candidates.reserve(cache->totalEntries);
+
+                    for (const auto& cameraPair: cache->entriesByCamera)
+                    {
+                        const auto& cameraId = cameraPair.first;
+                        const auto& trackMap = cameraPair.second;
+                        for (const auto& trackPair: trackMap)
+                        {
+                            candidates.push_back(Candidate{
+                                cameraId,
+                                trackPair.first,
+                                trackPair.second.lastSeen});
+                        }
+                    }
+
+                    std::sort(
+                        candidates.begin(),
+                        candidates.end(),
+                        [](const Candidate& a, const Candidate& b)
+                        {
+                            return a.lastSeen < b.lastSeen;
+                        });
+
+                    const size_t toRemove = cache->totalEntries - maxEntries;
+                    for (size_t i = 0; i < toRemove && i < candidates.size(); ++i)
+                    {
+                        const Candidate& candidate = candidates[i];
+                        auto cameraIt = cache->entriesByCamera.find(candidate.cameraId);
+                        if (cameraIt == cache->entriesByCamera.end())
+                            continue;
+
+                        auto& trackMap = cameraIt->second;
+                        auto trackIt = trackMap.find(candidate.trackId);
+                        if (trackIt == trackMap.end())
+                            continue;
+
+                        trackMap.erase(trackIt);
+                        if (cache->totalEntries > 0)
+                            --cache->totalEntries;
+
+                        if (trackMap.empty())
+                            cache->entriesByCamera.erase(cameraIt);
+                    }
+                }
+
+                static nx::sdk::Uuid uuidFromTrackId(const std::string& cameraId, int trackId)
+                {
+                    // track_id <= 0 is invalid/unknown; do not cache it.
+                    if (trackId <= 0)
+                        return nx::sdk::UuidHelper::randomUuid();
+
+                    constexpr auto kUuidCacheTtl = std::chrono::minutes(5);
+                    constexpr auto kCleanupInterval = std::chrono::seconds(30);
+                    constexpr size_t kUuidCacheMaxEntries = 20000;
+
+                    TrackUuidCache& cache = trackUuidCache();
+                    const auto now = SteadyClock::now();
+                    const std::string normalizedCameraId = normalizeCameraId(cameraId);
+
+                    std::lock_guard<std::mutex> lk(cache.mutex);
+
+                    if (now - cache.lastCleanup >= kCleanupInterval ||
+                        cache.totalEntries > kUuidCacheMaxEntries)
+                    {
+                        cleanupTrackUuidCacheLocked(
+                            &cache,
+                            now,
+                            kUuidCacheTtl,
+                            kUuidCacheMaxEntries);
+                        cache.lastCleanup = now;
+                    }
+
+                    auto& perCameraMap = cache.entriesByCamera[normalizedCameraId];
+                    auto entryIt = perCameraMap.find(trackId);
+                    if (entryIt != perCameraMap.end())
+                    {
+                        if (now - entryIt->second.lastSeen <= kUuidCacheTtl)
+                        {
+                            entryIt->second.lastSeen = now;
+                            return entryIt->second.uuid;
+                        }
+
+                        perCameraMap.erase(entryIt);
+                        if (cache.totalEntries > 0)
+                            --cache.totalEntries;
+                    }
+
+                    const nx::sdk::Uuid newUuid = nx::sdk::UuidHelper::randomUuid();
+                    perCameraMap.emplace(trackId, TrackUuidEntry{newUuid, now});
+                    ++cache.totalEntries;
+
+                    if (cache.totalEntries > kUuidCacheMaxEntries)
+                    {
+                        cleanupTrackUuidCacheLocked(
+                            &cache,
+                            now,
+                            kUuidCacheTtl,
+                            kUuidCacheMaxEntries);
+                        cache.lastCleanup = now;
+                    }
+
+                    return newUuid;
                 }
 
                 // Gọi Python service, trả về DetectionList (danh sách Detection của plugin)
@@ -210,34 +378,47 @@ namespace sample_company {
                     const int imgW = sendImg.cols;
                     const int imgH = sendImg.rows;
                     
-                    std::cerr << "[C++ infer] Encoding sendImg " << imgW << "x" << imgH 
-                              << " type=" << sendImg.type() << " continuous=" << sendImg.isContinuous() << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "infer_encode_img",
+                        std::chrono::seconds(30),
+                        "[C++ infer] Encoding sendImg " + std::to_string(imgW) + "x" + std::to_string(imgH) +
+                        " type=" + std::to_string(sendImg.type()) + " continuous=" + std::to_string(sendImg.isContinuous()));
                     
                     std::string b64;
                     try
                     {
-                        std::cerr << "[C++ infer] Calling matToBase64Jpeg..." << std::endl;
+                        Logger::logThrottled(LogLevel::Debug, "infer_call_jpeg",
+                            std::chrono::seconds(30),
+                            "[C++ infer] Calling matToBase64Jpeg...");
                         b64 = matToBase64Jpeg(sendImg);
-                        std::cerr << "[C++ infer] matToBase64Jpeg returned, b64 size=" << b64.size() << std::endl;
+                        Logger::logThrottled(LogLevel::Debug, "infer_jpeg_returned",
+                            std::chrono::seconds(30),
+                            "[C++ infer] matToBase64Jpeg returned, b64 size=" + std::to_string(b64.size()));
                     }
                     catch (const std::exception& e)
                     {
-                        std::cerr << "[C++ infer] matToBase64Jpeg threw exception: " << e.what() << std::endl;
+                        Logger::logThrottled(LogLevel::Error, "infer_encode_exception",
+                            std::chrono::seconds(60),
+                            "[C++ infer] matToBase64Jpeg threw exception: " + std::string(e.what()));
                         throw ObjectDetectionError(std::string("Failed to encode image to base64: ") + e.what());
                     }
 
                     if (b64.empty())
                     {
-                        std::cerr << "[C++ infer] ERROR: b64 is empty after encoding!" << std::endl;
+                        Logger::logThrottled(LogLevel::Error, "infer_b64_empty",
+                            std::chrono::seconds(60),
+                            "[C++ infer] ERROR: b64 is empty after encoding!");
                         throw ObjectDetectionError("b64 empty after imencode - image may be invalid");
                     }
                     
-                    std::cerr << "[C++ infer] b64 size OK: " << b64.size() << " bytes" << std::endl;
+                    Logger::logThrottled(LogLevel::Debug, "infer_b64_ok",
+                        std::chrono::seconds(30),
+                        "[C++ infer] b64 size OK: " + std::to_string(b64.size()) + " bytes");
 
 
                     // 2. JSON request body
                     json req;
-                    req["camera_id"] = "nx_camera";  // tạm thời, sau này map đúng ID camera nếu cần
+                    const std::string requestCameraId = "nx_camera";  // Legacy path has no per-device camera id.
+                    req["camera_id"] = requestCameraId;
                     req["image"] = b64;
 
                     // 3. HTTP client -> POST /infer
@@ -254,7 +435,7 @@ namespace sample_company {
                     static int s_reqCount = 0;
                     if ((++s_reqCount % 20) == 0)
                     {
-                        std::cerr << "[C++] calling /infer count=" << s_reqCount << std::endl;
+                        Logger::log(LogLevel::Info, "[C++] calling /infer count=" + std::to_string(s_reqCount));
                     }
 
                     auto res = cli.Post("/infer", req.dump(), "application/json");
@@ -265,8 +446,8 @@ namespace sample_company {
                         static int s_fail = 0;
                         if ((++s_fail % 200) == 0)
                         {
-                            std::cerr << "[C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
+                            Logger::log(LogLevel::Error, "[C++] /infer failed (no response)");
+                            Logger::log(LogLevel::Error, "[C++] Python service at 127.0.0.1:18000 may not be running.");
                         }
                         return {};
                     }
@@ -275,8 +456,8 @@ namespace sample_company {
                     {
                         static int s_bad = 0;
                         if ((++s_bad % 200) == 0)
-                            std::cerr << "[C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
+                            Logger::log(LogLevel::Error, "[C++] /infer status=" + std::to_string(res->status) +
+                                " body=" + res->body.substr(0, 100));
                         return {};
                     }
 
@@ -325,13 +506,14 @@ namespace sample_company {
 
                         // 🔹 Lấy track_id từ JSON -> UUID ổn định
                         const int trackId = item.value("track_id", 0);
-                        nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+                        nx::sdk::Uuid trackUuid = uuidFromTrackId(requestCameraId, trackId);
 
                         auto detection = std::make_shared<Detection>(Detection{
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
                             classLabel,
                             score,
-                            trackUuid
+                            trackUuid,
+                            false
                             });
 
                         result.push_back(detection);
@@ -340,8 +522,8 @@ namespace sample_company {
                     static int s_log = 0;
                     if ((++s_log % 100) == 0)
                     {
-                        std::cerr << "[C++] detections=" << result.size()
-                            << " img=" << imgW << "x" << imgH << std::endl;
+                        Logger::log(LogLevel::Info, "[C++] detections=" + std::to_string(result.size()) +
+                            " img=" + std::to_string(imgW) + "x" + std::to_string(imgH));
                     }
 
                     return result;
@@ -465,8 +647,8 @@ namespace sample_company {
                     static int s_reqCount = 0;
                     if ((++s_reqCount % 20) == 0)
                     {
-                        std::cerr << "[FLOW2 C++] Calling /infer with JPEG, count=" << s_reqCount 
-                                  << " jpegSize=" << jpegBytes.size() << " bytes" << std::endl;
+                        Logger::log(LogLevel::Info, "[FLOW2 C++] Calling /infer with JPEG, count=" + std::to_string(s_reqCount) +
+                            " jpegSize=" + std::to_string(jpegBytes.size()) + " bytes");
                     }
                     
                     // POST /infer endpoint
@@ -477,8 +659,8 @@ namespace sample_company {
                         static int s_fail = 0;
                         if ((++s_fail % 200) == 0)
                         {
-                            std::cerr << "[FLOW2 C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[FLOW2 C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
+                            Logger::log(LogLevel::Error, "[FLOW2 C++] /infer failed (no response)");
+                            Logger::log(LogLevel::Error, "[FLOW2 C++] Python service at 127.0.0.1:18000 may not be running.");
                         }
                         throw ObjectDetectionError("No response from /infer endpoint");
                     }
@@ -488,8 +670,8 @@ namespace sample_company {
                         static int s_bad = 0;
                         if ((++s_bad % 200) == 0)
                         {
-                            std::cerr << "[FLOW2 C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
+                            Logger::log(LogLevel::Error, "[FLOW2 C++] /infer status=" + std::to_string(res->status) +
+                                " body=" + res->body.substr(0, 100));
                         }
                         throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
                     }
@@ -551,7 +733,7 @@ namespace sample_company {
                             
                             // Get track ID
                             const int trackId = item.value("track_id", 0);
-                            nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+                            nx::sdk::Uuid trackUuid = uuidFromTrackId(cameraId, trackId);
                             
                             // FLOW 2: Include fall_detected flag
                             auto detection = std::make_shared<Detection>(Detection{
@@ -566,7 +748,9 @@ namespace sample_company {
                         }
                         catch (const std::exception& e)
                         {
-                            std::cerr << "[FLOW2 C++] Error parsing detection item: " << e.what() << std::endl;
+                            Logger::logThrottled(LogLevel::Error, "flow2_parse_error",
+                                std::chrono::seconds(60),
+                                "[FLOW2 C++] Error parsing detection item: " + std::string(e.what()));
                             continue;  // Skip bad items
                         }
                     }
@@ -574,7 +758,7 @@ namespace sample_company {
                     static int s_log = 0;
                     if ((++s_log % 100) == 0)
                     {
-                        std::cerr << "[FLOW2 C++] detections=" << result.size() << std::endl;
+                        Logger::log(LogLevel::Info, "[FLOW2 C++] detections=" + std::to_string(result.size()));
                     }
                     
                     return result;
