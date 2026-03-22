@@ -8,8 +8,10 @@
 #include <set>
 #include <iostream>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <cctype>
+#include <typeinfo>
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn/dnn.hpp>
@@ -144,10 +146,11 @@ namespace sample_company
                 m_frameQueueMaxSize = clampConfigValue(queueMax, kFrameQueueMaxSizeMin, kFrameQueueMaxSizeMax);
                 m_queueDiagnosticsIntervalSec = clampConfigValue(diagInterval, kQueueDiagnosticsIntervalSecMin, kQueueDiagnosticsIntervalSecMax);
 
-                Logger::log(LogLevel::Info, "queue_config",
-                    "framePeriod=" + std::to_string(m_detectionFramePeriod.load()) +
-                    " queueMax=" + std::to_string(m_frameQueueMaxSize.load()) +
-                    " diagnosticsSec=" + std::to_string(m_queueDiagnosticsIntervalSec.load()));
+                Logger::log(
+                    LogLevel::Info,
+                    "[queue_config] framePeriod=" + std::to_string(m_detectionFramePeriod.load()) +
+                        " queueMax=" + std::to_string(m_frameQueueMaxSize.load()) +
+                        " diagnosticsSec=" + std::to_string(m_queueDiagnosticsIntervalSec.load()));
             }
 
             template<typename T>
@@ -179,7 +182,7 @@ namespace sample_company
                     " maxDepth=" + std::to_string(m_maxQueueDepth.load()) +
                     " currentDepth=" + std::to_string(currentDepth);
 
-                Logger::log(LogLevel::Info, "queue_diagnostics", message);
+                Logger::log(LogLevel::Info, "[queue_diagnostics] " + message);
                 pushPluginDiagnosticEvent(nx::sdk::IPluginDiagnosticEvent::Level::info,
                     "Queue diagnostics",
                     message);
@@ -286,7 +289,7 @@ namespace sample_company
                 // ============================================================
 
                 // 🔻 Process detection frames regularly:
-                const int framePeriod = m_detectionFramePeriod.load();
+                int framePeriod = m_detectionFramePeriod.load();
                 if (framePeriod <= 0 || framePeriod > kDetectionFramePeriodMax)
                     framePeriod = kDetectionFramePeriodDefault;
 
@@ -312,7 +315,7 @@ namespace sample_company
                         // If queue is full, drop oldest frame and add newest.
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
-                            const auto queueMax = m_frameQueueMaxSize.load();
+                            auto queueMax = m_frameQueueMaxSize.load();
                             if (queueMax <= 0)
                                 queueMax = kFrameQueueMaxSizeDefault;
 
@@ -355,27 +358,6 @@ namespace sample_company
                 ++m_frameIndex;
                 return true; // ✓ Frame callback returns immediately
             }
-                                        "Worker thread may be slow; increase queue or reduce FPS");
-                                    m_frameQueueFullReported = true;
-                                }
-                            }
-                            m_frameQueue.push_back(std::move(job));
-                        }
-                        m_frameQueueCV.notify_one(); // Wake up worker thread
-                    }
-                    catch (const std::exception &e)
-                    {
-                        pushPluginDiagnosticEvent(
-                            nx::sdk::IPluginDiagnosticEvent::Level::error,
-                            "Frame encoding error",
-                            e.what());
-                    }
-                }
-
-                ++m_frameIndex;
-                return true; // ✓ Frame callback returns immediately
-            }
-
             bool DeviceAgent::pullMetadataPackets(
                 std::vector<nx::sdk::analytics::IMetadataPacket *> *metadataPackets)
             {

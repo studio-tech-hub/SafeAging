@@ -20,6 +20,7 @@
 #include "logging.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <unordered_map>
 #include <mutex>
@@ -448,7 +449,6 @@ namespace sample_company {
                             Logger::log(LogLevel::Error, "[C++] /infer failed (no response)");
                             Logger::log(LogLevel::Error, "[C++] Python service at 127.0.0.1:18000 may not be running.");
                         }
-                        }
                         return {};
                     }
 
@@ -512,7 +512,8 @@ namespace sample_company {
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
                             classLabel,
                             score,
-                            trackUuid
+                            trackUuid,
+                            false
                             });
 
                         result.push_back(detection);

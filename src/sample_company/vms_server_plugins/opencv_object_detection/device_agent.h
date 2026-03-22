@@ -131,6 +131,7 @@ private:
     std::filesystem::path m_pluginHomeDir;
     std::filesystem::path m_modelPath;
     std::string m_cameraId;
+    std::unique_ptr<ObjectDetector> m_objectDetector;
     std::unique_ptr<ObjectTracker> m_objectTracker;
     int m_frameIndex = 0;
 
