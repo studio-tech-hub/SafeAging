@@ -7,6 +7,8 @@
 #include <chrono>
 #include <exception>
 #include <cctype>
+#include <type_traits>
+#include <utility>
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn/dnn.hpp>
@@ -38,6 +40,50 @@ namespace sample_company
             using namespace nx::sdk::analytics;
             using namespace std::string_literals;
 
+            namespace {
+
+                template<typename T, typename = void>
+                struct HasNameMethod: std::false_type {};
+
+                template<typename T>
+                struct HasNameMethod<T, std::void_t<decltype(std::declval<const T*>()->name())>>:
+                    std::true_type {};
+
+                template<typename T, typename = void>
+                struct HasIdMethod: std::false_type {};
+
+                template<typename T>
+                struct HasIdMethod<T, std::void_t<decltype(std::declval<const T*>()->id())>>:
+                    std::true_type {};
+
+                std::string resolveCameraName(const nx::sdk::IDeviceInfo* deviceInfo)
+                {
+                    if (!deviceInfo)
+                        return "unknown_camera";
+
+                    std::string name;
+
+                    if constexpr (HasNameMethod<nx::sdk::IDeviceInfo>::value)
+                    {
+                        const char* raw = deviceInfo->name();
+                        if (raw && *raw)
+                            name = raw;
+                    }
+
+                    if constexpr (HasIdMethod<nx::sdk::IDeviceInfo>::value)
+                    {
+                        if (name.empty())
+                        {
+                            const char* raw = deviceInfo->id();
+                            if (raw && *raw)
+                                name = raw;
+                        }
+                    }
+
+                    return name.empty() ? "unknown_camera" : name;
+                }
+            } // namespace
+
             DeviceAgent::DeviceAgent(
                 const nx::sdk::IDeviceInfo *deviceInfo,
                 std::filesystem::path pluginHomeDir,
@@ -45,11 +91,15 @@ namespace sample_company
                 : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
                   m_pluginHomeDir(std::move(pluginHomeDir)),
                   m_modelPath(std::move(modelPath)),
+                  m_cameraName(resolveCameraName(deviceInfo)),
                   m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
                   m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
                   m_workerShouldStop(false)
             {
+                logutil::log(
+                    logutil::Level::info,
+                    "DeviceAgent camera_name=\"" + m_cameraName + "\"");
             }
 
             DeviceAgent::~DeviceAgent()
@@ -150,7 +200,7 @@ namespace sample_company
 
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
-                        job.cameraId = "nx_camera";
+                        job.cameraId = m_cameraName;
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 
@@ -693,7 +743,8 @@ namespace sample_company
                         "Calling detector from legacy processFrame path");
 
                     // 1) Gọi Python service -> lấy detections đã có track_id
-                    DetectionList detections = m_objectDetector->run(frame);
+                    std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
+                    DetectionList detections = m_objectDetector->run(m_cameraName, jpegBytes);
 
                     // 2) Dùng trực tiếp detections từ Python để tạo ObjectMetadata
                     const auto &objectMetadataPacket =

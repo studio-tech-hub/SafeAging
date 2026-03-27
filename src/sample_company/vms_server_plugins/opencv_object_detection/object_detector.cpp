@@ -462,7 +462,7 @@ namespace sample_company {
                     }
 
                     json req;
-                    req["camera_id"] = cameraId;
+                    req["camera_id"] = "unknown_camera";
                     req["image"] = b64;
 
                     thread_local httplib::Client cli("127.0.0.1", 18000);
@@ -557,7 +557,7 @@ namespace sample_company {
                         }
 
                         const int trackId = item.value("track_id", 0);
-                        nx::sdk::Uuid trackUuid = uuidFromTrackId(cameraId, trackId);
+                        nx::sdk::Uuid trackUuid = uuidFromTrackId("unknown_camera", trackId);
 
                         auto detection = std::make_shared<Detection>(Detection{
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
@@ -716,6 +716,7 @@ namespace sample_company {
                             std::chrono::seconds(30),
                             "FLOW2 /infer failed: no response from 127.0.0.1:18000");
                         throw ObjectDetectionError("No response from /infer endpoint");
+                    }
                     if (res->status != 200)
                     {
                         logutil::logThrottled(
@@ -724,6 +725,7 @@ namespace sample_company {
                             std::chrono::seconds(30),
                             "FLOW2 /infer HTTP status=" + std::to_string(res->status));
                         throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
+                    }
 
                     json j;
                     try
