@@ -222,7 +222,7 @@ namespace sample_company {
                     const char* type,
                     uint64_t seq)
                 {
-                    constexpr uint64_t kMaxFrameFiles = 150;
+                    constexpr uint64_t kMaxFrameFiles = 100;
                     const uint64_t slot = seq % kMaxFrameFiles;
 
                     std::string fileName = sanitizeForFileName(cameraId);
