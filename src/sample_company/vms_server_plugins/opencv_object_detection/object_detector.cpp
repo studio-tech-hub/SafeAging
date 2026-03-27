@@ -210,7 +210,9 @@ namespace sample_company {
                         std::error_code ec;
                         std::filesystem::create_directories(root / "input", ec);
                         std::filesystem::create_directories(root / "output", ec);
-                        std::cerr << "[FrameDump] root=" << root.string() << std::endl;
+                        logutil::log(
+                            logutil::Level::info,
+                            "Frame dump root: " + root.string());
                         initialized = true;
                     }
 
@@ -256,7 +258,11 @@ namespace sample_company {
                     }
                     catch (const std::exception& e)
                     {
-                        std::cerr << "[FrameDump] Failed to write input frame: " << e.what() << std::endl;
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "object_detector.frame_dump.input_write_failed",
+                            std::chrono::seconds(30),
+                            std::string("Failed to write input frame: ") + e.what());
                     }
                 }
 
@@ -303,7 +309,11 @@ namespace sample_company {
                     }
                     catch (const std::exception& e)
                     {
-                        std::cerr << "[FrameDump] Failed to write output frame: " << e.what() << std::endl;
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "object_detector.frame_dump.output_write_failed",
+                            std::chrono::seconds(30),
+                            std::string("Failed to write output frame: ") + e.what());
                     }
                 }
 
