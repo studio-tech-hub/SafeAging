@@ -20,7 +20,7 @@
         ]
     },
     "capabilities": [
-        "needUncompressedVideoFrames_bgr"
+        "needUncompressedVideoFrames_yuv420"
     ],
     "supportedObjectTypes": [
         {
