@@ -4,7 +4,6 @@
 
 #include "device_agent.h"
 #include <set>
-#include <iostream>
 #include <chrono>
 #include <exception>
 #include <cctype>
@@ -26,6 +25,7 @@
 #include "detection.h"
 #include "exceptions.h"
 #include "frame.h"
+#include "logging_utils.h"
 
 namespace sample_company
 {
@@ -107,32 +107,14 @@ namespace sample_company
 )json";
             }
 
-            bool DeviceAgent::pushUncompressedVideoFrame(const IUncompressedVideoFrame *videoFrame)
+            bool DeviceAgent::pushUncompressedVideoFrame(const IUncompressedVideoFrame* videoFrame)
             {
                 if (!videoFrame)
                     return false;
 
-                if (m_frameIndex % 200 == 0)
-                {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
-                }
+                ++m_inFrameCount;
+                const auto now = std::chrono::steady_clock::now();
 
-                if (m_frameIndex % 200 == 0)
-                {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::info,
-                        "Frame arrived",
-                        ("frame#" + std::to_string(m_frameIndex) +
-                         " w=" + std::to_string(videoFrame->width()) +
-                         " h=" + std::to_string(videoFrame->height()))
-                            .c_str());
-                }
-
-                // Nếu detector đã bị terminate cứng (hiếm), chỉ báo 1 lần rồi bỏ qua frame.
                 m_terminated = m_terminated || m_objectDetector->isTerminated();
                 if (m_terminated)
                 {
@@ -147,54 +129,80 @@ namespace sample_company
                     return true;
                 }
 
-                // ============================================================
-                // FLOW 2: Frame callback MUST NOT process frames here.
-                //         Instead, enqueue frame for async worker thread.
-                //         This callback returns immediately (NON-BLOCKING).
-                // ============================================================
-
-                // 🔻 Process detection frames regularly:
-                const int kPeriod = kDetectionFramePeriod;
-                if (m_frameIndex % kPeriod == 0)
+                bool shouldEnqueue = (m_frameIndex % kDetectionFramePeriod == 0);
+                if (shouldEnqueue && kTargetEnqueueFps > 0)
                 {
+                    const auto minIntervalMs = std::chrono::milliseconds(1000 / kTargetEnqueueFps);
+                    if (m_lastEnqueueTime != std::chrono::steady_clock::time_point::min() &&
+                        now - m_lastEnqueueTime < minIntervalMs)
+                    {
+                        shouldEnqueue = false;
+                    }
+                }
+
+                if (shouldEnqueue)
+                {
+                    m_lastEnqueueTime = now;
                     try
                     {
-                        // Convert Nx frame to OpenCV Mat for encoding
                         Frame frame(videoFrame, m_frameIndex);
-
-                        // Encode frame to JPEG with downscale to ~720p width for faster, more stable detection.
-                        // 2560x1440 -> 1280x720 (keeps aspect ratio, no crop).
                         std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
 
-                        // Create frame job
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
-                        job.cameraId = "nx_camera"; // TODO: Get from device info
+                        job.cameraId = "nx_camera";
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 
-                        // ⚠️ BACKPRESSURE: bounded queue (size 3)
-                        // If queue is full, drop oldest frame and add newest
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
                             if (m_frameQueue.size() >= kFrameQueueMaxSize)
                             {
-                                // Drop oldest (front) frame to make room
                                 m_frameQueue.pop_front();
-                                if (m_frameIndex % 20 == 0)
+                                ++m_droppedFrameCount;
+                                ++m_droppedSinceLastQueueWarning;
+
+                                const auto warnNow = std::chrono::steady_clock::now();
+                                if (m_lastQueueWarningTime == std::chrono::steady_clock::time_point::min() ||
+                                    warnNow - m_lastQueueWarningTime >=
+                                        std::chrono::seconds(kQueueWarningThrottleSec))
                                 {
+                                    const std::string details =
+                                        "Worker thread may be slow; dropped " +
+                                        std::to_string(m_droppedSinceLastQueueWarning) +
+                                        " frames in last interval. queue_max=" +
+                                        std::to_string(kFrameQueueMaxSize) +
+                                        ", target_fps=" + std::to_string(kTargetEnqueueFps);
                                     pushPluginDiagnosticEvent(
                                         nx::sdk::IPluginDiagnosticEvent::Level::warning,
                                         "Frame queue full - dropping old frames",
-                                        "Worker thread may be slow; increase queue or reduce FPS");
+                                        details.c_str());
+
+                                    logutil::log(
+                                        logutil::Level::warn,
+                                        "Backpressure: queue full, dropped " +
+                                            std::to_string(m_droppedSinceLastQueueWarning) +
+                                            " frames in last interval");
+
+                                    m_droppedSinceLastQueueWarning = 0;
+                                    m_lastQueueWarningTime = warnNow;
                                 }
                             }
+
                             m_frameQueue.push_back(std::move(job));
                         }
-                        m_frameQueueCV.notify_one(); // Wake up worker thread
+
+                        ++m_enqueuedFrameCount;
+                        m_frameQueueCV.notify_one();
                     }
-                    catch (const std::exception &e)
+                    catch (const std::exception& e)
                     {
+                        ++m_encodingErrorCount;
+                        logutil::logThrottled(
+                            logutil::Level::error,
+                            "device_agent.frame_encode_error",
+                            std::chrono::seconds(10),
+                            std::string("Frame encoding error: ") + e.what());
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::error,
                             "Frame encoding error",
@@ -202,8 +210,48 @@ namespace sample_company
                     }
                 }
 
+                if (now - m_lastMetricsLogTime >= std::chrono::seconds(kMetricsLogPeriodSec))
+                {
+                    const uint64_t inCount = m_inFrameCount.load();
+                    const uint64_t processedCount = m_processedFrameCount.load();
+                    const uint64_t droppedCount = m_droppedFrameCount.load();
+                    const uint64_t inferMs = m_totalInferMs.load();
+
+                    const uint64_t deltaIn = inCount - m_lastMetricsInCount;
+                    const uint64_t deltaProcessed = processedCount - m_lastMetricsProcessedCount;
+                    const uint64_t deltaDropped = droppedCount - m_lastMetricsDroppedCount;
+                    const uint64_t deltaInferMs = inferMs - m_lastMetricsInferMs;
+
+                    const double periodSec =
+                        std::chrono::duration<double>(now - m_lastMetricsLogTime).count();
+                    const double inFps = (periodSec > 0.0) ? (deltaIn / periodSec) : 0.0;
+                    const double procFps = (periodSec > 0.0) ? (deltaProcessed / periodSec) : 0.0;
+                    const double avgInferMs =
+                        (deltaProcessed > 0) ? (static_cast<double>(deltaInferMs) / deltaProcessed) : 0.0;
+
+                    size_t queueLen = 0;
+                    {
+                        std::unique_lock<std::mutex> lk(m_frameQueueMutex);
+                        queueLen = m_frameQueue.size();
+                    }
+
+                    logutil::log(
+                        logutil::Level::info,
+                        "Pipeline metrics: in_fps=" + std::to_string(inFps) +
+                            ", proc_fps=" + std::to_string(procFps) +
+                            ", drop=" + std::to_string(deltaDropped) +
+                            ", queue=" + std::to_string(queueLen) +
+                            ", avg_infer_ms=" + std::to_string(avgInferMs));
+
+                    m_lastMetricsInCount = inCount;
+                    m_lastMetricsProcessedCount = processedCount;
+                    m_lastMetricsDroppedCount = droppedCount;
+                    m_lastMetricsInferMs = inferMs;
+                    m_lastMetricsLogTime = now;
+                }
+
                 ++m_frameIndex;
-                return true; // ✓ Frame callback returns immediately
+                return true;
             }
 
             bool DeviceAgent::pullMetadataPackets(
@@ -271,6 +319,8 @@ namespace sample_company
                             continue; // Spurious wakeup, wait again
 
                         // Dequeue NEWEST frame (drop old ones if multiple in queue)
+                        if (m_frameQueue.size() > 1)
+                            m_droppedFrameCount.fetch_add(m_frameQueue.size() - 1);
                         job = std::move(m_frameQueue.back());
                         m_frameQueue.clear(); // Drop all other frames
                     }
@@ -278,7 +328,12 @@ namespace sample_company
                     // Process frame job (WITHOUT holding lock)
                     try
                     {
+                        const auto started = std::chrono::steady_clock::now();
                         MetadataPacketList metadataPackets = processFrameJob(job);
+                        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started).count();
+                        ++m_processedFrameCount;
+                        m_totalInferMs.fetch_add(static_cast<uint64_t>(elapsedMs));
 
                         // Enqueue metadata packets for Nx to pull
                         {
@@ -291,6 +346,12 @@ namespace sample_company
                     }
                     catch (const std::exception &e)
                     {
+                        ++m_processingErrorCount;
+                        logutil::logThrottled(
+                            logutil::Level::error,
+                            "device_agent.worker.process_error",
+                            std::chrono::seconds(10),
+                            std::string("Worker processing error: ") + e.what());
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::error,
                             "Worker thread: frame processing error",
@@ -611,11 +672,12 @@ namespace sample_company
             {
                 if (m_frameIndex % 200 == 0)
                 {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
+                    logutil::log(
+                        logutil::Level::debug,
+                        "processFrame pixelFormat=" + std::to_string((int)videoFrame->pixelFormat()) +
+                            " w=" + std::to_string(videoFrame->width()) +
+                            " h=" + std::to_string(videoFrame->height()) +
+                            " lineSize0=" + std::to_string(videoFrame->lineSize(0)));
                 }
 
                 try
@@ -624,13 +686,11 @@ namespace sample_company
                     Frame frame(videoFrame, m_frameIndex);
                     reinitializeObjectTrackerOnFrameSizeChanges(frame);
 
-                    if (m_frameIndex % 200 == 0)
-                    {
-                        pushPluginDiagnosticEvent(
-                            nx::sdk::IPluginDiagnosticEvent::Level::info,
-                            "Calling detector",
-                            "About to call Python /infer endpoint");
-                    }
+                    logutil::logThrottled(
+                        logutil::Level::debug,
+                        "device_agent.process_frame.call_detector",
+                        std::chrono::seconds(10),
+                        "Calling detector from legacy processFrame path");
 
                     // 1) Gọi Python service -> lấy detections đã có track_id
                     DetectionList detections = m_objectDetector->run(frame);

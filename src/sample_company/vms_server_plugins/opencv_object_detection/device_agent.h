@@ -13,6 +13,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
 
 #include <nx/sdk/analytics/helpers/event_metadata_packet.h>
 #include <nx/sdk/analytics/helpers/object_metadata_packet.h>
@@ -104,9 +107,12 @@ private:
 
     /** Process every 2nd frame for better detection frequency (reasonable balance). */
     static constexpr int kDetectionFramePeriod = 2;
+    static constexpr int kTargetEnqueueFps = 8;
     
     // ============ FLOW 2: Frame queue config ============
     static constexpr size_t kFrameQueueMaxSize = 3;  // Drop old frames if queue full
+    static constexpr int kQueueWarningThrottleSec = 30;
+    static constexpr int kMetricsLogPeriodSec = 10;
 
 private:
     bool m_terminated = false;
@@ -148,6 +154,25 @@ private:
 
     // Track state of person presence to emit start/finish state-dependent events.
     bool m_personDetectionActive = false;
+
+    // ========= Runtime metrics and backpressure diagnostics =========
+    std::atomic<uint64_t> m_inFrameCount{0};
+    std::atomic<uint64_t> m_enqueuedFrameCount{0};
+    std::atomic<uint64_t> m_processedFrameCount{0};
+    std::atomic<uint64_t> m_droppedFrameCount{0};
+    std::atomic<uint64_t> m_totalInferMs{0};
+    std::atomic<uint64_t> m_encodingErrorCount{0};
+    std::atomic<uint64_t> m_processingErrorCount{0};
+
+    std::chrono::steady_clock::time_point m_lastEnqueueTime = std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point m_lastQueueWarningTime = std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point m_lastMetricsLogTime = std::chrono::steady_clock::now();
+
+    uint64_t m_droppedSinceLastQueueWarning = 0;
+    uint64_t m_lastMetricsInCount = 0;
+    uint64_t m_lastMetricsProcessedCount = 0;
+    uint64_t m_lastMetricsDroppedCount = 0;
+    uint64_t m_lastMetricsInferMs = 0;
 };
 
 } // namespace opencv_object_detection

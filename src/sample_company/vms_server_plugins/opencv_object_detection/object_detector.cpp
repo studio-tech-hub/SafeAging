@@ -1,6 +1,7 @@
 #include "object_detector.h"
 #include "exceptions.h"
 #include "frame.h"
+#include "logging_utils.h"
 
 #ifdef _MSC_VER
 #pragma warning(push, 0)
@@ -19,6 +20,7 @@
 #include "json.hpp"
 #include <unordered_map>
 #include <mutex>
+#include <chrono>
 
 namespace sample_company {
     namespace vms_server_plugins {
@@ -127,8 +129,12 @@ namespace sample_company {
                     const uint8_t* data = bgr.data;
                     size_t dataSize = bgr.total() * bgr.elemSize();
                     
-                    std::cerr << "[C++ encode] Using RAW_BGR: " << bgr.cols << "x" << bgr.rows 
-                              << " data=" << dataSize << " bytes" << std::endl;
+                    logutil::logThrottled(
+                        logutil::Level::debug,
+                        "object_detector.encode.raw_bgr",
+                        std::chrono::seconds(10),
+                        "Encoding RAW_BGR frame " + std::to_string(bgr.cols) + "x" +
+                            std::to_string(bgr.rows) + " bytes=" + std::to_string(dataSize));
                     
                     // Simple format: magic + width + height + raw BGR data
                     std::vector<uchar> buf;
@@ -153,7 +159,11 @@ namespace sample_company {
                     // Add raw BGR data
                     buf.insert(buf.end(), data, data + dataSize);
                     
-                    std::cerr << "[C++ encode] Total buffer: " << buf.size() << " bytes (header=11)" << std::endl;
+                    logutil::logThrottled(
+                        logutil::Level::debug,
+                        "object_detector.encode.total_buffer",
+                        std::chrono::seconds(10),
+                        "Encoded RAW_BGR payload bytes=" + std::to_string(buf.size()));
                     
                     if (buf.empty())
                         throw ObjectDetectionError("Encoded buffer is empty");
@@ -210,29 +220,37 @@ namespace sample_company {
                     const int imgW = sendImg.cols;
                     const int imgH = sendImg.rows;
                     
-                    std::cerr << "[C++ infer] Encoding sendImg " << imgW << "x" << imgH 
-                              << " type=" << sendImg.type() << " continuous=" << sendImg.isContinuous() << std::endl;
+                    logutil::logThrottled(
+                        logutil::Level::debug,
+                        "object_detector.infer.send_img",
+                        std::chrono::seconds(10),
+                        "Preparing infer frame " + std::to_string(imgW) + "x" +
+                            std::to_string(imgH) + " type=" + std::to_string(sendImg.type()) +
+                            " continuous=" + std::to_string(sendImg.isContinuous() ? 1 : 0));
                     
                     std::string b64;
                     try
                     {
-                        std::cerr << "[C++ infer] Calling matToBase64Jpeg..." << std::endl;
                         b64 = matToBase64Jpeg(sendImg);
-                        std::cerr << "[C++ infer] matToBase64Jpeg returned, b64 size=" << b64.size() << std::endl;
+                        logutil::logThrottled(
+                            logutil::Level::debug,
+                            "object_detector.infer.base64_ok",
+                            std::chrono::seconds(10),
+                            "Base64 payload bytes=" + std::to_string(b64.size()));
                     }
                     catch (const std::exception& e)
                     {
-                        std::cerr << "[C++ infer] matToBase64Jpeg threw exception: " << e.what() << std::endl;
+                        logutil::log(
+                            logutil::Level::error,
+                            std::string("matToBase64Jpeg failed: ") + e.what());
                         throw ObjectDetectionError(std::string("Failed to encode image to base64: ") + e.what());
                     }
 
                     if (b64.empty())
                     {
-                        std::cerr << "[C++ infer] ERROR: b64 is empty after encoding!" << std::endl;
+                        logutil::log(logutil::Level::error, "Encoded base64 payload is empty");
                         throw ObjectDetectionError("b64 empty after imencode - image may be invalid");
                     }
-                    
-                    std::cerr << "[C++ infer] b64 size OK: " << b64.size() << " bytes" << std::endl;
 
 
                     // 2. JSON request body
@@ -252,9 +270,11 @@ namespace sample_company {
 
 
                     static int s_reqCount = 0;
-                    if ((++s_reqCount % 20) == 0)
+                    if ((++s_reqCount % 120) == 0)
                     {
-                        std::cerr << "[C++] calling /infer count=" << s_reqCount << std::endl;
+                        logutil::log(
+                            logutil::Level::info,
+                            "Legacy infer requests processed=" + std::to_string(s_reqCount));
                     }
 
                     auto res = cli.Post("/infer", req.dump(), "application/json");
@@ -262,21 +282,21 @@ namespace sample_company {
                     // ❗ res là pointer-like
                     if (!res)
                     {
-                        static int s_fail = 0;
-                        if ((++s_fail % 200) == 0)
-                        {
-                            std::cerr << "[C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
-                        }
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "object_detector.legacy.no_response",
+                            std::chrono::seconds(30),
+                            "Legacy /infer failed: no response from 127.0.0.1:18000");
                         return {};
                     }
 
                     if (res->status != 200)
                     {
-                        static int s_bad = 0;
-                        if ((++s_bad % 200) == 0)
-                            std::cerr << "[C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "object_detector.legacy.http_status",
+                            std::chrono::seconds(30),
+                            "Legacy /infer HTTP status=" + std::to_string(res->status));
                         return {};
                     }
 
@@ -337,12 +357,12 @@ namespace sample_company {
                         result.push_back(detection);
                     }
 
-                    static int s_log = 0;
-                    if ((++s_log % 100) == 0)
-                    {
-                        std::cerr << "[C++] detections=" << result.size()
-                            << " img=" << imgW << "x" << imgH << std::endl;
-                    }
+                    logutil::logThrottled(
+                        logutil::Level::debug,
+                        "object_detector.legacy.detections",
+                        std::chrono::seconds(10),
+                        "Legacy detections=" + std::to_string(result.size()) + " frame=" +
+                            std::to_string(imgW) + "x" + std::to_string(imgH));
 
                     return result;
                 }
@@ -463,10 +483,11 @@ namespace sample_company {
                     cli.set_write_timeout(2, 0);       // 2s
                     
                     static int s_reqCount = 0;
-                    if ((++s_reqCount % 20) == 0)
+                    if ((++s_reqCount % 120) == 0)
                     {
-                        std::cerr << "[FLOW2 C++] Calling /infer with JPEG, count=" << s_reqCount 
-                                  << " jpegSize=" << jpegBytes.size() << " bytes" << std::endl;
+                        logutil::log(
+                            logutil::Level::info,
+                            "FLOW2 infer requests processed=" + std::to_string(s_reqCount));
                     }
                     
                     // POST /infer endpoint
@@ -474,23 +495,21 @@ namespace sample_company {
                     
                     if (!res)
                     {
-                        static int s_fail = 0;
-                        if ((++s_fail % 200) == 0)
-                        {
-                            std::cerr << "[FLOW2 C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[FLOW2 C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
-                        }
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "object_detector.flow2.no_response",
+                            std::chrono::seconds(30),
+                            "FLOW2 /infer failed: no response from 127.0.0.1:18000");
                         throw ObjectDetectionError("No response from /infer endpoint");
                     }
                     
                     if (res->status != 200)
                     {
-                        static int s_bad = 0;
-                        if ((++s_bad % 200) == 0)
-                        {
-                            std::cerr << "[FLOW2 C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
-                        }
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "object_detector.flow2.http_status",
+                            std::chrono::seconds(30),
+                            "FLOW2 /infer HTTP status=" + std::to_string(res->status));
                         throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
                     }
                     
@@ -566,16 +585,20 @@ namespace sample_company {
                         }
                         catch (const std::exception& e)
                         {
-                            std::cerr << "[FLOW2 C++] Error parsing detection item: " << e.what() << std::endl;
+                            logutil::logThrottled(
+                                logutil::Level::warn,
+                                "object_detector.flow2.bad_detection_item",
+                                std::chrono::seconds(30),
+                                std::string("Skip invalid detection item: ") + e.what());
                             continue;  // Skip bad items
                         }
                     }
-                    
-                    static int s_log = 0;
-                    if ((++s_log % 100) == 0)
-                    {
-                        std::cerr << "[FLOW2 C++] detections=" << result.size() << std::endl;
-                    }
+
+                    logutil::logThrottled(
+                        logutil::Level::debug,
+                        "object_detector.flow2.detections",
+                        std::chrono::seconds(10),
+                        "FLOW2 detections=" + std::to_string(result.size()));
                     
                     return result;
                 }
