@@ -65,6 +65,7 @@ protected:
     virtual void doSetNeededMetadataTypes(
         nx::sdk::Result<void>* outValue,
         const nx::sdk::analytics::IMetadataTypes* neededMetadataTypes) override;
+    virtual nx::sdk::Result<const nx::sdk::ISettingsResponse*> settingsReceived() override;
 
 private:
     void reinitializeObjectTrackerOnFrameSizeChanges(const Frame& frame);
@@ -105,14 +106,13 @@ private:
     // FLOW 2: Fall Detection Event
     const std::string kFallDetectedEventType = "mycompany.yolov8_people_analytics.fallDetected";
 
-    /** Process every 2nd frame for better detection frequency (reasonable balance). */
-    static constexpr int kDetectionFramePeriod = 2;
-    static constexpr int kTargetEnqueueFps = 8;
-    
-    // ============ FLOW 2: Frame queue config ============
-    static constexpr size_t kFrameQueueMaxSize = 3;  // Drop old frames if queue full
     static constexpr int kQueueWarningThrottleSec = 30;
-    static constexpr int kMetricsLogPeriodSec = 10;
+    static constexpr int kMetricsDiagThrottleSec = 30;
+
+    static constexpr int kDefaultDetectionFramePeriod = 2;
+    static constexpr int kDefaultTargetEnqueueFps = 8;
+    static constexpr size_t kDefaultFrameQueueMaxSize = 3;
+    static constexpr int kDefaultMetricsLogPeriodSec = 10;
 
 private:
     bool m_terminated = false;
@@ -164,16 +164,23 @@ private:
     std::atomic<uint64_t> m_totalInferMs{0};
     std::atomic<uint64_t> m_encodingErrorCount{0};
     std::atomic<uint64_t> m_processingErrorCount{0};
+    std::atomic<size_t> m_maxQueueDepth{0};
 
     std::chrono::steady_clock::time_point m_lastEnqueueTime = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point m_lastQueueWarningTime = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point m_lastMetricsLogTime = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point m_lastMetricsDiagTime = std::chrono::steady_clock::time_point::min();
 
     uint64_t m_droppedSinceLastQueueWarning = 0;
     uint64_t m_lastMetricsInCount = 0;
     uint64_t m_lastMetricsProcessedCount = 0;
     uint64_t m_lastMetricsDroppedCount = 0;
     uint64_t m_lastMetricsInferMs = 0;
+
+    std::atomic<int> m_detectionFramePeriod{kDefaultDetectionFramePeriod};
+    std::atomic<int> m_targetEnqueueFps{kDefaultTargetEnqueueFps};
+    std::atomic<size_t> m_frameQueueMaxSize{kDefaultFrameQueueMaxSize};
+    std::atomic<int> m_metricsLogPeriodSec{kDefaultMetricsLogPeriodSec};
 };
 
 } // namespace opencv_object_detection

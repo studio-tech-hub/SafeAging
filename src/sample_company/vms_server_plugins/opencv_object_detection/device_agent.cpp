@@ -4,6 +4,7 @@
 
 #include "device_agent.h"
 #include <set>
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <cctype>
@@ -81,6 +82,38 @@ namespace sample_company
                     }
 
                     return name.empty() ? "unknown_camera" : name;
+                }
+
+                int parseIntSettingValue(
+                    const std::string& raw,
+                    int defaultValue,
+                    int minValue,
+                    int maxValue)
+                {
+                    if (raw.empty())
+                        return defaultValue;
+
+                    try
+                    {
+                        int value = std::stoi(raw);
+                        if (value < minValue)
+                            value = minValue;
+                        if (value > maxValue)
+                            value = maxValue;
+                        return value;
+                    }
+                    catch (...)
+                    {
+                        return defaultValue;
+                    }
+                }
+
+                void updateMaxDepth(std::atomic<size_t>& currentMax, size_t depth)
+                {
+                    size_t observed = currentMax.load();
+                    while (depth > observed && !currentMax.compare_exchange_weak(observed, depth))
+                    {
+                    }
                 }
             } // namespace
 
@@ -179,10 +212,17 @@ namespace sample_company
                     return true;
                 }
 
-                bool shouldEnqueue = (m_frameIndex % kDetectionFramePeriod == 0);
-                if (shouldEnqueue && kTargetEnqueueFps > 0)
+                const int detectionFramePeriod = std::max(
+                    1, m_detectionFramePeriod.load(std::memory_order_relaxed));
+                const int targetEnqueueFps = std::max(
+                    1, m_targetEnqueueFps.load(std::memory_order_relaxed));
+                const size_t frameQueueMaxSize = std::max<size_t>(
+                    1, m_frameQueueMaxSize.load(std::memory_order_relaxed));
+
+                bool shouldEnqueue = (m_frameIndex % detectionFramePeriod == 0);
+                if (shouldEnqueue && targetEnqueueFps > 0)
                 {
-                    const auto minIntervalMs = std::chrono::milliseconds(1000 / kTargetEnqueueFps);
+                    const auto minIntervalMs = std::chrono::milliseconds(1000 / targetEnqueueFps);
                     if (m_lastEnqueueTime != std::chrono::steady_clock::time_point::min() &&
                         now - m_lastEnqueueTime < minIntervalMs)
                     {
@@ -206,7 +246,7 @@ namespace sample_company
 
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
-                            if (m_frameQueue.size() >= kFrameQueueMaxSize)
+                            if (m_frameQueue.size() >= frameQueueMaxSize)
                             {
                                 m_frameQueue.pop_front();
                                 ++m_droppedFrameCount;
@@ -221,8 +261,8 @@ namespace sample_company
                                         "Worker thread may be slow; dropped " +
                                         std::to_string(m_droppedSinceLastQueueWarning) +
                                         " frames in last interval. queue_max=" +
-                                        std::to_string(kFrameQueueMaxSize) +
-                                        ", target_fps=" + std::to_string(kTargetEnqueueFps);
+                                        std::to_string(frameQueueMaxSize) +
+                                        ", target_fps=" + std::to_string(targetEnqueueFps);
                                     pushPluginDiagnosticEvent(
                                         nx::sdk::IPluginDiagnosticEvent::Level::warning,
                                         "Frame queue full - dropping old frames",
@@ -240,6 +280,7 @@ namespace sample_company
                             }
 
                             m_frameQueue.push_back(std::move(job));
+                            updateMaxDepth(m_maxQueueDepth, m_frameQueue.size());
                         }
 
                         ++m_enqueuedFrameCount;
@@ -260,12 +301,15 @@ namespace sample_company
                     }
                 }
 
-                if (now - m_lastMetricsLogTime >= std::chrono::seconds(kMetricsLogPeriodSec))
+                const int metricsLogPeriodSec = std::max(
+                    1, m_metricsLogPeriodSec.load(std::memory_order_relaxed));
+                if (now - m_lastMetricsLogTime >= std::chrono::seconds(metricsLogPeriodSec))
                 {
                     const uint64_t inCount = m_inFrameCount.load();
                     const uint64_t processedCount = m_processedFrameCount.load();
                     const uint64_t droppedCount = m_droppedFrameCount.load();
                     const uint64_t inferMs = m_totalInferMs.load();
+                    const size_t maxDepth = m_maxQueueDepth.load();
 
                     const uint64_t deltaIn = inCount - m_lastMetricsInCount;
                     const uint64_t deltaProcessed = processedCount - m_lastMetricsProcessedCount;
@@ -291,7 +335,25 @@ namespace sample_company
                             ", proc_fps=" + std::to_string(procFps) +
                             ", drop=" + std::to_string(deltaDropped) +
                             ", queue=" + std::to_string(queueLen) +
+                            ", max_depth=" + std::to_string(maxDepth) +
                             ", avg_infer_ms=" + std::to_string(avgInferMs));
+
+                    if (m_lastMetricsDiagTime == std::chrono::steady_clock::time_point::min() ||
+                        now - m_lastMetricsDiagTime >= std::chrono::seconds(kMetricsDiagThrottleSec))
+                    {
+                        const std::string diag =
+                            "in_fps=" + std::to_string(inFps) +
+                            ", proc_fps=" + std::to_string(procFps) +
+                            ", dropped=" + std::to_string(deltaDropped) +
+                            ", queue=" + std::to_string(queueLen) +
+                            ", max_depth=" + std::to_string(maxDepth) +
+                            ", avg_infer_ms=" + std::to_string(avgInferMs);
+                        pushPluginDiagnosticEvent(
+                            nx::sdk::IPluginDiagnosticEvent::Level::info,
+                            "Pipeline metrics",
+                            diag.c_str());
+                        m_lastMetricsDiagTime = now;
+                    }
 
                     m_lastMetricsInCount = inCount;
                     m_lastMetricsProcessedCount = processedCount;
@@ -314,6 +376,48 @@ namespace sample_company
                     m_metadataQueue.pop_front();
                 }
                 return true;
+            }
+
+            nx::sdk::Result<const nx::sdk::ISettingsResponse*> DeviceAgent::settingsReceived()
+            {
+                const int detectionPeriod = parseIntSettingValue(
+                    settingValue("detection_frame_period"),
+                    kDefaultDetectionFramePeriod,
+                    1,
+                    60);
+                const int enqueueFps = parseIntSettingValue(
+                    settingValue("target_enqueue_fps"),
+                    kDefaultTargetEnqueueFps,
+                    1,
+                    60);
+                const int queueMax = parseIntSettingValue(
+                    settingValue("frame_queue_max_size"),
+                    static_cast<int>(kDefaultFrameQueueMaxSize),
+                    1,
+                    100);
+                const int metricsPeriod = parseIntSettingValue(
+                    settingValue("metrics_log_period_sec"),
+                    kDefaultMetricsLogPeriodSec,
+                    1,
+                    300);
+
+                m_detectionFramePeriod.store(detectionPeriod, std::memory_order_relaxed);
+                m_targetEnqueueFps.store(enqueueFps, std::memory_order_relaxed);
+                m_frameQueueMaxSize.store(static_cast<size_t>(queueMax), std::memory_order_relaxed);
+                m_metricsLogPeriodSec.store(metricsPeriod, std::memory_order_relaxed);
+
+                logutil::log(
+                    logutil::Level::info,
+                    "Applied settings: detection_frame_period=" +
+                        std::to_string(m_detectionFramePeriod.load(std::memory_order_relaxed)) +
+                        ", target_enqueue_fps=" +
+                        std::to_string(m_targetEnqueueFps.load(std::memory_order_relaxed)) +
+                        ", frame_queue_max_size=" +
+                        std::to_string(m_frameQueueMaxSize.load(std::memory_order_relaxed)) +
+                        ", metrics_log_period_sec=" +
+                        std::to_string(m_metricsLogPeriodSec.load(std::memory_order_relaxed)));
+
+                return nullptr;
             }
 
             void DeviceAgent::doSetNeededMetadataTypes(
