@@ -19,6 +19,11 @@
 #include "json.hpp"
 #include <unordered_map>
 #include <mutex>
+#include <chrono>
+#include <algorithm>
+#include <vector>
+#include <cctype>
+#include <cstdint>
 
 namespace sample_company {
     namespace vms_server_plugins {
@@ -161,20 +166,217 @@ namespace sample_company {
                     return base64Encode(buf.data(), buf.size());
                 }
 
-                static nx::sdk::Uuid uuidFromTrackId(int trackId)
+                struct DebugBbox
+                {
+                    cv::Rect rect;
+                    std::string label;
+                    float score = 0.0f;
+                };
+
+                std::string sanitizeForFileName(const std::string& value)
+                {
+                    if (value.empty())
+                        return "unknown_camera";
+
+                    std::string out = value;
+                    for (char& ch : out)
+                    {
+                        const unsigned char u = static_cast<unsigned char>(ch);
+                        if (!std::isalnum(u) && ch != '-' && ch != '_')
+                            ch = '_';
+                    }
+                    return out;
+                }
+
+                std::filesystem::path frameDumpRootDir()
+                {
+                    static std::filesystem::path root =
+                        std::filesystem::path(R"(D:\Part-time\SafeAgingV4\SafeAging\debug_frames)");
+                    static bool initialized = false;
+                    static std::mutex initMutex;
+
+                    std::lock_guard<std::mutex> lk(initMutex);
+                    if (!initialized)
+                    {
+                        std::error_code ec;
+                        std::filesystem::create_directories(root / "input", ec);
+                        std::filesystem::create_directories(root / "output", ec);
+                        std::cerr << "[FrameDump] root=" << root.string() << std::endl;
+                        initialized = true;
+                    }
+
+                    return root;
+                }
+
+                uint64_t nextFrameDumpSeq()
                 {
                     static std::mutex m;
-                    static std::unordered_map<int, nx::sdk::Uuid> map;
+                    static uint64_t seq = 0;
+                    std::lock_guard<std::mutex> lk(m);
+                    ++seq;
+                    return seq;
+                }
+
+                std::filesystem::path frameDumpPath(
+                    const std::string& cameraId,
+                    const char* type,
+                    uint64_t seq)
+                {
+                    constexpr uint64_t kMaxFrameFiles = 150;
+                    const uint64_t slot = seq % kMaxFrameFiles;
+
+                    std::string fileName = sanitizeForFileName(cameraId);
+                    fileName += "_";
+                    fileName += std::to_string(slot);
+                    fileName += ".jpg";
+
+                    return frameDumpRootDir() / type / fileName;
+                }
+
+                void dumpInputFrame(
+                    const std::string& cameraId,
+                    uint64_t seq,
+                    const cv::Mat& frameBgr)
+                {
+                    if (frameBgr.empty())
+                        return;
+
+                    try
+                    {
+                        cv::imwrite(frameDumpPath(cameraId, "input", seq).string(), frameBgr);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        std::cerr << "[FrameDump] Failed to write input frame: " << e.what() << std::endl;
+                    }
+                }
+
+                void dumpOutputFrame(
+                    const std::string& cameraId,
+                    uint64_t seq,
+                    const cv::Mat& frameBgr,
+                    const std::vector<DebugBbox>& boxes)
+                {
+                    if (frameBgr.empty())
+                        return;
+
+                    try
+                    {
+                        cv::Mat rendered = frameBgr.clone();
+                        for (const auto& box : boxes)
+                        {
+                            cv::rectangle(rendered, box.rect, cv::Scalar(0, 255, 0), 2);
+
+                            std::string text = box.label + " " + std::to_string(box.score);
+                            int baseLine = 0;
+                            const cv::Size textSize =
+                                cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+                            const int textX = std::max(0, box.rect.x);
+                            const int textY = std::max(textSize.height + 4, box.rect.y - 6);
+
+                            cv::rectangle(
+                                rendered,
+                                cv::Rect(textX, textY - textSize.height - 4, textSize.width + 6, textSize.height + 6),
+                                cv::Scalar(0, 255, 0),
+                                cv::FILLED);
+                            cv::putText(
+                                rendered,
+                                text,
+                                cv::Point(textX + 3, textY - 3),
+                                cv::FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                cv::Scalar(0, 0, 0),
+                                1,
+                                cv::LINE_AA);
+                        }
+
+                        cv::imwrite(frameDumpPath(cameraId, "output", seq).string(), rendered);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        std::cerr << "[FrameDump] Failed to write output frame: " << e.what() << std::endl;
+                    }
+                }
+
+                static nx::sdk::Uuid uuidFromTrackId(const std::string& cameraId, int trackId)
+                {
+                    struct TrackCacheKey
+                    {
+                        std::string cameraId;
+                        int trackId = 0;
+
+                        bool operator==(const TrackCacheKey& other) const
+                        {
+                            return trackId == other.trackId && cameraId == other.cameraId;
+                        }
+                    };
+
+                    struct TrackCacheKeyHash
+                    {
+                        size_t operator()(const TrackCacheKey& key) const
+                        {
+                            size_t h1 = std::hash<std::string>{}(key.cameraId);
+                            size_t h2 = std::hash<int>{}(key.trackId);
+                            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+                        }
+                    };
+
+                    struct TrackCacheEntry
+                    {
+                        nx::sdk::Uuid uuid;
+                        std::chrono::steady_clock::time_point lastSeen;
+                    };
+
+                    static std::mutex m;
+                    static std::unordered_map<TrackCacheKey, TrackCacheEntry, TrackCacheKeyHash> map;
+                    static size_t accessCount = 0;
+
+                    constexpr std::chrono::minutes kTrackUuidTtl{5};
+                    constexpr size_t kTrackUuidMaxSize = 10000;
+                    constexpr size_t kCleanupPeriod = 256;
 
                     std::lock_guard<std::mutex> lk(m);
+                    const auto now = std::chrono::steady_clock::now();
 
-                    auto it = map.find(trackId);
+                    ++accessCount;
+                    if (accessCount % kCleanupPeriod == 0)
+                    {
+                        for (auto it = map.begin(); it != map.end();)
+                        {
+                            if (now - it->second.lastSeen > kTrackUuidTtl)
+                                it = map.erase(it);
+                            else
+                                ++it;
+                        }
+
+                        if (map.size() > kTrackUuidMaxSize)
+                        {
+                            std::vector<std::pair<TrackCacheKey, std::chrono::steady_clock::time_point>> entries;
+                            entries.reserve(map.size());
+                            for (const auto& kv : map)
+                                entries.push_back({kv.first, kv.second.lastSeen});
+
+                            std::sort(
+                                entries.begin(),
+                                entries.end(),
+                                [](const auto& a, const auto& b) { return a.second < b.second; });
+
+                            const size_t toRemove = map.size() - kTrackUuidMaxSize;
+                            for (size_t i = 0; i < toRemove; ++i)
+                                map.erase(entries[i].first);
+                        }
+                    }
+
+                    const TrackCacheKey key{cameraId.empty() ? "unknown_camera" : cameraId, trackId};
+                    auto it = map.find(key);
                     if (it != map.end())
-                        return it->second;
+                    {
+                        it->second.lastSeen = now;
+                        return it->second.uuid;
+                    }
 
-                    // tạo 1 UUID mới và cache lại cho trackId này
                     nx::sdk::Uuid u = nx::sdk::UuidHelper::randomUuid();
-                    map.emplace(trackId, u);
+                    map.emplace(key, TrackCacheEntry{u, now});
                     return u;
                 }
 
@@ -191,94 +393,52 @@ namespace sample_company {
                     auto now = std::chrono::steady_clock::now();
                     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCall).count();
 
-                    // ví dụ: chỉ gọi tối đa 5 lần/giây
                     if (ms < 200)
                         return {};
                     lastCall = now;
 
-                // Resize để giảm thời gian imencode/base64 và tăng FPS tổng
                     cv::Mat sendImg = image;
-                    const int targetW = 640; // bạn có thể thử 416 nếu máy yếu
+                    const int targetW = 640;
                     if (image.cols > targetW)
                     {
-                        float scale = (float)targetW / (float)image.cols;
-                        int newW = targetW;
-                        int newH = std::max(1, (int)std::round(image.rows * scale));
+                        const float scale = static_cast<float>(targetW) / static_cast<float>(image.cols);
+                        const int newW = targetW;
+                        const int newH = std::max(1, static_cast<int>(std::round(image.rows * scale)));
                         cv::resize(image, sendImg, cv::Size(newW, newH));
                     }
 
                     const int imgW = sendImg.cols;
                     const int imgH = sendImg.rows;
-                    
-                    std::cerr << "[C++ infer] Encoding sendImg " << imgW << "x" << imgH 
-                              << " type=" << sendImg.type() << " continuous=" << sendImg.isContinuous() << std::endl;
-                    
+                    const std::string cameraId = "nx_camera";
+                    const uint64_t dumpSeq = nextFrameDumpSeq();
+                    dumpInputFrame(cameraId, dumpSeq, sendImg);
+
                     std::string b64;
                     try
                     {
-                        std::cerr << "[C++ infer] Calling matToBase64Jpeg..." << std::endl;
                         b64 = matToBase64Jpeg(sendImg);
-                        std::cerr << "[C++ infer] matToBase64Jpeg returned, b64 size=" << b64.size() << std::endl;
                     }
                     catch (const std::exception& e)
                     {
-                        std::cerr << "[C++ infer] matToBase64Jpeg threw exception: " << e.what() << std::endl;
                         throw ObjectDetectionError(std::string("Failed to encode image to base64: ") + e.what());
                     }
 
                     if (b64.empty())
-                    {
-                        std::cerr << "[C++ infer] ERROR: b64 is empty after encoding!" << std::endl;
-                        throw ObjectDetectionError("b64 empty after imencode - image may be invalid");
-                    }
-                    
-                    std::cerr << "[C++ infer] b64 size OK: " << b64.size() << " bytes" << std::endl;
+                        throw ObjectDetectionError("b64 empty after encode - image may be invalid");
 
-
-                    // 2. JSON request body
                     json req;
-                    req["camera_id"] = "nx_camera";  // tạm thời, sau này map đúng ID camera nếu cần
+                    req["camera_id"] = cameraId;
                     req["image"] = b64;
 
-                    // 3. HTTP client -> POST /infer
-                    // Reuse client để đỡ tạo kết nối liên tục mỗi frame
                     thread_local httplib::Client cli("127.0.0.1", 18000);
-                    cli.set_keep_alive(true); // Keep connection alive để tái sử dụng
-
-                    // Tăng timeout để Python service có thời gian xử lý
-                    cli.set_connection_timeout(1, 500000); // 1.5s (1s + 500ms)
-                    cli.set_read_timeout(2, 500000);       // 2.5s (2s + 500ms)
-                    cli.set_write_timeout(1, 0);           // 1s
-
-
-                    static int s_reqCount = 0;
-                    if ((++s_reqCount % 20) == 0)
-                    {
-                        std::cerr << "[C++] calling /infer count=" << s_reqCount << std::endl;
-                    }
+                    cli.set_keep_alive(true);
+                    cli.set_connection_timeout(1, 500000);
+                    cli.set_read_timeout(2, 500000);
+                    cli.set_write_timeout(1, 0);
 
                     auto res = cli.Post("/infer", req.dump(), "application/json");
-
-                    // ❗ res là pointer-like
-                    if (!res)
-                    {
-                        static int s_fail = 0;
-                        if ((++s_fail % 200) == 0)
-                        {
-                            std::cerr << "[C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
-                        }
+                    if (!res || res->status != 200)
                         return {};
-                    }
-
-                    if (res->status != 200)
-                    {
-                        static int s_bad = 0;
-                        if ((++s_bad % 200) == 0)
-                            std::cerr << "[C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
-                        return {};
-                    }
 
                     json j;
                     try
@@ -293,39 +453,46 @@ namespace sample_company {
                     if (!j.is_array())
                         return {};
 
-                    // 5. Mỗi phần tử là 1 detection:
-                    //    { "cls": "person", "score": 0.9, "x": 180.0, "y": 270.6, "w": 120.0, "h": 360.8, "track_id": 1 }
+                    std::vector<DebugBbox> debugBoxes;
                     for (const auto& item : j)
                     {
                         const std::string classLabel = item.value("cls", "person");
                         const float score = item.value("score", 0.0f);
 
-                        float x = item.value("x", 0.0f);
-                        float y = item.value("y", 0.0f);
-                        float w = item.value("w", 0.0f);
-                        float h = item.value("h", 0.0f);
+                        const float x = item.value("x", 0.0f);
+                        const float y = item.value("y", 0.0f);
+                        const float w = item.value("w", 0.0f);
+                        const float h = item.value("h", 0.0f);
 
                         if (w <= 0.0f || h <= 0.0f)
                             continue;
 
-                        // Chuyển từ toạ độ pixel sang normalized [0..1]
                         float xNorm = x / static_cast<float>(imgW);
                         float yNorm = y / static_cast<float>(imgH);
                         float wNorm = w / static_cast<float>(imgW);
                         float hNorm = h / static_cast<float>(imgH);
 
-                        // Clamp lại cho chắc
                         if (xNorm < 0.0f) xNorm = 0.0f;
                         if (yNorm < 0.0f) yNorm = 0.0f;
                         if (xNorm + wNorm > 1.0f) wNorm = 1.0f - xNorm;
                         if (yNorm + hNorm > 1.0f) hNorm = 1.0f - yNorm;
-
                         if (wNorm <= 0.0f || hNorm <= 0.0f)
                             continue;
 
-                        // 🔹 Lấy track_id từ JSON -> UUID ổn định
+                        const int x1 = std::max(0, static_cast<int>(std::round(x)));
+                        const int y1 = std::max(0, static_cast<int>(std::round(y)));
+                        const int x2 = std::min(imgW, static_cast<int>(std::round(x + w)));
+                        const int y2 = std::min(imgH, static_cast<int>(std::round(y + h)));
+                        if (x2 > x1 && y2 > y1)
+                        {
+                            debugBoxes.push_back(DebugBbox{
+                                cv::Rect(x1, y1, x2 - x1, y2 - y1),
+                                classLabel,
+                                score});
+                        }
+
                         const int trackId = item.value("track_id", 0);
-                        nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
+                        nx::sdk::Uuid trackUuid = uuidFromTrackId(cameraId, trackId);
 
                         auto detection = std::make_shared<Detection>(Detection{
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
@@ -337,13 +504,7 @@ namespace sample_company {
                         result.push_back(detection);
                     }
 
-                    static int s_log = 0;
-                    if ((++s_log % 100) == 0)
-                    {
-                        std::cerr << "[C++] detections=" << result.size()
-                            << " img=" << imgW << "x" << imgH << std::endl;
-                    }
-
+                    dumpOutputFrame(cameraId, dumpSeq, sendImg, debugBoxes);
                     return result;
                 }
 
@@ -433,68 +594,43 @@ namespace sample_company {
             // Uses short timeout for MVP (fail-fast)
             // ============================================================
             DetectionList ObjectDetector::callPythonServiceMultipart(
-                const std::string& cameraId, 
+                const std::string& cameraId,
                 const std::vector<uint8_t>& jpegBytes)
             {
                 DetectionList result;
-                
+
                 try
                 {
-                    // Base64 encode JPEG for JSON request
                     std::string b64 = base64Encode(jpegBytes.data(), jpegBytes.size());
-                    
                     if (b64.empty())
                         throw ObjectDetectionError("Failed to base64 encode JPEG bytes");
-                    
-                    // Create JSON request
+
+                    const cv::Mat decodedJpeg = cv::imdecode(jpegBytes, cv::IMREAD_COLOR);
+                    if (decodedJpeg.empty())
+                        throw ObjectDetectionError("Failed to decode JPEG bytes to determine frame dimensions");
+
+                    const int frameW = decodedJpeg.cols;
+                    const int frameH = decodedJpeg.rows;
+                    const uint64_t dumpSeq = nextFrameDumpSeq();
+                    dumpInputFrame(cameraId, dumpSeq, decodedJpeg);
+
                     json req;
                     req["camera_id"] = cameraId;
                     req["image"] = b64;
-                    
-                    std::string jsonBody = req.dump();
-                    
-                    // HTTP client (thread-local, reused)
+                    const std::string jsonBody = req.dump();
+
                     thread_local httplib::Client cli("127.0.0.1", 18000);
                     cli.set_keep_alive(true);
-                    
-                    // Longer timeouts for high-res GPU inference (avoid client cancel -> 500)
-                    cli.set_connection_timeout(2, 0);  // 2s
-                    cli.set_read_timeout(15, 0);       // 15s
-                    cli.set_write_timeout(2, 0);       // 2s
-                    
-                    static int s_reqCount = 0;
-                    if ((++s_reqCount % 20) == 0)
-                    {
-                        std::cerr << "[FLOW2 C++] Calling /infer with JPEG, count=" << s_reqCount 
-                                  << " jpegSize=" << jpegBytes.size() << " bytes" << std::endl;
-                    }
-                    
-                    // POST /infer endpoint
+                    cli.set_connection_timeout(2, 0);
+                    cli.set_read_timeout(15, 0);
+                    cli.set_write_timeout(2, 0);
+
                     auto res = cli.Post("/infer", jsonBody, "application/json");
-                    
                     if (!res)
-                    {
-                        static int s_fail = 0;
-                        if ((++s_fail % 200) == 0)
-                        {
-                            std::cerr << "[FLOW2 C++] /infer failed (no response)" << std::endl;
-                            std::cerr << "[FLOW2 C++] Python service at 127.0.0.1:18000 may not be running." << std::endl;
-                        }
                         throw ObjectDetectionError("No response from /infer endpoint");
-                    }
-                    
                     if (res->status != 200)
-                    {
-                        static int s_bad = 0;
-                        if ((++s_bad % 200) == 0)
-                        {
-                            std::cerr << "[FLOW2 C++] /infer status=" << res->status 
-                                     << " body=" << res->body.substr(0, 100) << std::endl;
-                        }
                         throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
-                    }
-                    
-                    // Parse JSON response
+
                     json j;
                     try
                     {
@@ -504,79 +640,73 @@ namespace sample_company {
                     {
                         throw ObjectDetectionError(std::string("Failed to parse JSON response: ") + e.what());
                     }
-                    
+
                     if (!j.is_array())
                         throw ObjectDetectionError("Response is not a JSON array");
 
-                    // Determine the exact image size that was sent to /infer.
-                    // This avoids bbox normalization errors when frame height is not 480.
-                    const cv::Mat decodedJpeg = cv::imdecode(jpegBytes, cv::IMREAD_COLOR);
-                    if (decodedJpeg.empty())
-                        throw ObjectDetectionError("Failed to decode JPEG bytes to determine frame dimensions");
-                    const int frameW = decodedJpeg.cols;
-                    const int frameH = decodedJpeg.rows;
-                    
-                    // Parse each detection
+                    std::vector<DebugBbox> debugBoxes;
                     for (const auto& item : j)
                     {
                         try
                         {
                             const std::string classLabel = item.value("cls", "person");
                             const float score = item.value("score", 0.0f);
-                            
-                            float x = item.value("x", 0.0f);
-                            float y = item.value("y", 0.0f);
-                            float w = item.value("w", 0.0f);
-                            float h = item.value("h", 0.0f);
-                            
-                            const bool fallDetected = item.value("fall_detected", false);  // FLOW 2
-                            
+
+                            const float x = item.value("x", 0.0f);
+                            const float y = item.value("y", 0.0f);
+                            const float w = item.value("w", 0.0f);
+                            const float h = item.value("h", 0.0f);
+
+                            const bool fallDetected = item.value("fall_detected", false);
+
                             if (w <= 0.0f || h <= 0.0f)
                                 continue;
-                            
-                            // Normalize coordinates
+
                             float xNorm = x / static_cast<float>(frameW);
                             float yNorm = y / static_cast<float>(frameH);
                             float wNorm = w / static_cast<float>(frameW);
                             float hNorm = h / static_cast<float>(frameH);
-                            
-                            // Clamp
+
                             if (xNorm < 0.0f) xNorm = 0.0f;
                             if (yNorm < 0.0f) yNorm = 0.0f;
                             if (xNorm + wNorm > 1.0f) wNorm = 1.0f - xNorm;
                             if (yNorm + hNorm > 1.0f) hNorm = 1.0f - yNorm;
-                            
                             if (wNorm <= 0.0f || hNorm <= 0.0f)
                                 continue;
-                            
-                            // Get track ID
+
+                            const int x1 = std::max(0, static_cast<int>(std::round(x)));
+                            const int y1 = std::max(0, static_cast<int>(std::round(y)));
+                            const int x2 = std::min(frameW, static_cast<int>(std::round(x + w)));
+                            const int y2 = std::min(frameH, static_cast<int>(std::round(y + h)));
+                            if (x2 > x1 && y2 > y1)
+                            {
+                                debugBoxes.push_back(DebugBbox{
+                                    cv::Rect(x1, y1, x2 - x1, y2 - y1),
+                                    classLabel,
+                                    score});
+                            }
+
                             const int trackId = item.value("track_id", 0);
-                            nx::sdk::Uuid trackUuid = uuidFromTrackId(trackId);
-                            
-                            // FLOW 2: Include fall_detected flag
+                            nx::sdk::Uuid trackUuid = uuidFromTrackId(cameraId, trackId);
+
                             auto detection = std::make_shared<Detection>(Detection{
                                 nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
                                 classLabel,
                                 score,
                                 trackUuid,
-                                fallDetected  // FLOW 2
+                                fallDetected
                             });
-                            
+
                             result.push_back(detection);
                         }
                         catch (const std::exception& e)
                         {
                             std::cerr << "[FLOW2 C++] Error parsing detection item: " << e.what() << std::endl;
-                            continue;  // Skip bad items
+                            continue;
                         }
                     }
-                    
-                    static int s_log = 0;
-                    if ((++s_log % 100) == 0)
-                    {
-                        std::cerr << "[FLOW2 C++] detections=" << result.size() << std::endl;
-                    }
-                    
+
+                    dumpOutputFrame(cameraId, dumpSeq, decodedJpeg, debugBoxes);
                     return result;
                 }
                 catch (const ObjectDetectionError&)
