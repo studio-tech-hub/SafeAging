@@ -108,6 +108,7 @@ private:
 
     static constexpr int kQueueWarningThrottleSec = 30;
     static constexpr int kMetricsDiagThrottleSec = 30;
+    static constexpr int kAiServiceErrorDiagThrottleSec = 30;
 
     static constexpr int kDefaultDetectionFramePeriod = 2;
     static constexpr int kDefaultTargetEnqueueFps = 8;
@@ -170,6 +171,7 @@ private:
     std::chrono::steady_clock::time_point m_lastQueueWarningTime = std::chrono::steady_clock::time_point::min();
     std::chrono::steady_clock::time_point m_lastMetricsLogTime = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point m_lastMetricsDiagTime = std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point m_lastAiServiceErrorDiagTime = std::chrono::steady_clock::time_point::min();
 
     uint64_t m_droppedSinceLastQueueWarning = 0;
     uint64_t m_lastMetricsInCount = 0;

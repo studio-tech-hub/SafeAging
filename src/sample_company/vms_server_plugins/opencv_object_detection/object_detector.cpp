@@ -23,6 +23,8 @@
 #include <chrono>
 #include <algorithm>
 #include <vector>
+#include <array>
+#include <thread>
 #include <cctype>
 #include <cstdint>
 
@@ -400,6 +402,179 @@ namespace sample_company {
                 }
 
                 // Gọi Python service, trả về DetectionList (danh sách Detection của plugin)
+                enum class CircuitState
+                {
+                    closed,
+                    open,
+                    halfOpen
+                };
+
+                struct CircuitBreakerEntry
+                {
+                    CircuitState state = CircuitState::closed;
+                    int consecutiveFailures = 0;
+                    bool halfOpenProbeInFlight = false;
+                    std::chrono::steady_clock::time_point openUntil =
+                        std::chrono::steady_clock::time_point::min();
+                    std::chrono::steady_clock::time_point lastSeen =
+                        std::chrono::steady_clock::now();
+                };
+
+                constexpr int kCircuitFailureThreshold = 5;
+                constexpr std::chrono::seconds kCircuitOpenCooldown{15};
+                constexpr size_t kCircuitMapMaxSize = 256;
+                constexpr std::array<int, 2> kTransientRetryBackoffMs{{150, 400}};
+
+                std::mutex g_circuitMutex;
+                std::unordered_map<std::string, CircuitBreakerEntry> g_circuitByCamera;
+                size_t g_circuitAccessCount = 0;
+
+                std::string normalizeCameraKey(const std::string& cameraId)
+                {
+                    return cameraId.empty() ? "unknown_camera" : cameraId;
+                }
+
+                bool isTransientHttpStatus(int status)
+                {
+                    return status == 408 || status == 429 || (status >= 500 && status <= 599);
+                }
+
+                void cleanupCircuitStateIfNeeded(const std::chrono::steady_clock::time_point now)
+                {
+                    ++g_circuitAccessCount;
+                    if (g_circuitAccessCount % 256 != 0)
+                        return;
+
+                    for (auto it = g_circuitByCamera.begin(); it != g_circuitByCamera.end();)
+                    {
+                        if (now - it->second.lastSeen > std::chrono::minutes(30))
+                            it = g_circuitByCamera.erase(it);
+                        else
+                            ++it;
+                    }
+
+                    if (g_circuitByCamera.size() <= kCircuitMapMaxSize)
+                        return;
+
+                    std::vector<std::pair<std::string, std::chrono::steady_clock::time_point>> ages;
+                    ages.reserve(g_circuitByCamera.size());
+                    for (const auto& kv : g_circuitByCamera)
+                        ages.push_back({kv.first, kv.second.lastSeen});
+                    std::sort(
+                        ages.begin(),
+                        ages.end(),
+                        [](const auto& a, const auto& b) { return a.second < b.second; });
+
+                    const size_t toRemove = g_circuitByCamera.size() - kCircuitMapMaxSize;
+                    for (size_t i = 0; i < toRemove; ++i)
+                        g_circuitByCamera.erase(ages[i].first);
+                }
+
+                bool circuitBreakerAllowRequest(
+                    const std::string& cameraId,
+                    std::string* outReason,
+                    bool* outHalfOpenTransition)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> lk(g_circuitMutex);
+                    cleanupCircuitStateIfNeeded(now);
+
+                    auto& state = g_circuitByCamera[cameraId];
+                    state.lastSeen = now;
+                    if (outHalfOpenTransition)
+                        *outHalfOpenTransition = false;
+
+                    if (state.state == CircuitState::open)
+                    {
+                        if (now < state.openUntil)
+                        {
+                            if (outReason)
+                            {
+                                const auto remainMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    state.openUntil - now).count();
+                                *outReason = "cooldown_ms=" + std::to_string(std::max<int64_t>(0, remainMs));
+                            }
+                            return false;
+                        }
+
+                        state.state = CircuitState::halfOpen;
+                        state.halfOpenProbeInFlight = true;
+                        if (outHalfOpenTransition)
+                            *outHalfOpenTransition = true;
+                        return true;
+                    }
+
+                    if (state.state == CircuitState::halfOpen)
+                    {
+                        if (state.halfOpenProbeInFlight)
+                        {
+                            if (outReason)
+                                *outReason = "half_open_probe_in_flight";
+                            return false;
+                        }
+                        state.halfOpenProbeInFlight = true;
+                        return true;
+                    }
+
+                    return true;
+                }
+
+                bool circuitBreakerOnSuccess(const std::string& cameraId)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> lk(g_circuitMutex);
+                    auto& state = g_circuitByCamera[cameraId];
+                    const bool recovered = (state.state != CircuitState::closed);
+                    state.state = CircuitState::closed;
+                    state.consecutiveFailures = 0;
+                    state.halfOpenProbeInFlight = false;
+                    state.openUntil = std::chrono::steady_clock::time_point::min();
+                    state.lastSeen = now;
+                    return recovered;
+                }
+
+                bool circuitBreakerOnTransientFailure(const std::string& cameraId)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> lk(g_circuitMutex);
+                    auto& state = g_circuitByCamera[cameraId];
+                    state.lastSeen = now;
+
+                    if (state.state == CircuitState::halfOpen)
+                    {
+                        state.state = CircuitState::open;
+                        state.halfOpenProbeInFlight = false;
+                        state.consecutiveFailures = 0;
+                        state.openUntil = now + kCircuitOpenCooldown;
+                        return true;
+                    }
+
+                    ++state.consecutiveFailures;
+                    if (state.consecutiveFailures >= kCircuitFailureThreshold)
+                    {
+                        state.state = CircuitState::open;
+                        state.halfOpenProbeInFlight = false;
+                        state.consecutiveFailures = 0;
+                        state.openUntil = now + kCircuitOpenCooldown;
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                void circuitBreakerReleaseHalfOpenProbe(const std::string& cameraId)
+                {
+                    const auto now = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> lk(g_circuitMutex);
+                    auto it = g_circuitByCamera.find(cameraId);
+                    if (it == g_circuitByCamera.end())
+                        return;
+
+                    it->second.lastSeen = now;
+                    if (it->second.state == CircuitState::halfOpen)
+                        it->second.halfOpenProbeInFlight = false;
+                }
+
                 DetectionList callPythonService(const Frame& frame)
                 {
                     DetectionList result;
@@ -669,9 +844,36 @@ namespace sample_company {
                 const std::vector<uint8_t>& jpegBytes)
             {
                 DetectionList result;
+                const std::string normalizedCameraId = normalizeCameraKey(cameraId);
 
                 try
                 {
+                    std::string breakerReason;
+                    bool halfOpenTransition = false;
+                    if (!circuitBreakerAllowRequest(
+                            normalizedCameraId,
+                            &breakerReason,
+                            &halfOpenTransition))
+                    {
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "object_detector.flow2.circuit_open." + normalizedCameraId,
+                            std::chrono::seconds(30),
+                            "Circuit breaker OPEN for camera \"" + normalizedCameraId +
+                                "\", fail-fast: " + breakerReason);
+                        throw ObjectDetectionError(
+                            "Circuit breaker open for camera \"" + normalizedCameraId + "\"");
+                    }
+
+                    if (halfOpenTransition)
+                    {
+                        logutil::logThrottled(
+                            logutil::Level::info,
+                            "object_detector.flow2.circuit_half_open." + normalizedCameraId,
+                            std::chrono::seconds(10),
+                            "Circuit breaker HALF_OPEN probe for camera \"" + normalizedCameraId + "\"");
+                    }
+
                     std::string b64 = base64Encode(jpegBytes.data(), jpegBytes.size());
                     if (b64.empty())
                         throw ObjectDetectionError("Failed to base64 encode JPEG bytes");
@@ -683,10 +885,10 @@ namespace sample_company {
                     const int frameW = decodedJpeg.cols;
                     const int frameH = decodedJpeg.rows;
                     const uint64_t dumpSeq = nextFrameDumpSeq();
-                    dumpInputFrame(cameraId, dumpSeq, decodedJpeg);
+                    dumpInputFrame(normalizedCameraId, dumpSeq, decodedJpeg);
 
                     json req;
-                    req["camera_id"] = cameraId;
+                    req["camera_id"] = normalizedCameraId;
                     req["image"] = b64;
                     const std::string jsonBody = req.dump();
 
@@ -706,31 +908,84 @@ namespace sample_company {
                             "FLOW2 infer requests processed=" + std::to_string(s_reqCount));
                     }
                     
-                    // POST /infer endpoint
-                    auto res = cli.Post("/infer", jsonBody, "application/json");
-                    if (!res)
+                    std::string responseBody;
+                    bool requestSucceeded = false;
+                    std::string lastTransientError;
+                    constexpr int kMaxAttempts = static_cast<int>(kTransientRetryBackoffMs.size()) + 1;
+                    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt)
                     {
-                        logutil::logThrottled(
-                            logutil::Level::warn,
-                            "object_detector.flow2.no_response",
-                            std::chrono::seconds(30),
-                            "FLOW2 /infer failed: no response from 127.0.0.1:18000");
-                        throw ObjectDetectionError("No response from /infer endpoint");
+                        auto res = cli.Post("/infer", jsonBody, "application/json");
+                        if (res && res->status == 200)
+                        {
+                            responseBody = res->body;
+                            requestSucceeded = true;
+                            const bool recovered = circuitBreakerOnSuccess(normalizedCameraId);
+                            if (recovered)
+                            {
+                                logutil::log(
+                                    logutil::Level::info,
+                                    "Circuit breaker CLOSED (recovered) for camera \"" +
+                                        normalizedCameraId + "\"");
+                            }
+                            break;
+                        }
+
+                        bool transient = false;
+                        std::string err;
+                        if (!res)
+                        {
+                            transient = true;
+                            err = "no response from /infer endpoint";
+                        }
+                        else if (isTransientHttpStatus(res->status))
+                        {
+                            transient = true;
+                            err = "transient HTTP status=" + std::to_string(res->status);
+                        }
+                        else
+                        {
+                            circuitBreakerOnTransientFailure(normalizedCameraId);
+                            throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
+                        }
+
+                        lastTransientError = err;
+                        if (attempt < kMaxAttempts)
+                        {
+                            logutil::logThrottled(
+                                logutil::Level::warn,
+                                "object_detector.flow2.retry." + normalizedCameraId,
+                                std::chrono::seconds(10),
+                                "Transient infer error for camera \"" + normalizedCameraId +
+                                    "\" attempt " + std::to_string(attempt) + "/" +
+                                    std::to_string(kMaxAttempts) + ": " + err);
+
+                            const int backoffMs = kTransientRetryBackoffMs[attempt - 1];
+                            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+                            continue;
+                        }
+
+                        const bool opened = circuitBreakerOnTransientFailure(normalizedCameraId);
+                        if (opened)
+                        {
+                            logutil::logThrottled(
+                                logutil::Level::warn,
+                                "object_detector.flow2.circuit_open.transition." + normalizedCameraId,
+                                std::chrono::seconds(10),
+                                "Circuit breaker OPEN for camera \"" + normalizedCameraId +
+                                    "\" after repeated transient infer failures");
+                        }
                     }
-                    if (res->status != 200)
+
+                    if (!requestSucceeded)
                     {
-                        logutil::logThrottled(
-                            logutil::Level::warn,
-                            "object_detector.flow2.http_status",
-                            std::chrono::seconds(30),
-                            "FLOW2 /infer HTTP status=" + std::to_string(res->status));
-                        throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
+                        throw ObjectDetectionError(
+                            "Transient infer failure after retries: " + lastTransientError);
                     }
 
                     json j;
                     try
                     {
-                        j = json::parse(res->body);
+                        j = json::parse(responseBody);
                     }
                     catch (const std::exception& e)
                     {
@@ -783,7 +1038,7 @@ namespace sample_company {
                             }
 
                             const int trackId = item.value("track_id", 0);
-                            nx::sdk::Uuid trackUuid = uuidFromTrackId(cameraId, trackId);
+                            nx::sdk::Uuid trackUuid = uuidFromTrackId(normalizedCameraId, trackId);
 
                             auto detection = std::make_shared<Detection>(Detection{
                                 nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
@@ -816,10 +1071,12 @@ namespace sample_company {
                 }
                 catch (const ObjectDetectionError&)
                 {
+                    circuitBreakerReleaseHalfOpenProbe(normalizedCameraId);
                     throw;
                 }
                 catch (const std::exception& e)
                 {
+                    circuitBreakerReleaseHalfOpenProbe(normalizedCameraId);
                     throw ObjectDetectionError(std::string("callPythonServiceMultipart error: ") + e.what());
                 }
             }

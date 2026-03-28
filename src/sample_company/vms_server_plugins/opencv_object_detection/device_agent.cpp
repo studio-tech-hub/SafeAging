@@ -641,10 +641,23 @@ namespace sample_company
                 }
                 catch (const ObjectDetectionError &e)
                 {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::error,
-                        "AI service call failed - will retry next frame",
-                        e.what());
+                    logutil::logThrottled(
+                        logutil::Level::warn,
+                        "device_agent.ai_service_error." + m_cameraName,
+                        std::chrono::seconds(kAiServiceErrorDiagThrottleSec),
+                        std::string("AI service call failed: ") + e.what());
+
+                    const auto now = std::chrono::steady_clock::now();
+                    if (m_lastAiServiceErrorDiagTime == std::chrono::steady_clock::time_point::min() ||
+                        now - m_lastAiServiceErrorDiagTime >=
+                            std::chrono::seconds(kAiServiceErrorDiagThrottleSec))
+                    {
+                        pushPluginDiagnosticEvent(
+                            nx::sdk::IPluginDiagnosticEvent::Level::warning,
+                            "AI service call failed - throttled",
+                            e.what());
+                        m_lastAiServiceErrorDiagTime = now;
+                    }
                 }
                 catch (const std::exception &e)
                 {
