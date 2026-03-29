@@ -86,6 +86,7 @@ MAX_QUEUE_SIZE = 2
 
 # AI Service endpoint (existing /infer)
 AI_SERVICE_URL = "http://127.0.0.1:18000/infer"
+AI_API_KEY = os.getenv("AI_API_KEY", os.getenv("API_KEY", "")).strip()
 
 # Frame preprocessing
 FRAME_DOWNSCALE_WIDTH = 640  # Resize to 640px width for faster inference
@@ -188,6 +189,7 @@ class RTSPIngestService:
         camera_id: str,
         target_fps: int = 5,
         ai_service_url: str = AI_SERVICE_URL,
+        ai_api_key: str = AI_API_KEY,
         enable_preview: bool = False,
         save_frames: bool = False,
     ):
@@ -197,6 +199,7 @@ class RTSPIngestService:
         self.target_fps = target_fps
         self.frame_interval_ms = 1000 / target_fps  # Milliseconds between frames
         self.ai_service_url = ai_service_url
+        self.ai_api_key = ai_api_key.strip()
         self.enable_preview = enable_preview
         self.save_frames = save_frames
         
@@ -401,9 +404,13 @@ class RTSPIngestService:
             }
             
             # POST to /infer
+            headers = {}
+            if self.ai_api_key:
+                headers["X-API-Key"] = self.ai_api_key
             response = requests.post(
                 self.ai_service_url,
                 json=payload,
+                headers=headers,
                 timeout=5.0,  # 5 second timeout
             )
             
@@ -724,6 +731,7 @@ Examples:
     parser.add_argument('--camera-id', default=CAMERA_ID, help=f'Camera ID (default: {CAMERA_ID})')
     parser.add_argument('--fps', type=int, default=TARGET_FPS, help=f'Target FPS (default: {TARGET_FPS})')
     parser.add_argument('--ai-service', default=AI_SERVICE_URL, help=f'AI service URL (default: {AI_SERVICE_URL})')
+    parser.add_argument('--ai-api-key', default=AI_API_KEY, help='API key for AI service')
     parser.add_argument('--preview', action='store_true', help='Enable live preview')
     parser.add_argument('--save-frames', action='store_true', help='Save frames to disk')
     
@@ -737,6 +745,7 @@ Examples:
         camera_id=args.camera_id,
         target_fps=args.fps,
         ai_service_url=args.ai_service,
+        ai_api_key=args.ai_api_key,
         enable_preview=args.preview,
         save_frames=args.save_frames,
     )

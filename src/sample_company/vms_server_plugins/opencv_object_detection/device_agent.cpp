@@ -4,10 +4,12 @@
 
 #include "device_agent.h"
 #include <set>
-#include <iostream>
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <cctype>
+#include <type_traits>
+#include <utility>
 
 #include <opencv2/core.hpp>
 #include <opencv2/dnn/dnn.hpp>
@@ -26,6 +28,7 @@
 #include "detection.h"
 #include "exceptions.h"
 #include "frame.h"
+#include "logging_utils.h"
 
 namespace sample_company
 {
@@ -38,6 +41,82 @@ namespace sample_company
             using namespace nx::sdk::analytics;
             using namespace std::string_literals;
 
+            namespace {
+
+                template<typename T, typename = void>
+                struct HasNameMethod: std::false_type {};
+
+                template<typename T>
+                struct HasNameMethod<T, std::void_t<decltype(std::declval<const T*>()->name())>>:
+                    std::true_type {};
+
+                template<typename T, typename = void>
+                struct HasIdMethod: std::false_type {};
+
+                template<typename T>
+                struct HasIdMethod<T, std::void_t<decltype(std::declval<const T*>()->id())>>:
+                    std::true_type {};
+
+                std::string resolveCameraName(const nx::sdk::IDeviceInfo* deviceInfo)
+                {
+                    if (!deviceInfo)
+                        return "unknown_camera";
+
+                    std::string name;
+
+                    if constexpr (HasNameMethod<nx::sdk::IDeviceInfo>::value)
+                    {
+                        const char* raw = deviceInfo->name();
+                        if (raw && *raw)
+                            name = raw;
+                    }
+
+                    if constexpr (HasIdMethod<nx::sdk::IDeviceInfo>::value)
+                    {
+                        if (name.empty())
+                        {
+                            const char* raw = deviceInfo->id();
+                            if (raw && *raw)
+                                name = raw;
+                        }
+                    }
+
+                    return name.empty() ? "unknown_camera" : name;
+                }
+
+                int parseIntSettingValue(
+                    const std::string& raw,
+                    int defaultValue,
+                    int minValue,
+                    int maxValue)
+                {
+                    if (raw.empty())
+                        return defaultValue;
+
+                    try
+                    {
+                        int value = std::stoi(raw);
+                        if (value < minValue)
+                            value = minValue;
+                        if (value > maxValue)
+                            value = maxValue;
+                        return value;
+                    }
+                    catch (...)
+                    {
+                        return defaultValue;
+                    }
+                }
+
+                void updateMaxDepth(std::atomic<size_t>& currentMax, size_t depth)
+                {
+                    size_t observed = currentMax.load();
+                    while (depth > observed && !currentMax.compare_exchange_weak(observed, depth))
+                    {
+                    }
+                }
+            } // namespace
+
             DeviceAgent::DeviceAgent(
                 const nx::sdk::IDeviceInfo *deviceInfo,
                 std::filesystem::path pluginHomeDir,
@@ -45,11 +124,15 @@ namespace sample_company
                 : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
                   m_pluginHomeDir(std::move(pluginHomeDir)),
                   m_modelPath(std::move(modelPath)),
+                  m_cameraName(resolveCameraName(deviceInfo)),
                   m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
                   m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
                   m_workerShouldStop(false)
             {
+                logutil::log(
+                    logutil::Level::info,
+                    "DeviceAgent camera_name=\"" + m_cameraName + "\"");
             }
 
             DeviceAgent::~DeviceAgent()
@@ -107,32 +190,14 @@ namespace sample_company
 )json";
             }
 
-            bool DeviceAgent::pushUncompressedVideoFrame(const IUncompressedVideoFrame *videoFrame)
+            bool DeviceAgent::pushUncompressedVideoFrame(const IUncompressedVideoFrame* videoFrame)
             {
                 if (!videoFrame)
                     return false;
 
-                if (m_frameIndex % 200 == 0)
-                {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
-                }
+                ++m_inFrameCount;
+                const auto now = std::chrono::steady_clock::now();
 
-                if (m_frameIndex % 200 == 0)
-                {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::info,
-                        "Frame arrived",
-                        ("frame#" + std::to_string(m_frameIndex) +
-                         " w=" + std::to_string(videoFrame->width()) +
-                         " h=" + std::to_string(videoFrame->height()))
-                            .c_str());
-                }
-
-                // Nếu detector đã bị terminate cứng (hiếm), chỉ báo 1 lần rồi bỏ qua frame.
                 m_terminated = m_terminated || m_objectDetector->isTerminated();
                 if (m_terminated)
                 {
@@ -147,54 +212,88 @@ namespace sample_company
                     return true;
                 }
 
-                // ============================================================
-                // FLOW 2: Frame callback MUST NOT process frames here.
-                //         Instead, enqueue frame for async worker thread.
-                //         This callback returns immediately (NON-BLOCKING).
-                // ============================================================
+                const int detectionFramePeriod = std::max(
+                    1, m_detectionFramePeriod.load(std::memory_order_relaxed));
+                const int targetEnqueueFps = std::max(
+                    1, m_targetEnqueueFps.load(std::memory_order_relaxed));
+                const size_t frameQueueMaxSize = std::max<size_t>(
+                    1, m_frameQueueMaxSize.load(std::memory_order_relaxed));
 
-                // 🔻 Process detection frames regularly:
-                const int kPeriod = kDetectionFramePeriod;
-                if (m_frameIndex % kPeriod == 0)
+                bool shouldEnqueue = (m_frameIndex % detectionFramePeriod == 0);
+                if (shouldEnqueue && targetEnqueueFps > 0)
                 {
+                    const auto minIntervalMs = std::chrono::milliseconds(1000 / targetEnqueueFps);
+                    if (m_lastEnqueueTime != std::chrono::steady_clock::time_point::min() &&
+                        now - m_lastEnqueueTime < minIntervalMs)
+                    {
+                        shouldEnqueue = false;
+                    }
+                }
+
+                if (shouldEnqueue)
+                {
+                    m_lastEnqueueTime = now;
                     try
                     {
-                        // Convert Nx frame to OpenCV Mat for encoding
                         Frame frame(videoFrame, m_frameIndex);
-
-                        // Encode frame to JPEG with downscale to ~720p width for faster, more stable detection.
-                        // 2560x1440 -> 1280x720 (keeps aspect ratio, no crop).
                         std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
 
-                        // Create frame job
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
-                        job.cameraId = "nx_camera"; // TODO: Get from device info
+                        job.cameraId = m_cameraName;
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 
-                        // ⚠️ BACKPRESSURE: bounded queue (size 3)
-                        // If queue is full, drop oldest frame and add newest
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
-                            if (m_frameQueue.size() >= kFrameQueueMaxSize)
+                            if (m_frameQueue.size() >= frameQueueMaxSize)
                             {
-                                // Drop oldest (front) frame to make room
                                 m_frameQueue.pop_front();
-                                if (m_frameIndex % 20 == 0)
+                                ++m_droppedFrameCount;
+                                ++m_droppedSinceLastQueueWarning;
+
+                                const auto warnNow = std::chrono::steady_clock::now();
+                                if (m_lastQueueWarningTime == std::chrono::steady_clock::time_point::min() ||
+                                    warnNow - m_lastQueueWarningTime >=
+                                        std::chrono::seconds(kQueueWarningThrottleSec))
                                 {
+                                    const std::string details =
+                                        "Worker thread may be slow; dropped " +
+                                        std::to_string(m_droppedSinceLastQueueWarning) +
+                                        " frames in last interval. queue_max=" +
+                                        std::to_string(frameQueueMaxSize) +
+                                        ", target_fps=" + std::to_string(targetEnqueueFps);
                                     pushPluginDiagnosticEvent(
                                         nx::sdk::IPluginDiagnosticEvent::Level::warning,
                                         "Frame queue full - dropping old frames",
-                                        "Worker thread may be slow; increase queue or reduce FPS");
+                                        details.c_str());
+
+                                    logutil::log(
+                                        logutil::Level::warn,
+                                        "Backpressure: queue full, dropped " +
+                                            std::to_string(m_droppedSinceLastQueueWarning) +
+                                            " frames in last interval");
+
+                                    m_droppedSinceLastQueueWarning = 0;
+                                    m_lastQueueWarningTime = warnNow;
                                 }
                             }
+
                             m_frameQueue.push_back(std::move(job));
+                            updateMaxDepth(m_maxQueueDepth, m_frameQueue.size());
                         }
-                        m_frameQueueCV.notify_one(); // Wake up worker thread
+
+                        ++m_enqueuedFrameCount;
+                        m_frameQueueCV.notify_one();
                     }
-                    catch (const std::exception &e)
+                    catch (const std::exception& e)
                     {
+                        ++m_encodingErrorCount;
+                        logutil::logThrottled(
+                            logutil::Level::error,
+                            "device_agent.frame_encode_error",
+                            std::chrono::seconds(10),
+                            std::string("Frame encoding error: ") + e.what());
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::error,
                             "Frame encoding error",
@@ -202,8 +301,69 @@ namespace sample_company
                     }
                 }
 
+                const int metricsLogPeriodSec = std::max(
+                    1, m_metricsLogPeriodSec.load(std::memory_order_relaxed));
+                if (now - m_lastMetricsLogTime >= std::chrono::seconds(metricsLogPeriodSec))
+                {
+                    const uint64_t inCount = m_inFrameCount.load();
+                    const uint64_t processedCount = m_processedFrameCount.load();
+                    const uint64_t droppedCount = m_droppedFrameCount.load();
+                    const uint64_t inferMs = m_totalInferMs.load();
+                    const size_t maxDepth = m_maxQueueDepth.load();
+
+                    const uint64_t deltaIn = inCount - m_lastMetricsInCount;
+                    const uint64_t deltaProcessed = processedCount - m_lastMetricsProcessedCount;
+                    const uint64_t deltaDropped = droppedCount - m_lastMetricsDroppedCount;
+                    const uint64_t deltaInferMs = inferMs - m_lastMetricsInferMs;
+
+                    const double periodSec =
+                        std::chrono::duration<double>(now - m_lastMetricsLogTime).count();
+                    const double inFps = (periodSec > 0.0) ? (deltaIn / periodSec) : 0.0;
+                    const double procFps = (periodSec > 0.0) ? (deltaProcessed / periodSec) : 0.0;
+                    const double avgInferMs =
+                        (deltaProcessed > 0) ? (static_cast<double>(deltaInferMs) / deltaProcessed) : 0.0;
+
+                    size_t queueLen = 0;
+                    {
+                        std::unique_lock<std::mutex> lk(m_frameQueueMutex);
+                        queueLen = m_frameQueue.size();
+                    }
+
+                    logutil::log(
+                        logutil::Level::info,
+                        "Pipeline metrics: in_fps=" + std::to_string(inFps) +
+                            ", proc_fps=" + std::to_string(procFps) +
+                            ", drop=" + std::to_string(deltaDropped) +
+                            ", queue=" + std::to_string(queueLen) +
+                            ", max_depth=" + std::to_string(maxDepth) +
+                            ", avg_infer_ms=" + std::to_string(avgInferMs));
+
+                    if (m_lastMetricsDiagTime == std::chrono::steady_clock::time_point::min() ||
+                        now - m_lastMetricsDiagTime >= std::chrono::seconds(kMetricsDiagThrottleSec))
+                    {
+                        const std::string diag =
+                            "in_fps=" + std::to_string(inFps) +
+                            ", proc_fps=" + std::to_string(procFps) +
+                            ", dropped=" + std::to_string(deltaDropped) +
+                            ", queue=" + std::to_string(queueLen) +
+                            ", max_depth=" + std::to_string(maxDepth) +
+                            ", avg_infer_ms=" + std::to_string(avgInferMs);
+                        pushPluginDiagnosticEvent(
+                            nx::sdk::IPluginDiagnosticEvent::Level::info,
+                            "Pipeline metrics",
+                            diag.c_str());
+                        m_lastMetricsDiagTime = now;
+                    }
+
+                    m_lastMetricsInCount = inCount;
+                    m_lastMetricsProcessedCount = processedCount;
+                    m_lastMetricsDroppedCount = droppedCount;
+                    m_lastMetricsInferMs = inferMs;
+                    m_lastMetricsLogTime = now;
+                }
+
                 ++m_frameIndex;
-                return true; // ✓ Frame callback returns immediately
+                return true;
             }
 
             bool DeviceAgent::pullMetadataPackets(
@@ -216,6 +376,48 @@ namespace sample_company
                     m_metadataQueue.pop_front();
                 }
                 return true;
+            }
+
+            nx::sdk::Result<const nx::sdk::ISettingsResponse*> DeviceAgent::settingsReceived()
+            {
+                const int detectionPeriod = parseIntSettingValue(
+                    settingValue("detection_frame_period"),
+                    kDefaultDetectionFramePeriod,
+                    1,
+                    60);
+                const int enqueueFps = parseIntSettingValue(
+                    settingValue("target_enqueue_fps"),
+                    kDefaultTargetEnqueueFps,
+                    1,
+                    60);
+                const int queueMax = parseIntSettingValue(
+                    settingValue("frame_queue_max_size"),
+                    static_cast<int>(kDefaultFrameQueueMaxSize),
+                    1,
+                    100);
+                const int metricsPeriod = parseIntSettingValue(
+                    settingValue("metrics_log_period_sec"),
+                    kDefaultMetricsLogPeriodSec,
+                    1,
+                    300);
+
+                m_detectionFramePeriod.store(detectionPeriod, std::memory_order_relaxed);
+                m_targetEnqueueFps.store(enqueueFps, std::memory_order_relaxed);
+                m_frameQueueMaxSize.store(static_cast<size_t>(queueMax), std::memory_order_relaxed);
+                m_metricsLogPeriodSec.store(metricsPeriod, std::memory_order_relaxed);
+
+                logutil::log(
+                    logutil::Level::info,
+                    "Applied settings: detection_frame_period=" +
+                        std::to_string(m_detectionFramePeriod.load(std::memory_order_relaxed)) +
+                        ", target_enqueue_fps=" +
+                        std::to_string(m_targetEnqueueFps.load(std::memory_order_relaxed)) +
+                        ", frame_queue_max_size=" +
+                        std::to_string(m_frameQueueMaxSize.load(std::memory_order_relaxed)) +
+                        ", metrics_log_period_sec=" +
+                        std::to_string(m_metricsLogPeriodSec.load(std::memory_order_relaxed)));
+
+                return nullptr;
             }
 
             void DeviceAgent::doSetNeededMetadataTypes(
@@ -271,6 +473,8 @@ namespace sample_company
                             continue; // Spurious wakeup, wait again
 
                         // Dequeue NEWEST frame (drop old ones if multiple in queue)
+                        if (m_frameQueue.size() > 1)
+                            m_droppedFrameCount.fetch_add(m_frameQueue.size() - 1);
                         job = std::move(m_frameQueue.back());
                         m_frameQueue.clear(); // Drop all other frames
                     }
@@ -278,7 +482,12 @@ namespace sample_company
                     // Process frame job (WITHOUT holding lock)
                     try
                     {
+                        const auto started = std::chrono::steady_clock::now();
                         MetadataPacketList metadataPackets = processFrameJob(job);
+                        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started).count();
+                        ++m_processedFrameCount;
+                        m_totalInferMs.fetch_add(static_cast<uint64_t>(elapsedMs));
 
                         // Enqueue metadata packets for Nx to pull
                         {
@@ -291,6 +500,12 @@ namespace sample_company
                     }
                     catch (const std::exception &e)
                     {
+                        ++m_processingErrorCount;
+                        logutil::logThrottled(
+                            logutil::Level::error,
+                            "device_agent.worker.process_error",
+                            std::chrono::seconds(10),
+                            std::string("Worker processing error: ") + e.what());
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::error,
                             "Worker thread: frame processing error",
@@ -426,10 +641,23 @@ namespace sample_company
                 }
                 catch (const ObjectDetectionError &e)
                 {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::error,
-                        "AI service call failed - will retry next frame",
-                        e.what());
+                    logutil::logThrottled(
+                        logutil::Level::warn,
+                        "device_agent.ai_service_error." + m_cameraName,
+                        std::chrono::seconds(kAiServiceErrorDiagThrottleSec),
+                        std::string("AI service call failed: ") + e.what());
+
+                    const auto now = std::chrono::steady_clock::now();
+                    if (m_lastAiServiceErrorDiagTime == std::chrono::steady_clock::time_point::min() ||
+                        now - m_lastAiServiceErrorDiagTime >=
+                            std::chrono::seconds(kAiServiceErrorDiagThrottleSec))
+                    {
+                        pushPluginDiagnosticEvent(
+                            nx::sdk::IPluginDiagnosticEvent::Level::warning,
+                            "AI service call failed - throttled",
+                            e.what());
+                        m_lastAiServiceErrorDiagTime = now;
+                    }
                 }
                 catch (const std::exception &e)
                 {
@@ -520,7 +748,7 @@ namespace sample_company
 
                 const auto objectMetadataPacket = makePtr<ObjectMetadataPacket>();
 
-                // --- PASS 1: đếm số person trong frame, gom trackId ---
+                // PASS 1: count persons in this frame.
                 m_currentPersons = 0;
                 std::set<nx::sdk::Uuid> framePersonIds;
 
@@ -533,11 +761,10 @@ namespace sample_company
                     }
                 }
 
-                // Cập nhật tập trackId đã từng xuất hiện (đếm không trùng)
+                // Keep unique-person tracking state for future analytics extensions.
                 m_seenPersonIds.insert(framePersonIds.begin(), framePersonIds.end());
-                const int totalUniquePersons = static_cast<int>(m_seenPersonIds.size());
 
-                // --- PASS 2: tạo ObjectMetadata + gắn attribute + caption ---
+                // PASS 2: build ObjectMetadata and bbox attributes.
                 for (const std::shared_ptr<Detection> &detection : detections)
                 {
                     auto objectMetadata = makePtr<ObjectMetadata>();
@@ -549,24 +776,14 @@ namespace sample_company
                     if (detection->classLabel == "person")
                     {
                         objectMetadata->setTypeId(kPersonObjectType);
-
-                        // 1) id từng người (trackId)
-                        objectMetadata->addAttribute(makePtr<Attribute>(
-                            IAttribute::Type::string,
-                            "yolov8_person_id",
-                            nx::sdk::UuidHelper::toStdString(detection->trackId)));
-
-                        // 2) số người đang có trong frame hiện tại
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::number,
-                            "yolov8_person_count_frame",
+                            "Count Detect",
                             std::to_string(m_currentPersons)));
-
-                        // 3) tổng số người khác nhau đã đi qua (đếm không trùng)
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::number,
-                            "yolov8_person_count_unique",
-                            std::to_string(totalUniquePersons)));
+                            "Fall Detect",
+                            "0"));
                     }
                     else if (detection->classLabel == "cat")
                     {
@@ -583,7 +800,6 @@ namespace sample_company
                 objectMetadataPacket->setTimestampUs(timestampUs);
                 return objectMetadataPacket;
             }
-
             void DeviceAgent::reinitializeObjectTrackerOnFrameSizeChanges(const Frame &frame)
             {
                 const bool frameSizeUnset = m_previousFrameWidth == 0 && m_previousFrameHeight == 0;
@@ -611,11 +827,12 @@ namespace sample_company
             {
                 if (m_frameIndex % 200 == 0)
                 {
-                    std::cerr << "[DBG] pixelFormat=" << (int)videoFrame->pixelFormat()
-                              << " w=" << videoFrame->width()
-                              << " h=" << videoFrame->height()
-                              << " lineSize0=" << videoFrame->lineSize(0)
-                              << std::endl;
+                    logutil::log(
+                        logutil::Level::debug,
+                        "processFrame pixelFormat=" + std::to_string((int)videoFrame->pixelFormat()) +
+                            " w=" + std::to_string(videoFrame->width()) +
+                            " h=" + std::to_string(videoFrame->height()) +
+                            " lineSize0=" + std::to_string(videoFrame->lineSize(0)));
                 }
 
                 try
@@ -624,16 +841,15 @@ namespace sample_company
                     Frame frame(videoFrame, m_frameIndex);
                     reinitializeObjectTrackerOnFrameSizeChanges(frame);
 
-                    if (m_frameIndex % 200 == 0)
-                    {
-                        pushPluginDiagnosticEvent(
-                            nx::sdk::IPluginDiagnosticEvent::Level::info,
-                            "Calling detector",
-                            "About to call Python /infer endpoint");
-                    }
+                    logutil::logThrottled(
+                        logutil::Level::debug,
+                        "device_agent.process_frame.call_detector",
+                        std::chrono::seconds(10),
+                        "Calling detector from legacy processFrame path");
 
                     // 1) Gọi Python service -> lấy detections đã có track_id
-                    DetectionList detections = m_objectDetector->run(frame);
+                    std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
+                    DetectionList detections = m_objectDetector->run(m_cameraName, jpegBytes);
 
                     // 2) Dùng trực tiếp detections từ Python để tạo ObjectMetadata
                     const auto &objectMetadataPacket =
@@ -700,3 +916,6 @@ namespace sample_company
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins
 } // namespace sample_company
+
+
+

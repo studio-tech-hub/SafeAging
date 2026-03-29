@@ -128,3 +128,6 @@ frame_samples/*.avi
 frame_samples/*.mp4
 Fall-Detection-and-Human-Activity-Recognition/
 .env
+
+debug_frames/*
+ram_log.csv
