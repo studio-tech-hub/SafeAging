@@ -1,15 +1,19 @@
-import base64
+﻿import base64
+import hmac
 import json
 import time
 import logging
 import os
+import threading
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ultralytics import YOLO
 import torch
@@ -149,6 +153,16 @@ class AppConfig:
         )
         self.track_output_hold_time = max(0.0, _env_float("TRACK_OUTPUT_HOLD_TIME", 0.8))
         self.enable_history_rematch = _env_bool("ENABLE_HISTORY_REMATCH", False)
+        self.max_match_age = max(0.0, _env_float("MAX_MATCH_AGE", 0.8))
+        self.track_min_hits = max(1, _env_int("TRACK_MIN_HITS", 2))
+        self.track_max_misses = max(1, _env_int("TRACK_MAX_MISSES", 6))
+        self.tentative_max_misses = max(0, _env_int("TENTATIVE_MAX_MISSES", 1))
+        self.track_match_min_score = _clamp(
+            _env_float("TRACK_MATCH_MIN_SCORE", 0.25), 0.0, 1.0, "TRACK_MATCH_MIN_SCORE"
+        )
+        self.output_tentative_tracks = _env_bool("OUTPUT_TENTATIVE_TRACKS", False)
+        self.output_dedupe_iou = _clamp(_env_float("OUTPUT_DEDUPE_IOU", 0.55), 0.0, 1.0, "OUTPUT_DEDUPE_IOU")
+        self.hold_suppress_iou = _clamp(_env_float("HOLD_SUPPRESS_IOU", 0.4), 0.0, 1.0, "HOLD_SUPPRESS_IOU")
 
         self.enable_fall_detection = _env_bool("ENABLE_FALL_DETECTION", True)
         self.fall_velocity_threshold = max(0.0, _env_float("FALL_VELOCITY_THRESHOLD", 20.0))
@@ -194,6 +208,27 @@ class AppConfig:
             self.use_half = False
         self.torch_cudnn_benchmark = _env_bool("TORCH_CUDNN_BENCHMARK", True)
 
+        # Security controls (MVP)
+        self.api_key_required = _env_bool("API_KEY_REQUIRED", True)
+        self.api_key = os.getenv("API_KEY", "").strip()
+        if self.api_key_required and not self.api_key:
+            logger.warning("API_KEY_REQUIRED=true but API_KEY is empty. Authentication is disabled until API_KEY is set.")
+            self.api_key_required = False
+
+        self.require_https = _env_bool("REQUIRE_HTTPS", False)
+        self.tls_cert_file = os.getenv("TLS_CERT_FILE", "").strip()
+        self.tls_key_file = os.getenv("TLS_KEY_FILE", "").strip()
+        if bool(self.tls_cert_file) != bool(self.tls_key_file):
+            logger.warning("TLS_CERT_FILE and TLS_KEY_FILE must be set together. Direct TLS will be disabled.")
+            self.tls_cert_file = ""
+            self.tls_key_file = ""
+        self.rate_limit_enabled = _env_bool("RATE_LIMIT_ENABLED", True)
+        self.rate_limit_window_seconds = max(1, _env_int("RATE_LIMIT_WINDOW_SECONDS", 60))
+        self.rate_limit_max_per_ip = max(1, _env_int("RATE_LIMIT_MAX_PER_IP", 120))
+        self.rate_limit_max_per_camera = max(1, _env_int("RATE_LIMIT_MAX_PER_CAMERA", 60))
+        cors_raw = os.getenv("CORS_ALLOW_ORIGINS", "")
+        self.cors_allow_origins = [v.strip() for v in cors_raw.split(",") if v.strip()]
+
 
 _load_local_env()
 CONFIG = AppConfig()
@@ -217,6 +252,14 @@ NEW_TRACK_MIN_CONFIDENCE = CONFIG.new_track_min_confidence
 TRACK_DUPLICATE_IOU = CONFIG.track_duplicate_iou
 TRACK_OUTPUT_HOLD_TIME = CONFIG.track_output_hold_time
 ENABLE_HISTORY_REMATCH = CONFIG.enable_history_rematch
+MAX_MATCH_AGE = CONFIG.max_match_age
+TRACK_MIN_HITS = CONFIG.track_min_hits
+TRACK_MAX_MISSES = CONFIG.track_max_misses
+TENTATIVE_MAX_MISSES = CONFIG.tentative_max_misses
+TRACK_MATCH_MIN_SCORE = CONFIG.track_match_min_score
+OUTPUT_TENTATIVE_TRACKS = CONFIG.output_tentative_tracks
+OUTPUT_DEDUPE_IOU = CONFIG.output_dedupe_iou
+HOLD_SUPPRESS_IOU = CONFIG.hold_suppress_iou
 ENABLE_FALL_DETECTION = CONFIG.enable_fall_detection
 FALL_VELOCITY_THRESHOLD = CONFIG.fall_velocity_threshold
 FALL_ANGLE_CHANGE_THRESHOLD = CONFIG.fall_angle_change_threshold
@@ -243,6 +286,16 @@ YOLO_IMGSZ = CONFIG.yolo_imgsz
 DEVICE = CONFIG.device
 USE_HALF = CONFIG.use_half
 TORCH_CUDNN_BENCHMARK = CONFIG.torch_cudnn_benchmark
+API_KEY_REQUIRED = CONFIG.api_key_required
+API_KEY = CONFIG.api_key
+REQUIRE_HTTPS = CONFIG.require_https
+TLS_CERT_FILE = CONFIG.tls_cert_file
+TLS_KEY_FILE = CONFIG.tls_key_file
+RATE_LIMIT_ENABLED = CONFIG.rate_limit_enabled
+RATE_LIMIT_WINDOW_SECONDS = CONFIG.rate_limit_window_seconds
+RATE_LIMIT_MAX_PER_IP = CONFIG.rate_limit_max_per_ip
+RATE_LIMIT_MAX_PER_CAMERA = CONFIG.rate_limit_max_per_camera
+CORS_ALLOW_ORIGINS = CONFIG.cors_allow_origins
 
 if DEVICE.startswith("cuda"):
     try:
@@ -274,13 +327,18 @@ logger.info(f"="*60)
 logger.info(
     f"Tracking: post_nms={ENABLE_POST_NMS} iou={POST_NMS_IOU} "
     f"match_iou={MATCH_IOU_THRESHOLD} dup_iou={TRACK_DUPLICATE_IOU} "
-    f"hold={TRACK_OUTPUT_HOLD_TIME}s history_rematch={ENABLE_HISTORY_REMATCH}"
+    f"hold={TRACK_OUTPUT_HOLD_TIME}s match_age={MAX_MATCH_AGE}s "
+    f"min_hits={TRACK_MIN_HITS} max_misses={TRACK_MAX_MISSES} "
+    f"tentative_misses={TENTATIVE_MAX_MISSES} min_match_score={TRACK_MATCH_MIN_SCORE} "
+    f"out_tentative={OUTPUT_TENTATIVE_TRACKS} "
+    f"out_dedupe_iou={OUTPUT_DEDUPE_IOU} hold_suppress_iou={HOLD_SUPPRESS_IOU} "
+    f"history_rematch={ENABLE_HISTORY_REMATCH}"
 )
 logger.info(f"="*60)
 logger.info(f"Fall Detection: {ENABLE_FALL_DETECTION}")
 if ENABLE_FALL_DETECTION:
     logger.info(f"  Velocity Threshold: {FALL_VELOCITY_THRESHOLD}px/frame")
-    logger.info(f"  Angle Change Threshold: {FALL_ANGLE_CHANGE_THRESHOLD}°")
+    logger.info(f"  Angle Change Threshold: {FALL_ANGLE_CHANGE_THRESHOLD}Â°")
     logger.info(f"  Aspect Ratio Threshold: {FALL_ASPECT_RATIO_THRESHOLD}")
     logger.info(f"  Confidence Threshold: {FALL_CONFIDENCE_THRESHOLD}")
 logger.info(f"="*60)
@@ -317,17 +375,25 @@ def load_model():
                 model.to(DEVICE)
             except Exception as e:
                 logger.warning(f"Failed to move model to {DEVICE}: {e}")
-            logger.info(f"✅ YOLO model loaded successfully")
+            logger.info(f"âœ… YOLO model loaded successfully")
         finally:
             # Restore original torch.load
             torch.load = original_torch_load
             
         return model
     except Exception as e:
-        logger.error(f"❌ Failed to load YOLO model: {e}")
+        logger.error(f"âŒ Failed to load YOLO model: {e}")
         raise
 
 app = FastAPI(title="YOLOv8 Analytics Service")
+if CORS_ALLOW_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ALLOW_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+    )
 
 # ============================
 # Calibration Data (Camera-specific)
@@ -344,7 +410,7 @@ def load_calibration():
         try:
             camera_matrix = np.array(json.loads(CAMERA_MATRIX_JSON))
             dist_coeffs = np.array(json.loads(DISTORTION_COEFFS_JSON))
-            logger.info("✅ Camera calibration loaded from environment variables")
+            logger.info("âœ… Camera calibration loaded from environment variables")
             return True
         except Exception as e:
             logger.warning(f"Failed to load calibration from env: {e}")
@@ -356,13 +422,13 @@ def load_calibration():
                 cal_data = json.load(f)
                 camera_matrix = np.array(cal_data.get("camera_matrix", []))
                 dist_coeffs = np.array(cal_data.get("distortion_coefficients", []))
-                logger.info(f"✅ Camera calibration loaded from {CALIBRATION_FILE}")
+                logger.info(f"âœ… Camera calibration loaded from {CALIBRATION_FILE}")
                 return True
         except Exception as e:
             logger.warning(f"Failed to load calibration from file: {e}")
     
     if ENABLE_UNDISTORT:
-        logger.warning("⚠️ Undistort enabled but no calibration data found. Create camera_calibration.json or set env variables.")
+        logger.warning("âš ï¸ Undistort enabled but no calibration data found. Create camera_calibration.json or set env variables.")
     return False
 
 # ============================
@@ -407,7 +473,7 @@ def apply_roi_polygon(frame: np.ndarray) -> tuple:
         
         # Create mask
         mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [points], 255)
+        cv2.fillPoly(mask, [points], (255,))
         
         # Apply mask
         result = cv2.bitwise_and(frame, frame, mask=mask)
@@ -438,13 +504,16 @@ def apply_roi(frame: np.ndarray) -> tuple:
     else:  # rect (default)
         return apply_roi_rect(frame) + (ROI_TYPE,)
 
-def undistort_frame(frame: np.ndarray) -> np.ndarray:
+def undistort_frame(frame: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
     Apply undistortion to wide-angle frame using camera calibration.
     Straightens curved lines at edges caused by wide-angle lens.
+    Returns:
+      - processed frame
+      - crop offset (x, y) relative to undistorted full-size canvas
     """
     if not ENABLE_UNDISTORT or camera_matrix is None or dist_coeffs is None:
-        return frame
+        return frame, (0, 0)
     
     try:
         h, w = frame.shape[:2]
@@ -459,13 +528,47 @@ def undistort_frame(frame: np.ndarray) -> np.ndarray:
         
         # Crop to ROI if needed (remove black borders)
         x, y, w_roi, h_roi = roi
+        crop_offset = (0, 0)
         if x > 0 or y > 0 or w_roi < w or h_roi < h:
             result = result[y:y+h_roi, x:x+w_roi]
-        
-        return result
+            crop_offset = (int(x), int(y))
+
+        return result, crop_offset
     except Exception as e:
         logger.warning(f"Undistort error: {e}, using original frame")
-        return frame
+        return frame, (0, 0)
+
+def remap_detections_to_input_space(
+    detections: List["Detection"],
+    roi_box: Optional[Tuple[float, float, float, float]],
+    roi_type: Optional[str],
+    pre_roi_shape: Tuple[int, ...],
+    undistort_crop_offset: Tuple[int, int],
+) -> None:
+    """
+    Map detections from ROI/undistort-processed frame back to input frame coordinates.
+    Notes:
+      - ROI offset is applied only for rectangular ROI crop.
+      - Polygon ROI keeps full-frame size, so no ROI offset is applied.
+      - Undistort crop offset is added when undistort removed black borders.
+    """
+    x_add, y_add = 0.0, 0.0
+
+    if roi_box and roi_type == "rect":
+        full_roi_box = (0, 0, pre_roi_shape[1], pre_roi_shape[0])
+        if roi_box != full_roi_box:
+            x_add += float(roi_box[0])
+            y_add += float(roi_box[1])
+
+    x_add += float(undistort_crop_offset[0])
+    y_add += float(undistort_crop_offset[1])
+
+    if x_add == 0.0 and y_add == 0.0:
+        return
+
+    for det in detections:
+        det.x += x_add
+        det.y += y_add
 
 def scale_detections_to_original(detections: List[Dict], roi_box: tuple, original_shape: tuple) -> List[Dict]:
     """
@@ -487,7 +590,7 @@ def scale_detections_to_original(detections: List[Dict], roi_box: tuple, origina
 # ============================
 # Helper Functions
 # ============================
-def extract_appearance(frame: np.ndarray, bbox: tuple) -> dict:
+def extract_appearance(frame: np.ndarray, bbox: tuple[float, float, float, float]) -> dict:
     """Extract appearance features (color histogram) from detection region"""
     x1, y1, x2, y2 = bbox
     x1, y1, x2, y2 = max(0, int(x1)), max(0, int(y1)), min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
@@ -567,7 +670,7 @@ def auto_adjust_brightness(frame: np.ndarray, target_brightness: float = 190.0) 
             l_clahe = clahe.apply(l)
             
             # Step 2: Additional direct scaling on L channel
-            l_mean = np.mean(l_clahe)
+            l_mean = float(np.mean(np.asarray(l_clahe, dtype=np.float32)))
             if l_mean < target_brightness:
                 scale_factor = target_brightness / max(l_mean, 5)
                 scale_factor = min(scale_factor, 3.0)  # Cap at 3.0x
@@ -577,9 +680,9 @@ def auto_adjust_brightness(frame: np.ndarray, target_brightness: float = 190.0) 
             lab_adjusted = cv2.merge([l_clahe, a, b])
             frame_adjusted = cv2.cvtColor(lab_adjusted, cv2.COLOR_LAB2BGR)
             
-            new_brightness = np.mean(frame_adjusted)
+            new_brightness = float(np.mean(np.asarray(frame_adjusted, dtype=np.float32)))
             if new_brightness >= target_brightness * 0.95:  # Close enough to target
-                logger.debug(f"Brightness corrected: {current_brightness:.1f} → {new_brightness:.1f}")
+                logger.debug(f"Brightness corrected: {current_brightness:.1f} â†’ {new_brightness:.1f}")
                 return frame_adjusted
         
         return frame
@@ -665,6 +768,13 @@ def multi_scale_inference_smart(yolo_model, frame: np.ndarray, original_h: int, 
     class FilteredResult:
         def __init__(self, boxes=None):
             self.boxes = boxes
+
+    class ScaledBox:
+        """Minimal box wrapper compatible with downstream parsing logic."""
+        def __init__(self, xyxy: torch.Tensor, conf: torch.Tensor, cls: torch.Tensor):
+            self.xyxy = xyxy
+            self.conf = conf
+            self.cls = cls
     
     # Primary inference at 1.0x scale
     r = yolo_model.predict(
@@ -700,11 +810,15 @@ def multi_scale_inference_smart(yolo_model, frame: np.ndarray, original_h: int, 
         half=USE_HALF,
     )[0]
     
-    # Scale boxes back to original size
-    if r_scaled.boxes is not None:
+    # Scale boxes back to original size (avoid in-place writes on inference tensors)
+    if r_scaled.boxes is not None and len(r_scaled.boxes) > 0:
+        scaled_boxes: List[ScaledBox] = []
         for box in r_scaled.boxes:
-            box.xyxy[0] = box.xyxy[0] / 1.25
-        return FilteredResult(r_scaled.boxes)
+            xyxy = box.xyxy.detach().clone() / 1.25
+            conf = box.conf.detach().clone()
+            cls = box.cls.detach().clone()
+            scaled_boxes.append(ScaledBox(xyxy=xyxy, conf=conf, cls=cls))
+        return FilteredResult(scaled_boxes)
     
     return FilteredResult()
 
@@ -736,36 +850,141 @@ class HealthResponse(BaseModel):
 service_start_time = time.time()
 request_counter = 0
 error_counter = 0
+counter_lock = threading.Lock()
+rate_limit_lock = threading.RLock()
+ip_request_buckets: Dict[str, deque[float]] = defaultdict(deque)
+camera_request_buckets: Dict[str, deque[float]] = defaultdict(deque)
+
+def _get_client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client and request.client.host else "unknown"
+
+def _extract_api_token(request: Request) -> str:
+    api_key_header = request.headers.get("x-api-key", "").strip()
+    if api_key_header:
+        return api_key_header
+
+    auth_header = request.headers.get("authorization", "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return ""
+
+def _enforce_api_key(request: Request) -> None:
+    if not API_KEY_REQUIRED:
+        return
+
+    provided = _extract_api_token(request)
+    if not provided or not hmac.compare_digest(provided, API_KEY):
+        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid API key")
+
+def _enforce_rate_limit(request: Request, camera_id: Optional[str] = None) -> None:
+    if not RATE_LIMIT_ENABLED:
+        return
+
+    now_ts = time.time()
+    cutoff = now_ts - RATE_LIMIT_WINDOW_SECONDS
+    client_ip = _get_client_ip(request)
+
+    with rate_limit_lock:
+        ip_bucket = ip_request_buckets[client_ip]
+        while ip_bucket and ip_bucket[0] <= cutoff:
+            ip_bucket.popleft()
+        if len(ip_bucket) >= RATE_LIMIT_MAX_PER_IP:
+            retry_after = max(1, int(RATE_LIMIT_WINDOW_SECONDS - (now_ts - ip_bucket[0])))
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded for client IP",
+                headers={"Retry-After": str(retry_after)},
+            )
+        ip_bucket.append(now_ts)
+
+        if camera_id:
+            cam_key = f"{client_ip}:{camera_id}"
+            cam_bucket = camera_request_buckets[cam_key]
+            while cam_bucket and cam_bucket[0] <= cutoff:
+                cam_bucket.popleft()
+            if len(cam_bucket) >= RATE_LIMIT_MAX_PER_CAMERA:
+                retry_after = max(1, int(RATE_LIMIT_WINDOW_SECONDS - (now_ts - cam_bucket[0])))
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded for camera '{camera_id}'",
+                    headers={"Retry-After": str(retry_after)},
+                )
+            cam_bucket.append(now_ts)
+
+def enforce_security(request: Request, camera_id: Optional[str] = None, require_auth: bool = True) -> None:
+    if REQUIRE_HTTPS:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme).lower()
+        if proto != "https":
+            raise HTTPException(status_code=403, detail="HTTPS required")
+
+    if require_auth:
+        _enforce_api_key(request)
+
+    _enforce_rate_limit(request, camera_id)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    return response
 
 # ============================
 # STATE THEO CAMERA (Multi-camera support)
 # ============================
 camera_states: Dict[str, Dict[str, Any]] = {}
+camera_states_lock = threading.RLock()
+
+def increment_request_counter() -> int:
+    global request_counter
+    with counter_lock:
+        request_counter += 1
+        return request_counter
+
+def increment_error_counter() -> int:
+    global error_counter
+    with counter_lock:
+        error_counter += 1
+        return error_counter
+
+def get_counter_snapshot() -> tuple:
+    with counter_lock:
+        return request_counter, error_counter
 
 def get_camera_state(camera_id: str) -> Dict[str, Any]:
     """Get or create camera state"""
-    if camera_id not in camera_states:
-        logger.info(f"[CAMERA] Initializing new camera: {camera_id}")
-        camera_states[camera_id] = {
-            "tracks": [],
-            "track_history": [],  # NEW: Keep history of old tracks for re-matching
-            "next_id": 1,
-            "seen_ids": set(),
-            "total_count": 0,
-            "last_output": [],
-            "last_time": 0.0,
-            "inference_times": [],  # Track inference performance
-            "created_at": time.time(),
-            "fall_detector": FallDetectionManager(  # NEW: Fall detection manager
-                velocity_threshold=FALL_VELOCITY_THRESHOLD,
-                angle_change_threshold=FALL_ANGLE_CHANGE_THRESHOLD,
-                aspect_ratio_threshold=FALL_ASPECT_RATIO_THRESHOLD,
-                confidence_threshold=FALL_CONFIDENCE_THRESHOLD,
-            ) if ENABLE_FALL_DETECTION else None,
-        }
-    return camera_states[camera_id]
+    with camera_states_lock:
+        if camera_id not in camera_states:
+            logger.info(f"[CAMERA] Initializing new camera: {camera_id}")
+            camera_states[camera_id] = {
+                "lock": threading.RLock(),
+                "tracks": [],
+                "track_history": [],  # NEW: Keep history of old tracks for re-matching
+                "next_id": 1,
+                "seen_ids": set(),
+                "total_count": 0,
+                "last_output": [],
+                "last_time": 0.0,
+                "inference_times": [],  # Track inference performance
+                "created_at": time.time(),
+                "fall_detector": FallDetectionManager(  # NEW: Fall detection manager
+                    velocity_threshold=FALL_VELOCITY_THRESHOLD,
+                    angle_change_threshold=FALL_ANGLE_CHANGE_THRESHOLD,
+                    aspect_ratio_threshold=FALL_ASPECT_RATIO_THRESHOLD,
+                    confidence_threshold=FALL_CONFIDENCE_THRESHOLD,
+                ) if ENABLE_FALL_DETECTION else None,
+            }
+        return camera_states[camera_id]
 
-def iou(a, b) -> float:
+def iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
     """Calculate Intersection over Union"""
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
@@ -779,7 +998,7 @@ def iou(a, b) -> float:
         return 0.0
     return inter / (area_a + area_b - inter + 1e-6)
 
-def center_distance_ratio(a, b) -> float:
+def center_distance_ratio(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
     """
     Center distance normalized by average bbox diagonal.
     Lower is better (0 = same center).
@@ -802,7 +1021,11 @@ def center_distance_ratio(a, b) -> float:
     norm = max(1.0, 0.5 * (diag_a + diag_b))
     return dist / norm
 
-def smooth_bbox(old_bbox: tuple, new_bbox: tuple, alpha: float) -> tuple:
+def smooth_bbox(
+    old_bbox: tuple[float, float, float, float],
+    new_bbox: tuple[float, float, float, float],
+    alpha: float,
+) -> tuple[float, float, float, float]:
     """Exponential smoothing for bbox to reduce jitter (alpha = weight of new bbox)."""
     if alpha <= 0.0:
         return old_bbox
@@ -817,7 +1040,7 @@ def smooth_bbox(old_bbox: tuple, new_bbox: tuple, alpha: float) -> tuple:
         oy2 * (1.0 - alpha) + ny2 * alpha,
     )
 
-def post_nms_dedupe(dets: List[Dict[str, float]], iou_thresh: float) -> List[Dict[str, float]]:
+def post_nms_dedupe(dets: List[Dict[str, Any]], iou_thresh: float) -> List[Dict[str, Any]]:
     """
     Extra IoU-based dedupe after YOLO NMS to avoid overlapping boxes for the same person.
     Keeps highest-score boxes.
@@ -825,14 +1048,14 @@ def post_nms_dedupe(dets: List[Dict[str, float]], iou_thresh: float) -> List[Dic
     if len(dets) <= 1:
         return dets
     dets_sorted = sorted(dets, key=lambda d: d["score"], reverse=True)
-    kept: List[Dict[str, float]] = []
+    kept: List[Dict[str, Any]] = []
     for det in dets_sorted:
         if all(iou(det["bbox"], k["bbox"]) < iou_thresh for k in kept):
             kept.append(det)
     return kept
 
 def has_duplicate_track_overlap(
-    det_box: tuple,
+    det_box: tuple[float, float, float, float],
     track_by_id: Dict[int, Dict[str, Any]],
     now_ts: float,
     overlap_iou: float,
@@ -846,6 +1069,218 @@ def has_duplicate_track_overlap(
         if iou(det_box, tr["bbox"]) >= overlap_iou:
             return True
     return False
+
+def predict_track_bbox(track: Dict[str, Any], now_ts: float) -> tuple[float, float, float, float]:
+    """Predict next bbox from constant velocity model in xyxy space."""
+    bbox = track.get("bbox")
+    if not bbox:
+        return (0.0, 0.0, 0.0, 0.0)
+
+    dt = max(0.0, now_ts - float(track.get("last_seen", now_ts)))
+    if dt <= 1e-6:
+        return bbox
+
+    dt = min(dt, 1.0)
+    vx = float(track.get("vx", 0.0))
+    vy = float(track.get("vy", 0.0))
+    vw = float(track.get("vw", 0.0))
+    vh = float(track.get("vh", 0.0))
+
+    x1, y1, x2, y2 = bbox
+    pred = (x1 + vx * dt, y1 + vy * dt, x2 + vw * dt, y2 + vh * dt)
+    px1, py1, px2, py2 = pred
+    if px2 <= px1 or py2 <= py1:
+        return bbox
+    return pred
+
+
+def update_track_motion(track: Dict[str, Any], prev_bbox: tuple[float, float, float, float], new_bbox: tuple[float, float, float, float], now_ts: float) -> None:
+    """Update track velocity estimates for next-frame prediction."""
+    prev_ts = float(track.get("last_seen", now_ts))
+    dt = max(1e-3, now_ts - prev_ts)
+
+    px1, py1, px2, py2 = prev_bbox
+    nx1, ny1, nx2, ny2 = new_bbox
+
+    track["vx"] = (nx1 - px1) / dt
+    track["vy"] = (ny1 - py1) / dt
+    track["vw"] = (nx2 - px2) / dt
+    track["vh"] = (ny2 - py2) / dt
+
+
+def hungarian_minimize(cost_matrix: np.ndarray) -> List[Tuple[int, int]]:
+    """Solve rectangular minimum-cost assignment using Hungarian algorithm."""
+    if cost_matrix.size == 0:
+        return []
+
+    transposed = False
+    cost = cost_matrix
+    if cost.shape[0] > cost.shape[1]:
+        cost = cost.T
+        transposed = True
+
+    n_rows, n_cols = cost.shape
+    u = np.zeros(n_rows + 1, dtype=np.float64)
+    v = np.zeros(n_cols + 1, dtype=np.float64)
+    p = np.zeros(n_cols + 1, dtype=np.int64)
+    way = np.zeros(n_cols + 1, dtype=np.int64)
+
+    for i in range(1, n_rows + 1):
+        p[0] = i
+        j0 = 0
+        minv = np.full(n_cols + 1, np.inf, dtype=np.float64)
+        used = np.zeros(n_cols + 1, dtype=bool)
+
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = np.inf
+            j1 = 0
+
+            for j in range(1, n_cols + 1):
+                if used[j]:
+                    continue
+                cur = cost[i0 - 1, j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+
+            for j in range(0, n_cols + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+
+            j0 = j1
+            if p[j0] == 0:
+                break
+
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    assignments: List[Tuple[int, int]] = []
+    for j in range(1, n_cols + 1):
+        if p[j] == 0:
+            continue
+        row = p[j] - 1
+        col = j - 1
+        if transposed:
+            assignments.append((col, row))
+        else:
+            assignments.append((row, col))
+    return assignments
+
+
+def global_track_assignment(
+    raw_dets: List[Dict[str, Any]],
+    track_by_id: Dict[int, Dict[str, Any]],
+    frame: np.ndarray,
+    now_ts: float,
+) -> tuple:
+    """
+    Global 1-1 assignment with motion prediction + Hungarian optimization.
+    Returns det_idx -> track_id for accepted pairs only.
+    """
+    det_appearances: List[Dict[str, Any]] = [extract_appearance(frame, det["bbox"]) for det in raw_dets]
+
+    if not raw_dets or not track_by_id:
+        return {}, det_appearances
+
+    track_candidates: List[Dict[str, Any]] = []
+    for tr in track_by_id.values():
+        if now_ts - tr.get("last_seen", 0.0) > MAX_MATCH_AGE:
+            continue
+        if int(tr.get("misses", 0)) > TRACK_MAX_MISSES:
+            continue
+        tr["pred_bbox"] = predict_track_bbox(tr, now_ts)
+        track_candidates.append(tr)
+
+    if not track_candidates:
+        return {}, det_appearances
+
+    invalid_cost = 1e6
+    cost = np.full((len(raw_dets), len(track_candidates)), invalid_cost, dtype=np.float64)
+
+    for det_idx, det in enumerate(raw_dets):
+        det_box = det["bbox"]
+        det_app = det_appearances[det_idx]
+
+        for track_idx, tr in enumerate(track_candidates):
+            pred_bbox_raw = tr.get("pred_bbox") or tr.get("bbox")
+            if not pred_bbox_raw or len(pred_bbox_raw) != 4:
+                continue
+            pred_bbox: tuple[float, float, float, float] = (
+                float(pred_bbox_raw[0]),
+                float(pred_bbox_raw[1]),
+                float(pred_bbox_raw[2]),
+                float(pred_bbox_raw[3]),
+            )
+            iou_score = iou(det_box, pred_bbox)
+            center_ratio = center_distance_ratio(det_box, pred_bbox)
+
+            if iou_score < MATCH_IOU_THRESHOLD or center_ratio > MAX_CENTER_DISTANCE_RATIO:
+                continue
+
+            app_dist = 1.0
+            if tr.get("appearance") and det_app.get("color_hist") is not None:
+                tr_hist = tr["appearance"].get("color_hist")
+                if tr_hist is not None:
+                    app_dist = appearance_distance(tr_hist, det_app["color_hist"])
+
+            match_score = combined_track_score(iou_score, app_dist)
+            if match_score < TRACK_MATCH_MIN_SCORE:
+                continue
+
+            cost[det_idx, track_idx] = 1.0 - match_score
+
+    assignments = hungarian_minimize(cost)
+
+    matches: Dict[int, int] = {}
+    for det_idx, track_idx in assignments:
+        if det_idx >= cost.shape[0] or track_idx >= cost.shape[1]:
+            continue
+        if cost[det_idx, track_idx] >= invalid_cost:
+            continue
+        track_id = int(track_candidates[track_idx]["id"])
+        matches[det_idx] = track_id
+
+    return matches, det_appearances
+
+def suppress_overlapping_holds(
+    hold_track: Dict[str, Any],
+    output_track_ids: set,
+    track_by_id: Dict[int, Dict[str, Any]],
+    overlap_iou: float,
+) -> bool:
+    """Skip held tracks that heavily overlap tracks already selected for current output."""
+    for tid in output_track_ids:
+        tr = track_by_id.get(tid)
+        if not tr or tr.get("id") == hold_track.get("id"):
+            continue
+        if iou(hold_track["bbox"], tr["bbox"]) >= overlap_iou:
+            return True
+    return False
+
+def dedupe_output_tracks(detections: List["Detection"], iou_thresh: float) -> List["Detection"]:
+    """Final output dedupe to reduce overlapping duplicate boxes."""
+    if len(detections) <= 1:
+        return detections
+
+    sorted_dets = sorted(detections, key=lambda d: d.score, reverse=True)
+    kept: List["Detection"] = []
+    for det in sorted_dets:
+        det_box = (det.x, det.y, det.x + det.w, det.y + det.h)
+        if all(iou(det_box, (k.x, k.y, k.x + k.w, k.y + k.h)) < iou_thresh for k in kept):
+            kept.append(det)
+    return kept
 
 # ============================
 # Health Check Endpoint
@@ -864,7 +1299,7 @@ def health_check():
 # Inference Endpoint
 # ============================
 @app.post("/infer", response_model=List[Detection])
-def infer(req: InferRequest):
+def infer(req: InferRequest, request: Request):
     """
     Main inference endpoint.
     
@@ -885,11 +1320,11 @@ def infer(req: InferRequest):
         "track_id": 1
     }
     """
-    global request_counter, error_counter
-    request_counter += 1
+    req_seq = increment_request_counter()
     start_time = time.time()
     
     camera_id = req.camera_id or "default"
+    enforce_security(request, camera_id=camera_id, require_auth=True)
     
     try:
         # ============================================
@@ -919,48 +1354,51 @@ def infer(req: InferRequest):
                 logger.debug(f"[{camera_id}] Decoded JPEG/PNG format")
             
             if frame is None:
-                error_counter += 1
+                increment_error_counter()
                 logger.warning(f"[{camera_id}] Failed to decode image - got None")
                 return []
-                
+                 
         except Exception as e:
-            error_counter += 1
+            increment_error_counter()
             logger.warning(f"[{camera_id}] Image decode error: {type(e).__name__}: {e}")
             return []
 
         H, W = frame.shape[:2]
         
         # Debug: Check if frame is mostly empty/dark
-        frame_mean = np.mean(frame)
-        frame_max = np.max(frame)
-        frame_min = np.min(frame)
-        if request_counter % 20 == 0:
+        mean_bgr = cv2.mean(frame)
+        frame_mean = float((mean_bgr[0] + mean_bgr[1] + mean_bgr[2]) / 3.0)
+        gray_for_stats = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+        frame_min_val, frame_max_val, _, _ = cv2.minMaxLoc(gray_for_stats)
+        frame_max = int(frame_max_val)
+        frame_min = int(frame_min_val)
+        if req_seq % 20 == 0:
             logger.info(f"[{camera_id}] Frame: {W}x{H}, mean={frame_mean:.1f}, min={frame_min}, max={frame_max}")
             if SAVE_DEBUG_SAMPLES:
                 # Save frame to disk only when explicitly enabled via env var.
                 try:
                     import os
                     os.makedirs('frame_samples', exist_ok=True)
-                    sample_path = f'frame_samples/frame_{request_counter:06d}.jpg'
+                    sample_path = f'frame_samples/frame_{req_seq:06d}.jpg'
                     cv2.imwrite(sample_path, frame)
                     logger.info(f"[{camera_id}] Saved frame sample to {sample_path}")
                 except Exception as e:
                     logger.warning(f"Failed to save frame sample: {e}")
         logger.debug(f"[{camera_id}] Frame size: {W}x{H}")
 
-        # Store original frame for coordinate mapping
-        frame_original = frame.copy()
-        original_shape = frame.shape
+        # Store transform metadata for coordinate mapping (before undistort/ROI)
+        undistort_crop_offset = (0, 0)
         
         # ============================================
         # 1.4) Undistortion (for wide-angle/fisheye cameras)
         # ============================================
         if ENABLE_UNDISTORT:
             undistort_start = time.time()
-            frame = undistort_frame(frame)
+            frame, undistort_crop_offset = undistort_frame(frame)
             undistort_time = time.time() - undistort_start
-            if request_counter % 20 == 0:
+            if req_seq % 20 == 0:
                 logger.info(f"[{camera_id}] Undistortion: {undistort_time*1000:.1f}ms")
+        pre_roi_shape = frame.shape
 
         # ============================================
         # 1.5) ROI Crop (Region of Interest)
@@ -972,7 +1410,7 @@ def infer(req: InferRequest):
             frame, roi_box, roi_type = apply_roi(frame)
             roi_time = time.time() - roi_start
             H_roi, W_roi = frame.shape[:2]
-            if request_counter % 20 == 0:
+            if req_seq % 20 == 0:
                 logger.info(f"[{camera_id}] ROI ({roi_type}): {H_roi}x{W_roi}, time={roi_time*1000:.1f}ms")
         else:
             roi_box = (0, 0, frame.shape[1], frame.shape[0])
@@ -986,7 +1424,7 @@ def infer(req: InferRequest):
             inference_start = time.time()
             frame = preprocess_frame(frame)
             preprocess_time = time.time() - inference_start
-            if request_counter % 20 == 0:
+            if req_seq % 20 == 0:
                 logger.info(f"[{camera_id}] Frame preprocessing: {preprocess_time*1000:.1f}ms (CLAHE={ENABLE_CLAHE}, Enhancement={ENABLE_FRAME_ENHANCEMENT})")
 
         # ============================================
@@ -1019,21 +1457,26 @@ def infer(req: InferRequest):
             inference_time_ms = (time.time() - inference_start) * 1000
             
             # Log detection details for debugging
-            num_boxes = len(r.boxes) if r.boxes is not None else 0
-            if request_counter % 20 == 0:
+            boxes_for_log = r.boxes if r.boxes is not None else []
+            num_boxes = len(boxes_for_log)
+            if req_seq % 20 == 0:
                 logger.info(f"[{camera_id}] YOLO: {num_boxes} objects (conf={CONFIDENCE_THRESHOLD}, inference={inference_time_ms:.1f}ms)")
                 if num_boxes > 0:
-                    for i, box in enumerate(r.boxes[:3]):  # Show first 3
+                    for i, box in enumerate(boxes_for_log[:3]):  # Show first 3
                         logger.info(f"  Box {i}: cls={int(box.cls[0].item())}, conf={float(box.conf[0].item()):.2f}")
         except Exception as e:
-            error_counter += 1
+            increment_error_counter()
             logger.error(f"[{camera_id}] YOLO inference error: {type(e).__name__}: {e}")
             return []
 
         now = time.time()
         state = get_camera_state(camera_id)
-        tracks = state["tracks"]
-        next_id = state["next_id"]
+        camera_lock = state["lock"]
+        with camera_lock:
+            tracks = [dict(tr) for tr in state["tracks"]]
+            track_history_snapshot = [dict(tr) for tr in state["track_history"]]
+            next_id = state["next_id"]
+            fall_detector = state["fall_detector"]
 
         detections: List[Detection] = []
 
@@ -1041,8 +1484,9 @@ def infer(req: InferRequest):
         # 3) Process YOLO outputs with tracking
         # ============================================
         # Build raw detections first (for optional extra NMS)
-        raw_dets: List[Dict[str, float]] = []
-        for box in r.boxes:
+        raw_dets: List[Dict[str, Any]] = []
+        boxes_iter = r.boxes if r.boxes is not None else []
+        for box in boxes_iter:
             try:
                 cls_id = int(box.cls[0].item())
                 if cls_id != 0:  # Only person
@@ -1078,77 +1522,104 @@ def infer(req: InferRequest):
 
         # Track state (persistent)
         track_by_id = {tr["id"]: tr for tr in tracks}
+        for tr in track_by_id.values():
+            tr.setdefault("status", "confirmed")
+            tr.setdefault("hits", TRACK_MIN_HITS)
+            tr.setdefault("misses", 0)
+            tr.setdefault("vx", 0.0)
+            tr.setdefault("vy", 0.0)
+            tr.setdefault("vw", 0.0)
+            tr.setdefault("vh", 0.0)
+
         matched_ids = set()
         output_track_ids = set()
 
-        for det in raw_dets:
+        # Global optimal 1-1 matching (Hungarian) over gated det-track pairs.
+        det_to_track, det_appearances = global_track_assignment(raw_dets, track_by_id, frame, now)
+
+        for det_idx, track_id in det_to_track.items():
+            det = raw_dets[det_idx]
+            det_box = det["bbox"]
+            score = det["score"]
+            det_appearance = det_appearances[det_idx]
+
+            tr = track_by_id.get(track_id)
+            if not tr:
+                continue
+
+            prev_bbox = tr.get("bbox", det_box)
+            if BBOX_SMOOTHING > 0.0 and tr.get("bbox"):
+                tr["bbox"] = smooth_bbox(prev_bbox, det_box, BBOX_SMOOTHING)
+            else:
+                tr["bbox"] = det_box
+
+            update_track_motion(tr, prev_bbox=prev_bbox, new_bbox=tr["bbox"], now_ts=now)
+            tr["last_seen"] = now
+            tr["appearance"] = det_appearance
+            tr["score"] = score
+            tr["misses"] = 0
+            tr["hits"] = int(tr.get("hits", 0)) + 1
+            if tr["status"] != "confirmed" and tr["hits"] >= TRACK_MIN_HITS:
+                tr["status"] = "confirmed"
+            elif tr["status"] == "lost":
+                tr["status"] = "confirmed"
+
+            track_by_id[track_id] = tr
+            matched_ids.add(track_id)
+
+        for tr in track_by_id.values():
+            if tr["id"] in matched_ids:
+                continue
+            tr["misses"] = int(tr.get("misses", 0)) + 1
+            if tr.get("status") == "tentative":
+                if tr["misses"] > TENTATIVE_MAX_MISSES:
+                    tr["status"] = "deleted"
+            else:
+                tr["status"] = "lost"
+
+        unmatched_det_idxs = [idx for idx in range(len(raw_dets)) if idx not in det_to_track]
+        for det_idx in unmatched_det_idxs:
             try:
+                det = raw_dets[det_idx]
                 det_box = det["bbox"]
                 score = det["score"]
-                x1, y1, x2, y2 = det_box
-                w_box = x2 - x1
-                h_box = y2 - y1
+                det_appearance = det_appearances[det_idx]
+                track_id = None
 
-                # ============================================
-                # Track matching: find best match using IoU + Appearance
-                # ============================================
-                det_appearance = extract_appearance(frame, det_box)
-                best_score, best_tr = -1.0, None
-
-                # FIRST: Try to match against active tracks
-                for tr in track_by_id.values():
-                    if tr.get("id") in matched_ids:
-                        continue
-                    iou_score = iou(det_box, tr["bbox"])
-                    center_ratio = center_distance_ratio(det_box, tr["bbox"])
-
-                    # Hard gating to avoid cross-matching close objects with wrong IDs.
-                    if iou_score < MATCH_IOU_THRESHOLD and center_ratio > MAX_CENTER_DISTANCE_RATIO:
-                        continue
-
-                    # Always try to compare appearance if we have it
-                    if tr.get("appearance") and det_appearance["color_hist"] is not None:
-                        app_dist = appearance_distance(tr["appearance"]["color_hist"], det_appearance["color_hist"])
-                        app_similarity = 1.0 - app_dist
-                        match_score = 0.85 * iou_score + 0.15 * app_similarity
-                    else:
-                        # Fall back to IoU only
-                        match_score = iou_score
-
-                    if match_score > best_score:
-                        best_score, best_tr = match_score, tr
-
-                # SECOND: If no good active track match, search track history
-                # Disabled by default for stability (can be enabled by env if needed).
-                if ENABLE_HISTORY_REMATCH and (best_tr is None or best_score < MATCH_IOU_THRESHOLD) and state["track_history"]:
-                    for hist_tr in state["track_history"]:
+                # Optional history rematch: appearance-only for returning person.
+                if ENABLE_HISTORY_REMATCH and track_history_snapshot and det_appearance.get("color_hist") is not None:
+                    best_hist_score = -1.0
+                    best_hist = None
+                    for hist_tr in track_history_snapshot:
                         if hist_tr.get("id") in matched_ids:
                             continue
-                        # Only match if appearance is similar enough (less reliance on position)
-                        if hist_tr.get("appearance") and det_appearance["color_hist"] is not None:
+                        if hist_tr.get("appearance") and hist_tr["appearance"].get("color_hist") is not None:
                             app_dist = appearance_distance(hist_tr["appearance"]["color_hist"], det_appearance["color_hist"])
-                            # Person-like appearance match = likely same person returning
-                            if app_dist < 0.4:  # More lenient: similar appearance
-                                hist_score = 1.0 - app_dist  # Appearance-based score (0-1)
-                                if hist_score > best_score:
-                                    best_score, best_tr = hist_score, hist_tr
-                                    logger.debug(f"[{camera_id}] Re-matched track ID={hist_tr['id']} from history (app_dist={app_dist:.2f})")
+                            if app_dist < 0.4:
+                                hist_score = 1.0 - app_dist
+                                if hist_score > best_hist_score:
+                                    best_hist_score = hist_score
+                                    best_hist = hist_tr
+                    if best_hist is not None:
+                        track_id = int(best_hist["id"])
+                        track_by_id[track_id] = {
+                            "id": track_id,
+                            "bbox": det_box,
+                            "last_seen": now,
+                            "created_at": best_hist.get("created_at", now),
+                            "appearance": det_appearance,
+                            "score": score,
+                            "status": "confirmed",
+                            "hits": max(TRACK_MIN_HITS, int(best_hist.get("hits", TRACK_MIN_HITS))),
+                            "misses": 0,
+                            "vx": 0.0,
+                            "vy": 0.0,
+                            "vw": 0.0,
+                            "vh": 0.0,
+                        }
+                        logger.debug(f"[{camera_id}] Re-matched track ID={track_id} from history")
 
-                match_threshold = MATCH_IOU_THRESHOLD
-
-                if best_tr is not None and best_score >= match_threshold and best_tr.get("id") not in matched_ids:
-                    # Existing track: update position and appearance (with smoothing)
-                    track_id = best_tr["id"]
-                    if BBOX_SMOOTHING > 0.0 and best_tr.get("bbox"):
-                        best_tr["bbox"] = smooth_bbox(best_tr["bbox"], det_box, BBOX_SMOOTHING)
-                    else:
-                        best_tr["bbox"] = det_box
-                    best_tr["last_seen"] = now
-                    best_tr["appearance"] = det_appearance
-                    best_tr["score"] = score
-                    track_by_id[track_id] = best_tr
-                else:
-                    # New track
+                if track_id is None:
                     if score < NEW_TRACK_MIN_CONFIDENCE:
                         continue
 
@@ -1159,31 +1630,53 @@ def infer(req: InferRequest):
                         overlap_iou=TRACK_DUPLICATE_IOU,
                         recent_only_sec=max(TRACK_OUTPUT_HOLD_TIME, 0.5),
                     ):
-                        # This detection is likely a duplicate of an already tracked person.
                         continue
 
                     track_id = next_id
                     next_id += 1
-                    best_tr = {
+                    track_by_id[track_id] = {
                         "id": track_id,
                         "bbox": det_box,
                         "last_seen": now,
                         "created_at": now,
                         "appearance": det_appearance,
                         "score": score,
+                        "status": "tentative",
+                        "hits": 1,
+                        "misses": 0,
+                        "vx": 0.0,
+                        "vy": 0.0,
+                        "vw": 0.0,
+                        "vh": 0.0,
                     }
-                    track_by_id[track_id] = best_tr
 
                 matched_ids.add(track_id)
-                output_track_ids.add(track_id)
             except Exception as e:
-                logger.warning(f"[{camera_id}] Error processing detection: {type(e).__name__}: {e}")
+                logger.warning(f"[{camera_id}] Error processing unmatched detection: {type(e).__name__}: {e}")
                 continue
 
-        # Keep recent tracks for a short time to avoid flicker on temporary misses.
+        # Output selection: confirmed tracks by default; optional tentative output via config.
         for tr in track_by_id.values():
-            if now - tr.get("last_seen", 0.0) <= TRACK_OUTPUT_HOLD_TIME:
-                output_track_ids.add(tr["id"])
+            if tr.get("status") == "deleted":
+                continue
+
+            is_confirmed = tr.get("status") == "confirmed"
+            is_tentative = tr.get("status") == "tentative"
+
+            if tr["id"] in matched_ids:
+                if is_confirmed or (OUTPUT_TENTATIVE_TRACKS and is_tentative):
+                    output_track_ids.add(tr["id"])
+                continue
+
+            if not is_confirmed:
+                continue
+            if int(tr.get("misses", 0)) > TRACK_MAX_MISSES:
+                continue
+            if now - tr.get("last_seen", 0.0) > TRACK_OUTPUT_HOLD_TIME:
+                continue
+            if suppress_overlapping_holds(tr, output_track_ids, track_by_id, HOLD_SUPPRESS_IOU):
+                continue
+            output_track_ids.add(tr["id"])
 
         # Build final detections from stable track state (one bbox per track_id).
         detections = []
@@ -1206,10 +1699,12 @@ def infer(req: InferRequest):
                 track_id=int(track_id)
             ))
 
+        detections = dedupe_output_tracks(detections, OUTPUT_DEDUPE_IOU)
+
         # ============================================
         # 3.2) Fall Detection (NEW)
         # ============================================
-        if ENABLE_FALL_DETECTION and state["fall_detector"]:
+        if ENABLE_FALL_DETECTION and fall_detector:
             try:
                 # Prepare detection data for fall detection
                 fall_input_detections = []
@@ -1221,16 +1716,16 @@ def infer(req: InferRequest):
                     })
                 
                 # Update fall detector with current frame detections
-                fall_results = state["fall_detector"].update(fall_input_detections, request_counter)
+                with camera_lock:
+                    fall_results = fall_detector.update(fall_input_detections, req_seq)
+                    fall_stats = fall_detector.get_stats()
                 
                 # Mark detections with fall status
                 for det in detections:
                     det.fall_detected = fall_results.get(det.track_id, False)
                     if det.fall_detected:
                         logger.warning(f"[{camera_id}] FALL DETECTED: Person {det.track_id} (score={det.score:.2f})")
-                
-                # Get current fall statistics
-                fall_stats = state["fall_detector"].get_stats()
+
                 if fall_stats['total_fallen'] > 0:
                     logger.info(f"[{camera_id}] Fall Status: {fall_stats['total_fallen']} person(s) fallen out of {fall_stats['total_tracked']} tracked")
                     
@@ -1239,81 +1734,95 @@ def infer(req: InferRequest):
                 # Fall detection errors don't stop inference, just log and continue
 
         # ============================================
-        # 3.5) Scale detections back to original frame coordinates (if ROI was applied)
+        # 3.5) Map detections back to input frame coordinates
         # ============================================
-        if ENABLE_ROI and roi_box and roi_box != (0, 0, original_shape[1], original_shape[0]):
-            x_offset, y_offset, _, _ = roi_box
-            for det in detections:
-                det.x += x_offset
-                det.y += y_offset
+        remap_detections_to_input_space(
+            detections=detections,
+            roi_box=roi_box,
+            roi_type=roi_type,
+            pre_roi_shape=pre_roi_shape,
+            undistort_crop_offset=undistort_crop_offset,
+        )
 
         # ============================================
         # 4) Anti-flicker: reuse last output if empty
         # ============================================
-        if not detections and state["last_output"]:
-            time_since_last = now - state["last_time"]
-            if time_since_last < FLICKER_REUSE_TIME:
-                logger.debug(f"[{camera_id}] Reusing last output (anti-flicker, {time_since_last*1000:.0f}ms)")
-                detections = state["last_output"]
-        else:
-            state["last_output"] = detections
-            state["last_time"] = now
-
-        # ============================================
-        # 5) Track TTL cleanup with history buffer
-        # ============================================
-        # Keep active tracks for ~15 seconds, move very old ones to history for re-matching
-        old_count = len(state["tracks"])
-
-        # Separate active tracks from expired ones
-        active_tracks = []
-        expired_tracks = []
-        for tr in track_by_id.values():
-            if now - tr["last_seen"] <= TRACK_TTL:  # 15 seconds
-                active_tracks.append(tr)
+        with camera_lock:
+            if not detections and state["last_output"]:
+                time_since_last = now - state["last_time"]
+                if time_since_last < FLICKER_REUSE_TIME:
+                    logger.debug(f"[{camera_id}] Reusing last output (anti-flicker, {time_since_last*1000:.0f}ms)")
+                    detections = state["last_output"]
             else:
-                expired_tracks.append(tr)
-        
-        # Move expired tracks to history only when history rematch is enabled.
-        if ENABLE_HISTORY_REMATCH:
-            state["track_history"] = [tr for tr in state["track_history"] if now - tr.get("last_seen", now) <= 30.0]
-            state["track_history"].extend(expired_tracks)
-        else:
-            state["track_history"] = []
-        
-        state["tracks"] = active_tracks
-        removed = old_count - len(state["tracks"])
-        if removed > 0:
-            logger.debug(f"[{camera_id}] Moved {removed} tracks to history (will re-match if person returns)")
-        
-        state["next_id"] = next_id
+                state["last_output"] = detections
+                state["last_time"] = now
 
-        # ============================================
-        # 6) Count tracking
-        # ============================================
-        ids = {d.track_id for d in detections}
-        state["seen_ids"].update(ids)
-        
-        # Track inference time
-        inference_time = time.time() - start_time
-        state["inference_times"].append(inference_time)
-        if len(state["inference_times"]) > 30:
-            state["inference_times"] = state["inference_times"][-30:]
-        
-        avg_inference_time = sum(state["inference_times"]) / len(state["inference_times"])
-        max_inference_time = max(state["inference_times"])
+            # ============================================
+            # 5) Track TTL cleanup with history buffer
+            # ============================================
+            old_count = len(state["tracks"])
+
+            active_tracks = []
+            expired_tracks = []
+            for tr in track_by_id.values():
+                if tr.get("status") == "deleted":
+                    expired_tracks.append(tr)
+                    continue
+
+                if tr.get("status") == "tentative" and int(tr.get("misses", 0)) > TENTATIVE_MAX_MISSES:
+                    tr["status"] = "deleted"
+                    expired_tracks.append(tr)
+                    continue
+
+                if now - tr.get("last_seen", 0.0) <= TRACK_TTL:
+                    active_tracks.append(tr)
+                else:
+                    expired_tracks.append(tr)
+
+            if ENABLE_HISTORY_REMATCH:
+                state["track_history"] = [tr for tr in state["track_history"] if now - tr.get("last_seen", now) <= 30.0]
+                history_candidates = [
+                    tr for tr in expired_tracks
+                    if tr.get("status") in {"confirmed", "lost"} and tr.get("appearance")
+                ]
+                state["track_history"].extend(history_candidates)
+            else:
+                state["track_history"] = []
+
+            state["tracks"] = active_tracks
+            removed = old_count - len(state["tracks"])
+            if removed > 0:
+                logger.debug(f"[{camera_id}] Removed {removed} stale tracks from active state")
+
+            state["next_id"] = next_id
+
+            # ============================================
+            # 6) Count tracking
+            # ============================================
+            ids = {d.track_id for d in detections}
+            state["seen_ids"].update(ids)
+
+            inference_time = time.time() - start_time
+            state["inference_times"].append(inference_time)
+            if len(state["inference_times"]) > 30:
+                state["inference_times"] = state["inference_times"][-30:]
+
+            avg_inference_time = sum(state["inference_times"]) / len(state["inference_times"])
+            max_inference_time = max(state["inference_times"])
+            tracks_count = len(state["tracks"])
+            unique_count = len(state["seen_ids"])
         
         logger.info(
             f"[{camera_id}] Detections: {len(detections)} | "
-            f"Tracks: {len(state['tracks'])} | "
-            f"Unique: {len(state['seen_ids'])} | "
+            f"Tracks: {tracks_count} | "
+            f"Unique: {unique_count} | "
             f"Time: {inference_time*1000:.1f}ms (avg: {avg_inference_time*1000:.1f}ms)"
         )
 
         return detections
 
     except Exception as e:
-        error_counter += 1
+        increment_error_counter()
         logger.error(f"[{camera_id}] Unexpected error in /infer: {type(e).__name__}: {e}", exc_info=True)
         return []
 
@@ -1322,42 +1831,49 @@ def infer(req: InferRequest):
 # Status Endpoint
 # ============================
 @app.get("/status")
-def status():
+def status(request: Request):
     """Get service status and statistics"""
+    enforce_security(request, require_auth=True)
     uptime = time.time() - service_start_time
     cameras_info = {}
-    
-    for cam_id, state in camera_states.items():
-        cam_info = {
-            "tracks": len(state["tracks"]),
-            "unique_persons": len(state["seen_ids"]),
-            "created_at": datetime.fromtimestamp(state["created_at"]).isoformat(),
-            "avg_inference_ms": (sum(state["inference_times"]) / len(state["inference_times"]) * 1000) 
-                               if state["inference_times"] else 0.0
-        }
-        
-        # Add fall detection stats if enabled
-        if ENABLE_FALL_DETECTION and state["fall_detector"]:
-            fall_stats = state["fall_detector"].get_stats()
-            cam_info["fall_detection"] = {
-                "enabled": True,
-                "total_tracked": fall_stats["total_tracked"],
-                "total_fallen": fall_stats["total_fallen"],
-                "current_frame": fall_stats["current_frame"],
+
+    with camera_states_lock:
+        camera_items = list(camera_states.items())
+
+    for cam_id, state in camera_items:
+        with state["lock"]:
+            cam_info = {
+                "tracks": len(state["tracks"]),
+                "unique_persons": len(state["seen_ids"]),
+                "created_at": datetime.fromtimestamp(state["created_at"]).isoformat(),
+                "avg_inference_ms": (sum(state["inference_times"]) / len(state["inference_times"]) * 1000)
+                                   if state["inference_times"] else 0.0
             }
-        else:
-            cam_info["fall_detection"] = {"enabled": False}
-        
+
+            # Add fall detection stats if enabled
+            if ENABLE_FALL_DETECTION and state["fall_detector"]:
+                fall_stats = state["fall_detector"].get_stats()
+                cam_info["fall_detection"] = {
+                    "enabled": True,
+                    "total_tracked": fall_stats["total_tracked"],
+                    "total_fallen": fall_stats["total_fallen"],
+                    "current_frame": fall_stats["current_frame"],
+                }
+            else:
+                cam_info["fall_detection"] = {"enabled": False}
+
         cameras_info[cam_id] = cam_info
-    
+
+    total_requests, total_errors = get_counter_snapshot()
+
     return {
         "service": "YOLOv8 People Analytics + Fall Detection",
         "status": "running",
         "uptime_seconds": uptime,
-        "total_requests": request_counter,
-        "total_errors": error_counter,
-        "error_rate": (error_counter / request_counter * 100) if request_counter > 0 else 0.0,
-        "active_cameras": len(camera_states),
+        "total_requests": total_requests,
+        "total_errors": total_errors,
+        "error_rate": (total_errors / total_requests * 100) if total_requests > 0 else 0.0,
+        "active_cameras": len(camera_items),
         "fall_detection": "ENABLED" if ENABLE_FALL_DETECTION else "DISABLED",
         "cameras": cameras_info,
         "model": MODEL_PATH,
@@ -1369,58 +1885,74 @@ def status():
 # Reset Count Endpoint
 # ============================
 @app.post("/reset/{camera_id}")
-def reset_camera(camera_id: str):
+def reset_camera(camera_id: str, request: Request):
     """
     Reset count for a specific camera.
     Call: POST http://127.0.0.1:18000/reset/default
     """
-    global camera_states
-    if camera_id in camera_states:
-        old_count = len(camera_states[camera_id]["seen_ids"])
-        camera_states[camera_id]["seen_ids"].clear()
-        camera_states[camera_id]["tracks"].clear()
-        camera_states[camera_id]["track_history"].clear()
-        camera_states[camera_id]["next_id"] = 1
-        logger.info(f"[{camera_id}] Reset: cleared {old_count} persons, count now = 0")
-        return {
-            "camera_id": camera_id,
-            "status": "reset",
-            "previous_count": old_count,
-            "current_count": 0
-        }
-    else:
+    enforce_security(request, camera_id=camera_id, require_auth=True)
+    with camera_states_lock:
+        state = camera_states.get(camera_id)
+
+    if state is None:
         return {
             "camera_id": camera_id,
             "status": "not_found",
             "message": f"Camera {camera_id} not yet initialized"
         }
 
+    with state["lock"]:
+        old_count = len(state["seen_ids"])
+        state["seen_ids"].clear()
+        state["tracks"].clear()
+        state["track_history"].clear()
+        state["next_id"] = 1
+        if state["fall_detector"]:
+            state["fall_detector"].reset_fall()
+
+    logger.info(f"[{camera_id}] Reset: cleared {old_count} persons, count now = 0")
+    return {
+        "camera_id": camera_id,
+        "status": "reset",
+        "previous_count": old_count,
+        "current_count": 0
+    }
+
 @app.post("/reset_all")
-def reset_all():
+def reset_all(request: Request):
     """Reset count for ALL cameras"""
-    global camera_states
-    total_persons = sum(len(state["seen_ids"]) for state in camera_states.values())
-    for cam_id in camera_states:
-        camera_states[cam_id]["seen_ids"].clear()
-        camera_states[cam_id]["tracks"].clear()
-        camera_states[cam_id]["track_history"].clear()
-        camera_states[cam_id]["next_id"] = 1
-        # Reset fall detection too
-        if camera_states[cam_id]["fall_detector"]:
-            camera_states[cam_id]["fall_detector"].reset_fall()
-    logger.info(f"Reset all {len(camera_states)} cameras, cleared {total_persons} persons")
+    enforce_security(request, require_auth=True)
+    with camera_states_lock:
+        camera_items = list(camera_states.items())
+
+    total_persons = 0
+    for cam_id, state in camera_items:
+        with state["lock"]:
+            total_persons += len(state["seen_ids"])
+            state["seen_ids"].clear()
+            state["tracks"].clear()
+            state["track_history"].clear()
+            state["next_id"] = 1
+            if state["fall_detector"]:
+                state["fall_detector"].reset_fall()
+
+    logger.info(f"Reset all {len(camera_items)} cameras, cleared {total_persons} persons")
     return {
         "status": "reset_all",
-        "cameras_reset": len(camera_states),
+        "cameras_reset": len(camera_items),
         "total_persons_cleared": total_persons
     }
 
 @app.post("/reset_fall/{camera_id}")
-def reset_fall_detection(camera_id: str):
+def reset_fall_detection(camera_id: str, request: Request):
     """Reset fall detection state for a specific camera"""
-    if camera_id in camera_states and camera_states[camera_id]["fall_detector"]:
-        state = camera_states[camera_id]
-        state["fall_detector"].reset_fall()
+    enforce_security(request, camera_id=camera_id, require_auth=True)
+    with camera_states_lock:
+        state = camera_states.get(camera_id)
+
+    if state and state["fall_detector"]:
+        with state["lock"]:
+            state["fall_detector"].reset_fall()
         logger.info(f"[{camera_id}] Fall detection state reset")
         return {
             "camera_id": camera_id,
@@ -1435,13 +1967,18 @@ def reset_fall_detection(camera_id: str):
         }
 
 @app.post("/reset_fall_all")
-def reset_fall_all():
+def reset_fall_all(request: Request):
     """Reset fall detection state for ALL cameras"""
+    enforce_security(request, require_auth=True)
     reset_count = 0
-    for cam_id, state in camera_states.items():
-        if state["fall_detector"]:
-            state["fall_detector"].reset_fall()
-            reset_count += 1
+    with camera_states_lock:
+        camera_items = list(camera_states.items())
+
+    for cam_id, state in camera_items:
+        with state["lock"]:
+            if state["fall_detector"]:
+                state["fall_detector"].reset_fall()
+                reset_count += 1
     logger.info(f"Fall detection state reset for {reset_count} camera(s)")
     return {
         "status": "fall_detection_reset_all",
@@ -1459,10 +1996,23 @@ async def startup_event():
     if ENABLE_UNDISTORT:
         load_calibration()
     
-    logger.info(f"✅ FastAPI app started on {SERVICE_HOST}:{SERVICE_PORT}")
+    logger.info(f"âœ… FastAPI app started on {SERVICE_HOST}:{SERVICE_PORT}")
     logger.info(f"Health check: http://{SERVICE_HOST}:{SERVICE_PORT}/health")
     logger.info(f"Inference: http://{SERVICE_HOST}:{SERVICE_PORT}/infer")
     logger.info(f"Status: http://{SERVICE_HOST}:{SERVICE_PORT}/status")
+    logger.info(f"Auth API key: {'ENABLED' if API_KEY_REQUIRED else 'DISABLED'}")
+    if API_KEY_REQUIRED:
+        logger.info("Protected endpoints require header: X-API-Key: <API_KEY>")
+    logger.info(f"Rate limit: {'ENABLED' if RATE_LIMIT_ENABLED else 'DISABLED'}")
+    if RATE_LIMIT_ENABLED:
+        logger.info(
+            f"Rate limit window={RATE_LIMIT_WINDOW_SECONDS}s ip={RATE_LIMIT_MAX_PER_IP}/window "
+            f"camera={RATE_LIMIT_MAX_PER_CAMERA}/window"
+        )
+    logger.info(f"HTTPS required: {'YES' if REQUIRE_HTTPS else 'NO'}")
+    logger.info(f"Direct TLS (uvicorn): {'ENABLED' if TLS_CERT_FILE and TLS_KEY_FILE else 'DISABLED'}")
+    if CORS_ALLOW_ORIGINS:
+        logger.info(f"CORS allow origins: {', '.join(CORS_ALLOW_ORIGINS)}")
     logger.info(f"Reset count for camera: POST http://{SERVICE_HOST}:{SERVICE_PORT}/reset/default")
     logger.info(f"Reset all cameras: POST http://{SERVICE_HOST}:{SERVICE_PORT}/reset_all")
     if ENABLE_FALL_DETECTION:
@@ -1472,19 +2022,32 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Called when service shuts down"""
-    logger.info("🛑 Service shutting down")
-    logger.info(f"Total requests: {request_counter}")
-    logger.info(f"Total errors: {error_counter}")
+    logger.info("Service shutting down")
+    total_requests, total_errors = get_counter_snapshot()
+    logger.info(f"Total requests: {total_requests}")
+    logger.info(f"Total errors: {total_errors}")
 
 # ============================
 # Main
 # ============================
 if __name__ == "__main__":
     logger.info(f"Starting service on {SERVICE_HOST}:{SERVICE_PORT}")
-    uvicorn.run(
-        app,
-        host=SERVICE_HOST,
-        port=SERVICE_PORT,
-        log_level="info",
-        access_log=True
-    )
+    uvicorn_kwargs: Dict[str, Any] = {
+        "app": app,
+        "host": SERVICE_HOST,
+        "port": SERVICE_PORT,
+        "log_level": "info",
+        "access_log": True,
+    }
+    if TLS_CERT_FILE and TLS_KEY_FILE:
+        uvicorn_kwargs["ssl_certfile"] = TLS_CERT_FILE
+        uvicorn_kwargs["ssl_keyfile"] = TLS_KEY_FILE
+        logger.info("Using direct TLS via uvicorn ssl_certfile/ssl_keyfile")
+    uvicorn.run(**uvicorn_kwargs)
+
+
+
+
+
+
+

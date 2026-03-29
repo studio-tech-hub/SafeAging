@@ -14,11 +14,19 @@ import sys
 import time
 import json
 import base64
+import os
 import requests
 from pathlib import Path
 
 # Service config
 SERVICE_URL = "http://127.0.0.1:18000"
+API_KEY = os.getenv("API_KEY", "").strip()
+
+def build_headers() -> dict:
+    headers = {}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    return headers
 
 def print_header(title):
     """Print a nice header"""
@@ -31,7 +39,7 @@ def test_health():
     print_header("Health Check")
     
     try:
-        response = requests.get(f"{SERVICE_URL}/health", timeout=5)
+        response = requests.get(f"{SERVICE_URL}/health", headers=build_headers(), timeout=5)
         print(f"Status Code: {response.status_code}")
         
         if response.status_code == 200:
@@ -57,7 +65,7 @@ def test_status():
     print_header("Service Status")
     
     try:
-        response = requests.get(f"{SERVICE_URL}/status", timeout=5)
+        response = requests.get(f"{SERVICE_URL}/status", headers=build_headers(), timeout=5)
         
         if response.status_code == 200:
             data = response.json()
@@ -121,6 +129,7 @@ def test_infer(image_path):
                 "image": b64,
                 "camera_id": "test_camera"
             },
+            headers=build_headers(),
             timeout=10
         )
         
