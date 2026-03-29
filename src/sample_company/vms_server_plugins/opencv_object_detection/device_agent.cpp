@@ -748,7 +748,7 @@ namespace sample_company
 
                 const auto objectMetadataPacket = makePtr<ObjectMetadataPacket>();
 
-                // --- PASS 1: đếm số person trong frame, gom trackId ---
+                // PASS 1: count persons in this frame.
                 m_currentPersons = 0;
                 std::set<nx::sdk::Uuid> framePersonIds;
 
@@ -761,11 +761,10 @@ namespace sample_company
                     }
                 }
 
-                // Cập nhật tập trackId đã từng xuất hiện (đếm không trùng)
+                // Keep unique-person tracking state for future analytics extensions.
                 m_seenPersonIds.insert(framePersonIds.begin(), framePersonIds.end());
-                const int totalUniquePersons = static_cast<int>(m_seenPersonIds.size());
 
-                // --- PASS 2: tạo ObjectMetadata + gắn attribute + caption ---
+                // PASS 2: build ObjectMetadata and bbox attributes.
                 for (const std::shared_ptr<Detection> &detection : detections)
                 {
                     auto objectMetadata = makePtr<ObjectMetadata>();
@@ -777,24 +776,14 @@ namespace sample_company
                     if (detection->classLabel == "person")
                     {
                         objectMetadata->setTypeId(kPersonObjectType);
-
-                        // 1) id từng người (trackId)
-                        objectMetadata->addAttribute(makePtr<Attribute>(
-                            IAttribute::Type::string,
-                            "yolov8_person_id",
-                            nx::sdk::UuidHelper::toStdString(detection->trackId)));
-
-                        // 2) số người đang có trong frame hiện tại
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::number,
-                            "yolov8_person_count_frame",
+                            "Count Detect",
                             std::to_string(m_currentPersons)));
-
-                        // 3) tổng số người khác nhau đã đi qua (đếm không trùng)
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::number,
-                            "yolov8_person_count_unique",
-                            std::to_string(totalUniquePersons)));
+                            "Fall Detect",
+                            "0"));
                     }
                     else if (detection->classLabel == "cat")
                     {
@@ -811,7 +800,6 @@ namespace sample_company
                 objectMetadataPacket->setTimestampUs(timestampUs);
                 return objectMetadataPacket;
             }
-
             void DeviceAgent::reinitializeObjectTrackerOnFrameSizeChanges(const Frame &frame)
             {
                 const bool frameSizeUnset = m_previousFrameWidth == 0 && m_previousFrameHeight == 0;
@@ -928,3 +916,6 @@ namespace sample_company
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins
 } // namespace sample_company
+
+
+
