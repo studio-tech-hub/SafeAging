@@ -1,67 +1,3 @@
-﻿Tmhung
-tmhung3404
-Online
-
-Lê Dũng — 3/22/26, 9:53 PM
-D:\sdk\metadata_sdk
-Tmhung — 3/22/26, 9:54 PM
-metavms-metadata_sdk-6.0.6.41837-universal
-Lê Dũng — 3/22/26, 9:56 PM
-D:\metavms-metadata_sdk-6.0.6.41837-universal\metadata_sdk
-Tmhung — 3/22/26, 9:57 PM
-cd D:\Part-time\SafeAgingV2\SafeAging
-$env:NX_METADATA_SDK_DIR="D:\metavms-metadata_sdk-6.0.6.41837-universal\metadata_sdk"
-.\tools\build_plugin_windows.ps1 
--NxMetadataSdkDir "D:\metavms-metadata_sdk-6.0.6.41837-universal\metadata_sdk" -VcvarsVersion "14.29.30133"
-Lê Dũng — 3/22/26, 10:23 PM
-Viết docs cách build và cài plugin cho nx meta giúp Dũng (viết full luôn nha, đầy đủ từ cách cài conan, tới cách down và set visual installer, và gửi mấy câu lệnh để build + chỉ luôn cái metavms-metadata_sdk-6.0.6.41837-universal)
-Check manifest.json, oke thì gửi dũng
-goodboy — 3/22/26, 10:57 PM
-Build đồ ngon hết chưa
-Chạy êm chưa
-Tmhung — Yesterday at 12:34 AM
-Image
-Lê Dũng — Yesterday at 4:39 PM
-Attachment file type: unknown
-yolov8_people_analytics_plugin.dll
-5.41 MB
-{
-    "id": "mycompany.yolov8_people_analytics",
-    "name": "YOLOv8 People Analytics",
-    "description": "Analytics plugin using YOLOv8 model for people detection and tracking.",
-    "version": "1.0.0",
-    "vendor": "HumanCounterV8",
-
-manifest.json
-3 KB
-Lê Dũng — 4:39 PM
-// device_agent.cpp
-// Copyright 2018-present Network Optix, Inc.
-// Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
-
-#include "device_agent.h"
-#include <set>
-
-device_agent.cpp
-42 KB
-// device_agent.h
-// Copyright 2018-present Network Optix, Inc.
-// Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
-
-#pragma once
-
-device_agent.h
-8 KB
-#include "object_detector.h"
-#include "exceptions.h"
-#include "frame.h"
-#include "logging_utils.h"
-
-#ifdef _MSC_VER
-
-object_detector.cpp
-49 KB
-﻿
 // device_agent.cpp
 // Copyright 2018-present Network Optix, Inc.
 // Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
@@ -72,6 +8,7 @@ object_detector.cpp
 #include <chrono>
 #include <exception>
 #include <cctype>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -106,6 +43,10 @@ namespace sample_company
             using namespace std::string_literals;
 
             namespace {
+                int renderTrackHoldMs(int targetEnqueueFps)
+                {
+                    return std::clamp(1800 / std::max(1, targetEnqueueFps), 220, 420);
+                }
 
                 template<typename T, typename = void>
                 struct HasNameMethod: std::false_type {};
@@ -197,6 +138,9 @@ namespace sample_company
                 logutil::log(
                     logutil::Level::info,
                     "DeviceAgent camera_name=\"" + m_cameraName + "\"");
+                logutil::log(
+                    logutil::Level::info,
+                    "Plugin log file: " + logutil::configuredLogFilePath());
             }
 
             DeviceAgent::~DeviceAgent()
@@ -254,6 +198,79 @@ namespace sample_company
 )json";
             }
 
+            void DeviceAgent::updateRenderedTrackState(const DetectionList& detections)
+            {
+                std::unique_lock<std::mutex> lk(m_renderStateMutex);
+                const auto now = std::chrono::steady_clock::now();
+                const int targetEnqueueFps = std::max(
+                    1, m_targetEnqueueFps.load(std::memory_order_relaxed));
+                const auto holdWindow = std::chrono::milliseconds(renderTrackHoldMs(targetEnqueueFps));
+
+                for (const auto& detection: detections)
+                {
+                    if (!detection)
+                        continue;
+
+                    m_renderedTrackStates[detection->trackId] = RenderedDetectionState{
+                        detection,
+                        now};
+                }
+
+                for (auto it = m_renderedTrackStates.begin(); it != m_renderedTrackStates.end();)
+                {
+                    if (now - it->second.lastSeen > holdWindow)
+                        it = m_renderedTrackStates.erase(it);
+                    else
+                        ++it;
+                }
+
+                if (!detections.empty() || !m_renderedTrackStates.empty())
+                    m_lastRenderedTrackStateUpdateTime = now;
+            }
+
+            Ptr<ObjectMetadataPacket> DeviceAgent::renderCurrentObjectMetadataPacket(
+                int64_t timestampUs)
+            {
+                DetectionList detections;
+                {
+                    std::unique_lock<std::mutex> lk(m_renderStateMutex);
+                    if (m_lastRenderedTrackStateUpdateTime ==
+                        std::chrono::steady_clock::time_point::min())
+                    {
+                        return nullptr;
+                    }
+
+                    const int targetEnqueueFps = std::max(
+                        1, m_targetEnqueueFps.load(std::memory_order_relaxed));
+                    const int ttlMs = renderTrackHoldMs(targetEnqueueFps);
+                    if (std::chrono::steady_clock::now() - m_lastRenderedTrackStateUpdateTime >
+                        std::chrono::milliseconds(ttlMs))
+                    {
+                        return nullptr;
+                    }
+
+                    const auto now = std::chrono::steady_clock::now();
+                    for (auto it = m_renderedTrackStates.begin(); it != m_renderedTrackStates.end();)
+                    {
+                        if (now - it->second.lastSeen > std::chrono::milliseconds(ttlMs))
+                        {
+                            it = m_renderedTrackStates.erase(it);
+                            continue;
+                        }
+
+                        const auto& state = it->second;
+                        if (state.detection)
+                            detections.push_back(state.detection);
+                        ++it;
+                    }
+                }
+
+                if (detections.empty())
+                    return nullptr;
+
+                return detectionsToObjectMetadataPacket(detections, timestampUs);
+            }
+
             bool DeviceAgent::pushUncompressedVideoFrame(const IUncompressedVideoFrame* videoFrame)
             {
                 if (!videoFrame)
@@ -283,10 +300,31 @@ namespace sample_company
                 const size_t frameQueueMaxSize = std::max<size_t>(
                     1, m_frameQueueMaxSize.load(std::memory_order_relaxed));
 
-                bool shouldEnqueue = (m_frameIndex % detectionFramePeriod == 0);
-                if (shouldEnqueue && targetEnqueueFps > 0)
+                bool hasActiveRenderedTracks = false;
                 {
-                    const auto minIntervalMs = std::chrono::milliseconds(1000 / targetEnqueueFps);
+                    std::unique_lock<std::mutex> lk(m_renderStateMutex);
+                    if (!m_renderedTrackStates.empty() &&
+                        m_lastRenderedTrackStateUpdateTime !=
+                            std::chrono::steady_clock::time_point::min())
+                    {
+                        const int ttlMs = renderTrackHoldMs(targetEnqueueFps);
+                        hasActiveRenderedTracks =
+                            now - m_lastRenderedTrackStateUpdateTime <=
+                            std::chrono::milliseconds(ttlMs);
+                    }
+                }
+
+                const int effectiveTargetEnqueueFps = hasActiveRenderedTracks
+                    ? targetEnqueueFps
+                    : std::max(targetEnqueueFps, kAcquireBoostEnqueueFps);
+                m_lastEffectiveEnqueueFps.store(
+                    effectiveTargetEnqueueFps, std::memory_order_relaxed);
+
+                bool shouldEnqueue = (m_frameIndex % detectionFramePeriod == 0);
+                if (shouldEnqueue && effectiveTargetEnqueueFps > 0)
+                {
+                    const auto minIntervalMs =
+                        std::chrono::milliseconds(1000 / effectiveTargetEnqueueFps);
                     if (m_lastEnqueueTime != std::chrono::steady_clock::time_point::min() &&
                         now - m_lastEnqueueTime < minIntervalMs)
                     {
@@ -304,6 +342,7 @@ namespace sample_company
 
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
+                        job.frame = std::make_shared<Frame>(frame);
                         job.cameraId = m_cameraName;
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
@@ -365,6 +404,13 @@ namespace sample_company
                     }
                 }
 
+                {
+                    const auto objectMetadataPacket =
+                        renderCurrentObjectMetadataPacket(videoFrame->timestampUs());
+                    std::unique_lock<std::mutex> lk(m_metadataQueueMutex);
+                    m_latestObjectMetadataPacket = objectMetadataPacket;
+                }
+
                 const int metricsLogPeriodSec = std::max(
                     1, m_metricsLogPeriodSec.load(std::memory_order_relaxed));
                 if (now - m_lastMetricsLogTime >= std::chrono::seconds(metricsLogPeriodSec))
@@ -400,6 +446,8 @@ namespace sample_company
                             ", drop=" + std::to_string(deltaDropped) +
                             ", queue=" + std::to_string(queueLen) +
                             ", max_depth=" + std::to_string(maxDepth) +
+                            ", effective_enqueue_fps=" +
+                            std::to_string(m_lastEffectiveEnqueueFps.load(std::memory_order_relaxed)) +
                             ", avg_infer_ms=" + std::to_string(avgInferMs));
 
                     if (m_lastMetricsDiagTime == std::chrono::steady_clock::time_point::min() ||
@@ -411,6 +459,8 @@ namespace sample_company
                             ", dropped=" + std::to_string(deltaDropped) +
                             ", queue=" + std::to_string(queueLen) +
                             ", max_depth=" + std::to_string(maxDepth) +
+                            ", effective_enqueue_fps=" +
+                            std::to_string(m_lastEffectiveEnqueueFps.load(std::memory_order_relaxed)) +
                             ", avg_infer_ms=" + std::to_string(avgInferMs);
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::info,
@@ -434,6 +484,8 @@ namespace sample_company
                 std::vector<nx::sdk::analytics::IMetadataPacket *> *metadataPackets)
             {
                 std::unique_lock<std::mutex> lk(m_metadataQueueMutex);
+                if (m_latestObjectMetadataPacket)
+                    metadataPackets->push_back(m_latestObjectMetadataPacket.releasePtr());
                 while (!m_metadataQueue.empty())
                 {
                     metadataPackets->push_back(m_metadataQueue.front().releasePtr());
@@ -444,23 +496,41 @@ namespace sample_company
 
             nx::sdk::Result<const nx::sdk::ISettingsResponse*> DeviceAgent::settingsReceived()
             {
+                const std::string rawDetectionPeriod = settingValue("detection_frame_period");
+                const std::string rawEnqueueFps = settingValue("target_enqueue_fps");
+                const std::string rawQueueMax = settingValue("frame_queue_max_size");
+                const std::string rawMetricsPeriod = settingValue("metrics_log_period_sec");
+
+                const auto printableSettingValue = [](const std::string& value)
+                {
+                    return value.empty() ? std::string("<empty>") : value;
+                };
+
+                logutil::log(
+                    logutil::Level::info,
+                    "Raw settings from Nx: detection_frame_period=" +
+                        printableSettingValue(rawDetectionPeriod) +
+                        ", target_enqueue_fps=" + printableSettingValue(rawEnqueueFps) +
+                        ", frame_queue_max_size=" + printableSettingValue(rawQueueMax) +
+                        ", metrics_log_period_sec=" + printableSettingValue(rawMetricsPeriod));
+
                 const int detectionPeriod = parseIntSettingValue(
-                    settingValue("detection_frame_period"),
+                    rawDetectionPeriod,
                     kDefaultDetectionFramePeriod,
                     1,
                     60);
                 const int enqueueFps = parseIntSettingValue(
-                    settingValue("target_enqueue_fps"),
+                    rawEnqueueFps,
                     kDefaultTargetEnqueueFps,
                     1,
                     60);
                 const int queueMax = parseIntSettingValue(
-                    settingValue("frame_queue_max_size"),
+                    rawQueueMax,
                     static_cast<int>(kDefaultFrameQueueMaxSize),
                     1,
                     100);
                 const int metricsPeriod = parseIntSettingValue(
-                    settingValue("metrics_log_period_sec"),
+                    rawMetricsPeriod,
                     kDefaultMetricsLogPeriodSec,
                     1,
                     300);
@@ -615,15 +685,27 @@ namespace sample_company
 
                 try
                 {
+                    if (!job.frame)
+                        throw std::runtime_error("FrameJob is missing frame data for tracking");
+
+                    reinitializeObjectTrackerOnFrameSizeChanges(*job.frame);
+
                     // Call Python AI service with JPEG bytes
                     DetectionList detections = m_objectDetector->run(job.cameraId, job.jpegBytes);
 
-                    // Create ObjectMetadata for bboxes
-                    const auto &objectMetadataPacket =
-                        detectionsToObjectMetadataPacket(detections, job.timestampUs);
+                    // The Python service is already the authoritative source for track_id and
+                    // smoothed bbox output. Rendering those detections directly avoids a second
+                    // tracker in the plugin from dropping boxes or reassigning IDs mid-stream.
+                    updateRenderedTrackState(detections);
 
-                    if (objectMetadataPacket)
-                        result.push_back(objectMetadataPacket);
+                    const auto trackingResult = m_objectTracker->run(*job.frame, detections);
+
+                    const auto trackerEventPackets =
+                        eventsToEventMetadataPacketList(trackingResult.events, job.timestampUs);
+                    result.insert(
+                        result.end(),
+                        std::make_move_iterator(trackerEventPackets.begin()),
+                        std::make_move_iterator(trackerEventPackets.end()));
 
                     // Emit state-dependent person presence event (start/finish).
                     bool hasPerson = false;
@@ -914,15 +996,15 @@ namespace sample_company
                     // 1) Gọi Python service -> lấy detections đã có track_id
                     std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
                     DetectionList detections = m_objectDetector->run(m_cameraName, jpegBytes);
+                    const auto trackingResult = m_objectTracker->run(frame, detections);
 
                     // 2) Dùng trực tiếp detections từ Python để tạo ObjectMetadata
                     const auto &objectMetadataPacket =
-                        detectionsToObjectMetadataPacket(detections, frame.timestampUs);
+                        detectionsToObjectMetadataPacket(trackingResult.detections, frame.timestampUs);
 
                     // 3) Không còn events từ tracking, nên truyền EventList rỗng
-                    EventList emptyEvents;
                     const auto &eventMetadataPacketList =
-                        eventsToEventMetadataPacketList(emptyEvents, frame.timestampUs);
+                        eventsToEventMetadataPacketList(trackingResult.events, frame.timestampUs);
 
                     MetadataPacketList result;
                     if (objectMetadataPacket)
@@ -980,8 +1062,3 @@ namespace sample_company
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins
 } // namespace sample_company
-
-
-
-device_agent.cpp
-42 KB

@@ -38,7 +38,7 @@ param(
     [string]$VcvarsVersion = "14.29.30133",
 
     [Parameter(Mandatory = $false)]
-    [string]$VsVcvarsPath = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+    [string]$VsVcvarsPath = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
 
     [Parameter(Mandatory = $false)]
     [string]$CmakePath,

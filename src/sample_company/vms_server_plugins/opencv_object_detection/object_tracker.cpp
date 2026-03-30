@@ -164,7 +164,7 @@ void ObjectTracker::copyDetectionsHistoryToTrack(
         std::shared_ptr<const DetectionInternal> detection = convertTrackedObjectToDetection(
             /*frame*/ frame,
             /*trackedDetection*/ trackedDetection,
-            /*classLabel*/ classLabel,
+            /*detectionMetadata*/ TrackedDetectionMetadata{classLabel, false},
             /*idMapper*/ m_idMapper.get());
         track->addDetection(
             /*timestampUs*/ (int64_t) trackedDetection.timestamp,
@@ -271,16 +271,16 @@ ObjectTracker::Result ObjectTracker::runImpl(
     const Frame& frame,
     const DetectionList& detections)
 {
-    // Unfortunately the OpenCV tbm module does not support preserving classLabel during tracking.
+    // Unfortunately the OpenCV tbm module does not preserve our per-detection metadata.
     // See issue: https://github.com/opencv/opencv_contrib/issues/2298
-    // Therefore, we save information about classLabels in the map from unique id of the detection
-    // (bounding box + timestamp) to classLabel.
-    std::map<const CompositeDetectionId, std::string> classLabels;
+    // Therefore, we save metadata in a map from unique id of the detection
+    // (bounding box + timestamp) to the fields we need to restore after tracking.
+    DetectionMetadataMap detectionMetadataMap;
 
     TrackedObjects detectionsToTrack = convertDetectionsToTrackedObjects(
         /*frame*/ frame,
         /*detections*/ detections,
-        /*classLabels*/ &classLabels);
+        /*inOutDetectionMetadata*/ &detectionMetadataMap);
 
     // Perform tracking and extract tracked detections.
     m_tracker->process(frame.cvMat, detectionsToTrack, (uint64_t) frame.timestampUs);
@@ -290,7 +290,7 @@ ObjectTracker::Result ObjectTracker::runImpl(
         convertTrackedObjectsToDetections(
         /*frame*/ frame,
         /*trackedDetections*/ trackedDetections,
-        /*classLabels*/ classLabels,
+        /*detectionMetadataMap*/ detectionMetadataMap,
         /*idMapper*/ m_idMapper.get());
 
     EventList events = generateEvents(

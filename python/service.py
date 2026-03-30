@@ -130,37 +130,53 @@ class AppConfig:
         self.service_port = _env_int("SERVICE_PORT", 18000)
         self.service_host = os.getenv("SERVICE_HOST", "127.0.0.1")
         self.model_path = os.getenv("MODEL_PATH", "yolov8n.pt")
-        self.confidence_threshold = _clamp(_env_float("CONFIDENCE_THRESHOLD", 0.20), 0.0, 1.0, "CONFIDENCE_THRESHOLD")
+        self.confidence_threshold = _clamp(_env_float("CONFIDENCE_THRESHOLD", 0.35), 0.0, 1.0, "CONFIDENCE_THRESHOLD")  # FIXED: Was 0.15 → Industry standard 0.35
         self.iou_threshold = _clamp(_env_float("IOU_THRESHOLD", 0.45), 0.0, 1.0, "IOU_THRESHOLD")
         self.min_detection_area = max(1, _env_int("MIN_DETECTION_AREA", 20))
+        self.person_min_hw_ratio = _clamp(
+            _env_float("PERSON_MIN_HW_RATIO", 0.80), 0.1, 10.0, "PERSON_MIN_HW_RATIO"
+        )
         self.track_ttl = max(1.0, _env_float("TRACK_TTL", 15.0))
         self.ioa_threshold = _clamp(_env_float("IOA_THRESHOLD", 0.05), 0.0, 1.0, "IOA_THRESHOLD")
-        self.flicker_reuse_time = max(0.0, _env_float("FLICKER_REUSE_TIME", 1.0))
+        # Keep only a very short reuse window. The service is already fast enough that
+        # longer reuse makes bbox disappearance feel sticky and late.
+        self.flicker_reuse_time = max(0.0, _env_float("FLICKER_REUSE_TIME", 0.25))
 
         # Defaults fixed for your workflow: run service directly without env setup.
-        self.bbox_smoothing = _clamp(_env_float("BBOX_SMOOTHING", 0.6), 0.0, 1.0, "BBOX_SMOOTHING")
+        self.bbox_smoothing = _clamp(_env_float("BBOX_SMOOTHING", 0.35), 0.0, 1.0, "BBOX_SMOOTHING")
         self.enable_post_nms = _env_bool("ENABLE_POST_NMS", True)
         self.post_nms_iou = _clamp(_env_float("POST_NMS_IOU", 0.6), 0.0, 1.0, "POST_NMS_IOU")
         self.match_iou_threshold = _clamp(_env_float("MATCH_IOU_THRESHOLD", 0.20), 0.0, 1.0, "MATCH_IOU_THRESHOLD")
         self.max_center_distance_ratio = _clamp(
             _env_float("MAX_CENTER_DISTANCE_RATIO", 1.2), 0.1, 10.0, "MAX_CENTER_DISTANCE_RATIO"
         )
+        # Keep track creation threshold aligned with YOLO confidence by default.
         self.new_track_min_confidence = _clamp(
-            _env_float("NEW_TRACK_MIN_CONFIDENCE", 0.35), 0.0, 1.0, "NEW_TRACK_MIN_CONFIDENCE"
+            _env_float("NEW_TRACK_MIN_CONFIDENCE", self.confidence_threshold),
+            0.0,
+            1.0,
+            "NEW_TRACK_MIN_CONFIDENCE"
         )
         self.track_duplicate_iou = _clamp(
             _env_float("TRACK_DUPLICATE_IOU", 0.65), 0.0, 1.0, "TRACK_DUPLICATE_IOU"
         )
-        self.track_output_hold_time = max(0.0, _env_float("TRACK_OUTPUT_HOLD_TIME", 0.8))
-        self.enable_history_rematch = _env_bool("ENABLE_HISTORY_REMATCH", False)
-        self.max_match_age = max(0.0, _env_float("MAX_MATCH_AGE", 0.8))
-        self.track_min_hits = max(1, _env_int("TRACK_MIN_HITS", 2))
+        self.track_output_hold_time = max(0.0, _env_float("TRACK_OUTPUT_HOLD_TIME", 0.5))
+        self.enable_history_rematch = _env_bool("ENABLE_HISTORY_REMATCH", True)
+        # Match age must be longer than real-world inference cadence; otherwise every slow frame
+        # spawns new IDs and the downstream plugin sees heavy bbox flicker.
+        default_match_age = max(self.track_output_hold_time, 2.5)
+        self.max_match_age = max(0.0, _env_float("MAX_MATCH_AGE", default_match_age))
+        self.track_min_hits = max(1, _env_int("TRACK_MIN_HITS", 1))
+        self.unique_count_min_hits = max(
+            1,
+            _env_int("UNIQUE_COUNT_MIN_HITS", max(3, self.track_min_hits))
+        )
         self.track_max_misses = max(1, _env_int("TRACK_MAX_MISSES", 6))
         self.tentative_max_misses = max(0, _env_int("TENTATIVE_MAX_MISSES", 1))
         self.track_match_min_score = _clamp(
             _env_float("TRACK_MATCH_MIN_SCORE", 0.25), 0.0, 1.0, "TRACK_MATCH_MIN_SCORE"
         )
-        self.output_tentative_tracks = _env_bool("OUTPUT_TENTATIVE_TRACKS", False)
+        self.output_tentative_tracks = _env_bool("OUTPUT_TENTATIVE_TRACKS", True)
         self.output_dedupe_iou = _clamp(_env_float("OUTPUT_DEDUPE_IOU", 0.55), 0.0, 1.0, "OUTPUT_DEDUPE_IOU")
         self.hold_suppress_iou = _clamp(_env_float("HOLD_SUPPRESS_IOU", 0.4), 0.0, 1.0, "HOLD_SUPPRESS_IOU")
 
@@ -170,8 +186,8 @@ class AppConfig:
         self.fall_aspect_ratio_threshold = max(0.0, _env_float("FALL_ASPECT_RATIO_THRESHOLD", 1.5))
         self.fall_confidence_threshold = _clamp(_env_float("FALL_CONFIDENCE_THRESHOLD", 0.8), 0.0, 1.0, "FALL_CONFIDENCE_THRESHOLD")
 
-        self.enable_clahe = _env_bool("ENABLE_CLAHE", True)
-        self.enable_multi_scale = _env_bool("ENABLE_MULTI_SCALE", True)
+        self.enable_clahe = _env_bool("ENABLE_CLAHE", False)  # FIXED: Was True → Disable to speed up (was bottleneck!)
+        self.enable_multi_scale = _env_bool("ENABLE_MULTI_SCALE", False)  # FIXED: Was True → Disable to speed up (was bottleneck!)
         self.enable_frame_enhancement = _env_bool("ENABLE_FRAME_ENHANCEMENT", False)
         self.clahe_clip_limit = max(0.1, _env_float("CLAHE_CLIP_LIMIT", 2.0))
         self.clahe_tile_size = max(2, _env_int("CLAHE_TILE_SIZE", 16))
@@ -224,8 +240,9 @@ class AppConfig:
             self.tls_key_file = ""
         self.rate_limit_enabled = _env_bool("RATE_LIMIT_ENABLED", True)
         self.rate_limit_window_seconds = max(1, _env_int("RATE_LIMIT_WINDOW_SECONDS", 60))
-        self.rate_limit_max_per_ip = max(1, _env_int("RATE_LIMIT_MAX_PER_IP", 120))
-        self.rate_limit_max_per_camera = max(1, _env_int("RATE_LIMIT_MAX_PER_CAMERA", 60))
+        self.rate_limit_max_per_ip = max(1, _env_int("RATE_LIMIT_MAX_PER_IP", 600))
+        self.rate_limit_max_per_camera = max(1, _env_int("RATE_LIMIT_MAX_PER_CAMERA", 300))
+        self.rate_limit_skip_loopback = _env_bool("RATE_LIMIT_SKIP_LOOPBACK", True)
         cors_raw = os.getenv("CORS_ALLOW_ORIGINS", "")
         self.cors_allow_origins = [v.strip() for v in cors_raw.split(",") if v.strip()]
 
@@ -240,6 +257,7 @@ MODEL_PATH = CONFIG.model_path
 CONFIDENCE_THRESHOLD = CONFIG.confidence_threshold
 IOU_THRESHOLD = CONFIG.iou_threshold
 MIN_DETECTION_AREA = CONFIG.min_detection_area
+PERSON_MIN_HW_RATIO = CONFIG.person_min_hw_ratio
 TRACK_TTL = CONFIG.track_ttl
 IOA_THRESHOLD = CONFIG.ioa_threshold
 FLICKER_REUSE_TIME = CONFIG.flicker_reuse_time
@@ -254,6 +272,7 @@ TRACK_OUTPUT_HOLD_TIME = CONFIG.track_output_hold_time
 ENABLE_HISTORY_REMATCH = CONFIG.enable_history_rematch
 MAX_MATCH_AGE = CONFIG.max_match_age
 TRACK_MIN_HITS = CONFIG.track_min_hits
+UNIQUE_COUNT_MIN_HITS = CONFIG.unique_count_min_hits
 TRACK_MAX_MISSES = CONFIG.track_max_misses
 TENTATIVE_MAX_MISSES = CONFIG.tentative_max_misses
 TRACK_MATCH_MIN_SCORE = CONFIG.track_match_min_score
@@ -295,6 +314,7 @@ RATE_LIMIT_ENABLED = CONFIG.rate_limit_enabled
 RATE_LIMIT_WINDOW_SECONDS = CONFIG.rate_limit_window_seconds
 RATE_LIMIT_MAX_PER_IP = CONFIG.rate_limit_max_per_ip
 RATE_LIMIT_MAX_PER_CAMERA = CONFIG.rate_limit_max_per_camera
+RATE_LIMIT_SKIP_LOOPBACK = CONFIG.rate_limit_skip_loopback
 CORS_ALLOW_ORIGINS = CONFIG.cors_allow_origins
 
 if DEVICE.startswith("cuda"):
@@ -315,6 +335,7 @@ logger.info(f"Host: {SERVICE_HOST}")
 logger.info(f"Model: {MODEL_PATH}")
 logger.info(f"Confidence: {CONFIDENCE_THRESHOLD}")
 logger.info(f"IOU: {IOU_THRESHOLD}")
+logger.info(f"Person min h/w ratio: {PERSON_MIN_HW_RATIO}")
 logger.info(f"ImgSize: {YOLO_IMGSZ}")
 logger.info(f"Device: {DEVICE} | FP16: {USE_HALF}")
 logger.info(f"="*60)
@@ -329,6 +350,7 @@ logger.info(
     f"match_iou={MATCH_IOU_THRESHOLD} dup_iou={TRACK_DUPLICATE_IOU} "
     f"hold={TRACK_OUTPUT_HOLD_TIME}s match_age={MAX_MATCH_AGE}s "
     f"min_hits={TRACK_MIN_HITS} max_misses={TRACK_MAX_MISSES} "
+    f"unique_min_hits={UNIQUE_COUNT_MIN_HITS} "
     f"tentative_misses={TENTATIVE_MAX_MISSES} min_match_score={TRACK_MATCH_MIN_SCORE} "
     f"out_tentative={OUTPUT_TENTATIVE_TRACKS} "
     f"out_dedupe_iou={OUTPUT_DEDUPE_IOU} hold_suppress_iou={HOLD_SUPPRESS_IOU} "
@@ -861,6 +883,10 @@ def _get_client_ip(request: Request) -> str:
         return xff.split(",")[0].strip()
     return request.client.host if request.client and request.client.host else "unknown"
 
+def _is_loopback_ip(ip: str) -> bool:
+    normalized = (ip or "").strip().lower()
+    return normalized in {"127.0.0.1", "::1", "localhost"}
+
 def _extract_api_token(request: Request) -> str:
     api_key_header = request.headers.get("x-api-key", "").strip()
     if api_key_header:
@@ -886,6 +912,9 @@ def _enforce_rate_limit(request: Request, camera_id: Optional[str] = None) -> No
     now_ts = time.time()
     cutoff = now_ts - RATE_LIMIT_WINDOW_SECONDS
     client_ip = _get_client_ip(request)
+
+    if RATE_LIMIT_SKIP_LOOPBACK and _is_loopback_ip(client_ip):
+        return
 
     with rate_limit_lock:
         ip_bucket = ip_request_buckets[client_ip]
@@ -1026,18 +1055,22 @@ def smooth_bbox(
     new_bbox: tuple[float, float, float, float],
     alpha: float,
 ) -> tuple[float, float, float, float]:
-    """Exponential smoothing for bbox to reduce jitter (alpha = weight of new bbox)."""
+    """Exponential smoothing with adaptive responsiveness for moving targets."""
     if alpha <= 0.0:
         return old_bbox
     if alpha >= 1.0:
         return new_bbox
+
+    move_ratio = center_distance_ratio(old_bbox, new_bbox)
+    adaptive_alpha = min(0.97, alpha + min(0.50, move_ratio * 0.8))
+
     ox1, oy1, ox2, oy2 = old_bbox
     nx1, ny1, nx2, ny2 = new_bbox
     return (
-        ox1 * (1.0 - alpha) + nx1 * alpha,
-        oy1 * (1.0 - alpha) + ny1 * alpha,
-        ox2 * (1.0 - alpha) + nx2 * alpha,
-        oy2 * (1.0 - alpha) + ny2 * alpha,
+        ox1 * (1.0 - adaptive_alpha) + nx1 * adaptive_alpha,
+        oy1 * (1.0 - adaptive_alpha) + ny1 * adaptive_alpha,
+        ox2 * (1.0 - adaptive_alpha) + nx2 * adaptive_alpha,
+        oy2 * (1.0 - adaptive_alpha) + ny2 * adaptive_alpha,
     )
 
 def post_nms_dedupe(dets: List[Dict[str, Any]], iou_thresh: float) -> List[Dict[str, Any]]:
@@ -1072,7 +1105,7 @@ def has_duplicate_track_overlap(
 
 def predict_track_bbox(track: Dict[str, Any], now_ts: float) -> tuple[float, float, float, float]:
     """Predict next bbox from constant velocity model in xyxy space."""
-    bbox = track.get("bbox")
+    bbox = track.get("measurement_bbox") or track.get("bbox")
     if not bbox:
         return (0.0, 0.0, 0.0, 0.0)
 
@@ -1504,10 +1537,19 @@ def infer(req: InferRequest, request: Request):
                 w_box = x2 - x1
                 h_box = y2 - y1
                 area = w_box * h_box
+                hw_ratio = h_box / max(1.0, w_box)
 
                 # Filter by minimum area
                 if w_box <= 1.0 or h_box <= 1.0 or area < MIN_DETECTION_AREA:
                     logger.debug(f"[{camera_id}] Skipping small detection: {w_box:.1f}x{h_box:.1f} (area={area:.0f} < {MIN_DETECTION_AREA})")
+                    continue
+
+                # Reject furniture-like wide boxes that YOLO occasionally confuses as people.
+                if hw_ratio < PERSON_MIN_HW_RATIO:
+                    logger.debug(
+                        f"[{camera_id}] Skipping wide person-like detection: "
+                        f"{w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f} < {PERSON_MIN_HW_RATIO:.2f}"
+                    )
                     continue
 
                 det_box = (x1, y1, x2, y2)
@@ -1530,6 +1572,7 @@ def infer(req: InferRequest, request: Request):
             tr.setdefault("vy", 0.0)
             tr.setdefault("vw", 0.0)
             tr.setdefault("vh", 0.0)
+            tr.setdefault("measurement_bbox", tr.get("bbox"))
 
         matched_ids = set()
         output_track_ids = set()
@@ -1548,14 +1591,21 @@ def infer(req: InferRequest, request: Request):
                 continue
 
             prev_bbox = tr.get("bbox", det_box)
+            prev_measurement_bbox = tr.get("measurement_bbox", prev_bbox)
             if BBOX_SMOOTHING > 0.0 and tr.get("bbox"):
                 tr["bbox"] = smooth_bbox(prev_bbox, det_box, BBOX_SMOOTHING)
             else:
                 tr["bbox"] = det_box
 
-            update_track_motion(tr, prev_bbox=prev_bbox, new_bbox=tr["bbox"], now_ts=now)
+            update_track_motion(
+                tr,
+                prev_bbox=prev_measurement_bbox,
+                new_bbox=det_box,
+                now_ts=now
+            )
             tr["last_seen"] = now
             tr["appearance"] = det_appearance
+            tr["measurement_bbox"] = det_box
             tr["score"] = score
             tr["misses"] = 0
             tr["hits"] = int(tr.get("hits", 0)) + 1
@@ -1605,6 +1655,7 @@ def infer(req: InferRequest, request: Request):
                         track_by_id[track_id] = {
                             "id": track_id,
                             "bbox": det_box,
+                            "measurement_bbox": det_box,
                             "last_seen": now,
                             "created_at": best_hist.get("created_at", now),
                             "appearance": det_appearance,
@@ -1637,6 +1688,7 @@ def infer(req: InferRequest, request: Request):
                     track_by_id[track_id] = {
                         "id": track_id,
                         "bbox": det_box,
+                        "measurement_bbox": det_box,
                         "last_seen": now,
                         "created_at": now,
                         "appearance": det_appearance,
@@ -1700,6 +1752,88 @@ def infer(req: InferRequest, request: Request):
             ))
 
         detections = dedupe_output_tracks(detections, OUTPUT_DEDUPE_IOU)
+
+        if raw_dets and not detections:
+            best_score = max(det["score"] for det in raw_dets)
+            logger.warning(
+                f"[{camera_id}] YOLO raw persons={len(raw_dets)} but output detections=0 "
+                f"(best_score={best_score:.2f}, track_min_hits={TRACK_MIN_HITS}, "
+                f"output_tentative={OUTPUT_TENTATIVE_TRACKS}, "
+                f"new_track_min_confidence={NEW_TRACK_MIN_CONFIDENCE:.2f})"
+            )
+
+            # Plugin-local tracking is now authoritative for bbox continuity. If the service-side
+            # tracker filters everything out but YOLO still sees a person, fall back to raw YOLO
+            # boxes so Nx still receives a usable person bbox.
+            fallback_detections: List[Detection] = []
+            used_track_ids: set[int] = set()
+            reuse_window_sec = max(TRACK_OUTPUT_HOLD_TIME, 0.5)
+
+            for det in sorted(raw_dets, key=lambda item: item["score"], reverse=True):
+                det_box = det["bbox"]
+                best_track_id = None
+                best_iou_score = 0.0
+
+                for tr in track_by_id.values():
+                    if tr["id"] in used_track_ids:
+                        continue
+                    if now - tr.get("last_seen", 0.0) > reuse_window_sec:
+                        continue
+
+                    overlap = iou(det_box, tr["bbox"])
+                    if overlap > best_iou_score:
+                        best_iou_score = overlap
+                        best_track_id = int(tr["id"])
+
+                if best_track_id is None or best_iou_score < 0.10:
+                    best_track_id = next_id
+                    next_id += 1
+                    track_by_id[best_track_id] = {
+                        "id": best_track_id,
+                        "bbox": det_box,
+                        "measurement_bbox": det_box,
+                        "last_seen": now,
+                        "created_at": now,
+                        "appearance": None,
+                        "score": det["score"],
+                        "status": "tentative",
+                        "hits": 1,
+                        "misses": 0,
+                        "vx": 0.0,
+                        "vy": 0.0,
+                        "vw": 0.0,
+                        "vh": 0.0,
+                    }
+                else:
+                    tr = track_by_id[best_track_id]
+                    tr["bbox"] = det_box
+                    tr["measurement_bbox"] = det_box
+                    tr["last_seen"] = now
+                    tr["score"] = det["score"]
+                    tr["misses"] = 0
+                    if tr.get("status") == "lost":
+                        tr["status"] = "tentative"
+                    track_by_id[best_track_id] = tr
+
+                used_track_ids.add(best_track_id)
+
+                x1, y1, x2, y2 = det_box
+                fallback_detections.append(Detection(
+                    cls="person",
+                    score=float(det["score"]),
+                    x=float(x1),
+                    y=float(y1),
+                    w=float(max(0.0, x2 - x1)),
+                    h=float(max(0.0, y2 - y1)),
+                    track_id=int(best_track_id)
+                ))
+
+            if fallback_detections:
+                detections = fallback_detections
+                logger.warning(
+                    f"[{camera_id}] Fallback to raw YOLO detections for plugin continuity: "
+                    f"{len(detections)} person(s)"
+                )
 
         # ============================================
         # 3.2) Fall Detection (NEW)
@@ -1799,8 +1933,14 @@ def infer(req: InferRequest, request: Request):
             # ============================================
             # 6) Count tracking
             # ============================================
-            ids = {d.track_id for d in detections}
-            state["seen_ids"].update(ids)
+            stable_unique_ids = {
+                int(track_id)
+                for track_id in output_track_ids
+                if track_id in track_by_id
+                and track_by_id[track_id].get("status") == "confirmed"
+                and int(track_by_id[track_id].get("hits", 0)) >= UNIQUE_COUNT_MIN_HITS
+            }
+            state["seen_ids"].update(stable_unique_ids)
 
             inference_time = time.time() - start_time
             state["inference_times"].append(inference_time)
@@ -2009,6 +2149,7 @@ async def startup_event():
             f"Rate limit window={RATE_LIMIT_WINDOW_SECONDS}s ip={RATE_LIMIT_MAX_PER_IP}/window "
             f"camera={RATE_LIMIT_MAX_PER_CAMERA}/window"
         )
+        logger.info(f"Rate limit skip loopback: {'YES' if RATE_LIMIT_SKIP_LOOPBACK else 'NO'}")
     logger.info(f"HTTPS required: {'YES' if REQUIRE_HTTPS else 'NO'}")
     logger.info(f"Direct TLS (uvicorn): {'ENABLED' if TLS_CERT_FILE and TLS_KEY_FILE else 'DISABLED'}")
     if CORS_ALLOW_ORIGINS:

@@ -4,9 +4,15 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 
 namespace sample_company {
@@ -66,12 +72,97 @@ inline bool shouldLog(Level level)
     return static_cast<int>(level) >= static_cast<int>(configuredLevel());
 }
 
+inline std::mutex& sinkMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+inline std::string configuredLogFilePath()
+{
+    static const std::string path = []()
+    {
+        const char* env = std::getenv("SAFEAGING_LOG_FILE");
+        if (env && *env)
+            return std::string(env);
+
+#ifdef _WIN32
+        return std::string(R"(D:\SafeAging\logs\plugin.log)");
+#else
+        return std::string("/tmp/safeaging_plugin.log");
+#endif
+    }();
+
+    return path;
+}
+
+inline std::string makeTimestamp()
+{
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t time = std::chrono::system_clock::to_time_t(now);
+
+    std::tm localTime{};
+#ifdef _WIN32
+    localtime_s(&localTime, &time);
+#else
+    localtime_r(&time, &localTime);
+#endif
+
+    std::ostringstream stream;
+    stream << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S");
+    return stream.str();
+}
+
+inline void appendToLogFileUnlocked(const std::string& line)
+{
+    struct FileSink
+    {
+        std::ofstream stream;
+        bool initialized = false;
+        bool available = false;
+        bool warned = false;
+    };
+
+    static FileSink sink;
+    if (!sink.initialized)
+    {
+        sink.initialized = true;
+
+        const std::filesystem::path logPath(configuredLogFilePath());
+        std::error_code ec;
+        if (logPath.has_parent_path())
+            std::filesystem::create_directories(logPath.parent_path(), ec);
+
+        sink.stream.open(logPath, std::ios::app);
+        sink.available = sink.stream.is_open();
+
+        if (!sink.available && !sink.warned)
+        {
+            sink.warned = true;
+            std::clog << "[SafeAging][WARN] Failed to open plugin log file: "
+                      << logPath.string() << std::endl;
+        }
+    }
+
+    if (!sink.available)
+        return;
+
+    sink.stream << line << std::endl;
+    sink.stream.flush();
+}
+
 inline void log(Level level, const std::string& message)
 {
     if (!shouldLog(level))
         return;
 
-    std::clog << "[SafeAging][" << levelName(level) << "] " << message << std::endl;
+    const std::string consoleLine =
+        "[SafeAging][" + std::string(levelName(level)) + "] " + message;
+    const std::string fileLine = "[" + makeTimestamp() + "] " + consoleLine;
+
+    std::lock_guard<std::mutex> lock(sinkMutex());
+    std::clog << consoleLine << std::endl;
+    appendToLogFileUnlocked(fileLine);
 }
 
 struct ThrottleState

@@ -1,67 +1,3 @@
-﻿Tmhung
-tmhung3404
-Online
-
-Lê Dũng — 3/22/26, 9:53 PM
-D:\sdk\metadata_sdk
-Tmhung — 3/22/26, 9:54 PM
-metavms-metadata_sdk-6.0.6.41837-universal
-Lê Dũng — 3/22/26, 9:56 PM
-D:\metavms-metadata_sdk-6.0.6.41837-universal\metadata_sdk
-Tmhung — 3/22/26, 9:57 PM
-cd D:\Part-time\SafeAgingV2\SafeAging
-$env:NX_METADATA_SDK_DIR="D:\metavms-metadata_sdk-6.0.6.41837-universal\metadata_sdk"
-.\tools\build_plugin_windows.ps1 
--NxMetadataSdkDir "D:\metavms-metadata_sdk-6.0.6.41837-universal\metadata_sdk" -VcvarsVersion "14.29.30133"
-Lê Dũng — 3/22/26, 10:23 PM
-Viết docs cách build và cài plugin cho nx meta giúp Dũng (viết full luôn nha, đầy đủ từ cách cài conan, tới cách down và set visual installer, và gửi mấy câu lệnh để build + chỉ luôn cái metavms-metadata_sdk-6.0.6.41837-universal)
-Check manifest.json, oke thì gửi dũng
-goodboy — 3/22/26, 10:57 PM
-Build đồ ngon hết chưa
-Chạy êm chưa
-Tmhung — Yesterday at 12:34 AM
-Image
-Lê Dũng — Yesterday at 4:39 PM
-Attachment file type: unknown
-yolov8_people_analytics_plugin.dll
-5.41 MB
-{
-    "id": "mycompany.yolov8_people_analytics",
-    "name": "YOLOv8 People Analytics",
-    "description": "Analytics plugin using YOLOv8 model for people detection and tracking.",
-    "version": "1.0.0",
-    "vendor": "HumanCounterV8",
-
-manifest.json
-3 KB
-Lê Dũng — 4:39 PM
-// device_agent.cpp
-// Copyright 2018-present Network Optix, Inc.
-// Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
-
-#include "device_agent.h"
-#include <set>
-
-device_agent.cpp
-42 KB
-// device_agent.h
-// Copyright 2018-present Network Optix, Inc.
-// Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
-
-#pragma once
-
-device_agent.h
-8 KB
-#include "object_detector.h"
-#include "exceptions.h"
-#include "frame.h"
-#include "logging_utils.h"
-
-#ifdef _MSC_VER
-
-object_detector.cpp
-49 KB
-﻿
 #include "object_detector.h"
 #include "exceptions.h"
 #include "frame.h"
@@ -795,14 +731,12 @@ namespace sample_company {
                                 score});
                         }
 
-                        const int trackId = item.value("track_id", 0);
-                        nx::sdk::Uuid trackUuid = uuidFromTrackId("unknown_camera", trackId);
-
                         auto detection = std::make_shared<Detection>(Detection{
                             nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
                             classLabel,
                             score,
-                            trackUuid
+                            nx::sdk::Uuid{},
+                            false
                             });
 
                         result.push_back(detection);
@@ -1072,6 +1006,7 @@ namespace sample_company {
                             const float w = item.value("w", 0.0f);
                             const float h = item.value("h", 0.0f);
 
+                            const int trackId = item.value("track_id", 0);
                             const bool fallDetected = item.value("fall_detected", false);
 
                             if (w <= 0.0f || h <= 0.0f)
@@ -1101,14 +1036,13 @@ namespace sample_company {
                                     score});
                             }
 
-                            const int trackId = item.value("track_id", 0);
-                            nx::sdk::Uuid trackUuid = uuidFromTrackId(normalizedCameraId, trackId);
-
                             auto detection = std::make_shared<Detection>(Detection{
                                 nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
                                 classLabel,
                                 score,
-                                trackUuid,
+                                trackId > 0
+                                    ? uuidFromTrackId(normalizedCameraId, trackId)
+                                    : nx::sdk::Uuid{},
                                 fallDetected
                             });
 
@@ -1169,5 +1103,3 @@ namespace sample_company {
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins
 } // namespace sample_company
-object_detector.cpp
-49 KB

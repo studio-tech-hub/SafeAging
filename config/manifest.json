@@ -21,21 +21,21 @@
                 "type": "Number",
                 "name": "detection_frame_period",
                 "caption": "Detection Frame Period",
-                "defaultValue": 2,
+                "defaultValue": 1,
                 "description": "Run detection every Nth frame."
             },
             {
                 "type": "Number",
                 "name": "target_enqueue_fps",
                 "caption": "Target Enqueue FPS",
-                "defaultValue": 8,
+                "defaultValue": 1,
                 "description": "Max frame enqueue rate to AI worker."
             },
             {
                 "type": "Number",
                 "name": "frame_queue_max_size",
                 "caption": "Frame Queue Max Size",
-                "defaultValue": 3,
+                "defaultValue": 1,
                 "description": "Max buffered frames before dropping oldest."
             },
             {

@@ -46,23 +46,29 @@ struct CompositeDetectionId
     const cv::Rect rect;
 };
 
-using ClassLabelMap = std::map<const CompositeDetectionId, std::string>;
+struct TrackedDetectionMetadata
+{
+    std::string classLabel;
+    bool fallDetected = false;
+};
+
+using DetectionMetadataMap = std::map<const CompositeDetectionId, TrackedDetectionMetadata>;
 
 cv::detail::tracking::tbm::TrackedObjects convertDetectionsToTrackedObjects(
     const Frame& frame,
     const DetectionList& detections,
-    ClassLabelMap* inOutClassLabels);
+    DetectionMetadataMap* inOutDetectionMetadata);
 
 std::shared_ptr<DetectionInternal> convertTrackedObjectToDetection(
     const Frame& frame,
     const cv::detail::tracking::tbm::TrackedObject& trackedDetection,
-    const std::string& classLabel,
+    const TrackedDetectionMetadata& detectionMetadata,
     IdMapper* idMapper);
 
 DetectionInternalList convertTrackedObjectsToDetections(
     const Frame& frame,
     const cv::detail::tracking::tbm::TrackedObjects& trackedDetections,
-    const ClassLabelMap& classLabels,
+    const DetectionMetadataMap& detectionMetadataMap,
     IdMapper* idMapper);
 
 DetectionList extractDetectionList(const DetectionInternalList& detectionsInternal);
@@ -90,7 +96,7 @@ template<> struct less<
             return lhs.rect.y < rhs.rect.y;
         if (lhs.rect.width != rhs.rect.width)
             return lhs.rect.width < rhs.rect.width;
-        return lhs.rect.width < rhs.rect.width;
+        return lhs.rect.height < rhs.rect.height;
     }
 };
 }

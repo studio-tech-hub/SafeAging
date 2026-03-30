@@ -42,7 +42,7 @@ void IdMapper::removeAllExcept(const std::set<Uuid>& idsToKeep)
 TrackedObjects convertDetectionsToTrackedObjects(
     const Frame& frame,
     const DetectionList& detections,
-    ClassLabelMap* inOutClassLabels)
+    DetectionMetadataMap* inOutDetectionMetadata)
 {
     TrackedObjects result;
 
@@ -53,10 +53,12 @@ TrackedObjects convertDetectionsToTrackedObjects(
             frame.width,
             frame.height);
 
-        inOutClassLabels->insert(std::make_pair(CompositeDetectionId{
+        inOutDetectionMetadata->insert(std::make_pair(CompositeDetectionId{
             frame.index,
             cvRect},
-            detection->classLabel));
+            TrackedDetectionMetadata{
+                detection->classLabel,
+                detection->fallDetected}));
 
         result.push_back(TrackedObject(
             cvRect,
@@ -74,14 +76,15 @@ TrackedObjects convertDetectionsToTrackedObjects(
 std::shared_ptr<DetectionInternal> convertTrackedObjectToDetection(
     const Frame& frame,
     const TrackedObject& trackedDetection,
-    const std::string& classLabel,
+    const TrackedDetectionMetadata& detectionMetadata,
     IdMapper* idMapper)
 {
     auto detection = std::make_shared<Detection>(Detection{
         /*boundingBox*/ cvRectToNxRect(trackedDetection.rect, frame.width, frame.height),
-        classLabel,
+        detectionMetadata.classLabel,
         (float) trackedDetection.confidence,
-        /*trackId*/ idMapper->get(trackedDetection.object_id)});
+        /*trackId*/ idMapper->get(trackedDetection.object_id),
+        /*fallDetected*/ detectionMetadata.fallDetected});
     return std::make_shared<DetectionInternal>(DetectionInternal{
         detection,
         trackedDetection.object_id,
@@ -94,19 +97,19 @@ std::shared_ptr<DetectionInternal> convertTrackedObjectToDetection(
 DetectionInternalList convertTrackedObjectsToDetections(
     const Frame& frame,
     const TrackedObjects& trackedDetections,
-    const ClassLabelMap& classLabels,
+    const DetectionMetadataMap& detectionMetadataMap,
     IdMapper* idMapper)
 {
     DetectionInternalList result;
     for (const cv::detail::tracking::tbm::TrackedObject& trackedDetection: trackedDetections)
     {
-        const std::string classLabel = classLabels.at({
+        const TrackedDetectionMetadata& detectionMetadata = detectionMetadataMap.at({
             frame.index,
             trackedDetection.rect});
         result.push_back(convertTrackedObjectToDetection(
             frame,
             trackedDetection,
-            classLabel,
+            detectionMetadata,
             idMapper));
     }
 
