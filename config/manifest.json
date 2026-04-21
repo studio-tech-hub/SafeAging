@@ -1,7 +1,7 @@
 {
     "id": "mycompany.yolov8_people_analytics",
     "name": "YOLOv8 People Analytics",
-    "description": "Analytics plugin using YOLOv8 model for people detection and tracking.",
+    "description": "Analytics plugin that forwards frames to the local Python people analytics service.",
     "version": "1.0.0",
     "vendor": "HumanCounterV8",
     "engineSettingsModel": {
@@ -28,14 +28,14 @@
                 "type": "Number",
                 "name": "target_enqueue_fps",
                 "caption": "Target Enqueue FPS",
-                "defaultValue": 1,
+                "defaultValue": 10,
                 "description": "Max frame enqueue rate to AI worker."
             },
             {
                 "type": "Number",
                 "name": "frame_queue_max_size",
                 "caption": "Frame Queue Max Size",
-                "defaultValue": 1,
+                "defaultValue": 2,
                 "description": "Max buffered frames before dropping oldest."
             },
             {

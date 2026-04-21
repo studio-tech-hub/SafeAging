@@ -4,8 +4,8 @@
 
 #include <map>
 #include <memory>
-#include <vector>
 #include <string>
+#include <vector>
 
 #include <nx/sdk/analytics/rect.h>
 #include <nx/sdk/uuid.h>
@@ -14,8 +14,7 @@ namespace sample_company {
 namespace vms_server_plugins {
 namespace opencv_object_detection {
 
-// Class labels for the MobileNet SSD model (VOC dataset).
-extern const std::vector<std::string> kClasses;
+// Object classes exposed by the current plugin/service contract.
 extern const std::vector<std::string> kClassesToDetect;
 extern const std::map<std::string, std::string> kClassesToDetectPluralCapitalized;
 
@@ -28,7 +27,9 @@ struct Detection
     const std::string classLabel;
     const float confidence;
     const nx::sdk::Uuid trackId;
-    const bool fallDetected;  // FLOW 2: Fall detection flag from Python service
+    const bool fallDetected;  // Fall detection flag from the Python service
+    const bool stable;        // Service-confirmed track that plugin may use for lifecycle events
+    const bool degraded;      // Fallback/raw detection; render only, no lifecycle events
 };
 
 using DetectionList = std::vector<std::shared_ptr<Detection>>;

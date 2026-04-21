@@ -37,7 +37,7 @@ std::string Plugin::manifestString() const
 {
     "id": "mycompany.yolov8_people_analytics",
     "name": "YOLOv8 People Analytics",
-    "description": "Analytics plugin using YOLOv8 model for people detection.",
+    "description": "Analytics plugin that forwards frames to the local Python people analytics service.",
     "version": "1.0.0",
     "vendor": "HumanCounterV8"
 }

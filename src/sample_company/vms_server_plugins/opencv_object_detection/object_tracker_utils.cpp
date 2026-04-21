@@ -84,7 +84,9 @@ std::shared_ptr<DetectionInternal> convertTrackedObjectToDetection(
         detectionMetadata.classLabel,
         (float) trackedDetection.confidence,
         /*trackId*/ idMapper->get(trackedDetection.object_id),
-        /*fallDetected*/ detectionMetadata.fallDetected});
+        /*fallDetected*/ detectionMetadata.fallDetected,
+        /*stable*/ true,
+        /*degraded*/ false});
     return std::make_shared<DetectionInternal>(DetectionInternal{
         detection,
         trackedDetection.object_id,

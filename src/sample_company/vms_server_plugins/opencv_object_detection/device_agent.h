@@ -57,8 +57,7 @@ public:
 public:
     DeviceAgent(
         const nx::sdk::IDeviceInfo* deviceInfo,
-        std::filesystem::path pluginHomeDir,
-        std::filesystem::path modelPath);
+        std::filesystem::path pluginHomeDir);
 
     virtual ~DeviceAgent() override;
 
@@ -91,6 +90,8 @@ private:
     void workerThreadRun();
     std::vector<uint8_t> encodeFrameToJpeg(const Frame& frame, int targetWidth = 0);
     MetadataPacketList processFrameJob(const FrameJob& job);
+    MetadataPacketList buildDisabledCleanupPackets(int64_t timestampUs);
+    void clearPendingFrameQueue();
 
     void updateRenderedTrackState(const DetectionList& detections);
     nx::sdk::Ptr<nx::sdk::analytics::ObjectMetadataPacket> renderCurrentObjectMetadataPacket(
@@ -115,7 +116,7 @@ private:
     static constexpr int kAiServiceErrorDiagThrottleSec = 30;
 
     static constexpr int kDefaultDetectionFramePeriod = 1;
-    static constexpr int kDefaultTargetEnqueueFps = 8;
+    static constexpr int kDefaultTargetEnqueueFps = 10;
     static constexpr size_t kDefaultFrameQueueMaxSize = 2;
     static constexpr int kDefaultMetricsLogPeriodSec = 10;
     static constexpr int kAcquireBoostEnqueueFps = 10;
@@ -125,7 +126,6 @@ private:
     bool m_terminatedPrevious = false;
 
     std::filesystem::path m_pluginHomeDir;
-    std::filesystem::path m_modelPath;
     std::string m_cameraName;
 
     const std::unique_ptr<ObjectDetector> m_objectDetector;
@@ -154,6 +154,7 @@ private:
     std::chrono::steady_clock::time_point m_lastRenderedTrackStateUpdateTime =
         std::chrono::steady_clock::time_point::min();
 
+    std::mutex m_lifecycleStateMutex;
     std::set<nx::sdk::Uuid> m_activeFallDetectedTrackIds;
     bool m_personDetectionActive = false;
 
@@ -183,6 +184,8 @@ private:
     std::atomic<size_t> m_frameQueueMaxSize{kDefaultFrameQueueMaxSize};
     std::atomic<int> m_metricsLogPeriodSec{kDefaultMetricsLogPeriodSec};
     std::atomic<int> m_lastEffectiveEnqueueFps{kDefaultTargetEnqueueFps};
+    std::atomic<bool> m_detectionEnabled{true};
+    std::atomic<bool> m_detectionDisableCleanupPending{false};
 };
 
 } // namespace opencv_object_detection

@@ -29,7 +29,6 @@ protected:
 
 private:
     std::filesystem::path m_pluginHomeDir;
-    std::filesystem::path m_modelPath;   //< Full path tới file .onnx
 };
 
 } // namespace opencv_object_detection

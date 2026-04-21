@@ -13,7 +13,6 @@
 #include <utility>
 
 #include <opencv2/core.hpp>
-#include <opencv2/dnn/dnn.hpp>
 #include <opencv2/imgcodecs.hpp>
 
 #include <nx/sdk/i_plugin_diagnostic_event.h>
@@ -113,6 +112,22 @@ namespace sample_company
                     }
                 }
 
+                bool parseBoolSettingValue(const std::string& raw, bool defaultValue)
+                {
+                    if (raw.empty())
+                        return defaultValue;
+
+                    std::string value = raw;
+                    std::transform(value.begin(), value.end(), value.begin(),
+                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+                    if (value == "1" || value == "true" || value == "yes" || value == "on")
+                        return true;
+                    if (value == "0" || value == "false" || value == "no" || value == "off")
+                        return false;
+                    return defaultValue;
+                }
+
                 void updateMaxDepth(std::atomic<size_t>& currentMax, size_t depth)
                 {
                     size_t observed = currentMax.load();
@@ -124,13 +139,11 @@ namespace sample_company
 
             DeviceAgent::DeviceAgent(
                 const nx::sdk::IDeviceInfo *deviceInfo,
-                std::filesystem::path pluginHomeDir,
-                std::filesystem::path modelPath)
+                std::filesystem::path pluginHomeDir)
                 : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
                   m_pluginHomeDir(std::move(pluginHomeDir)),
-                  m_modelPath(std::move(modelPath)),
                   m_cameraName(resolveCameraName(deviceInfo)),
-                  m_objectDetector(std::make_unique<ObjectDetector>(m_modelPath)),
+                  m_objectDetector(std::make_unique<ObjectDetector>()),
                   m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
                   m_workerShouldStop(false)
@@ -290,6 +303,29 @@ namespace sample_company
                             "Disable the plugin.");
                         m_terminatedPrevious = true;
                     }
+                    return true;
+                }
+
+                if (!m_detectionEnabled.load(std::memory_order_relaxed))
+                {
+                    MetadataPacketList cleanupPackets;
+                    const bool shouldCleanup =
+                        m_detectionDisableCleanupPending.exchange(false, std::memory_order_relaxed);
+                    if (shouldCleanup)
+                        cleanupPackets = buildDisabledCleanupPackets(videoFrame->timestampUs());
+
+                    {
+                        std::unique_lock<std::mutex> lk(m_metadataQueueMutex);
+                        m_latestObjectMetadataPacket = nullptr;
+                        if (shouldCleanup)
+                        {
+                            m_metadataQueue.clear();
+                            for (auto& packet: cleanupPackets)
+                                m_metadataQueue.push_back(std::move(packet));
+                        }
+                    }
+
+                    ++m_frameIndex;
                     return true;
                 }
 
@@ -496,6 +532,7 @@ namespace sample_company
 
             nx::sdk::Result<const nx::sdk::ISettingsResponse*> DeviceAgent::settingsReceived()
             {
+                const std::string rawEnabled = settingValue("enabled");
                 const std::string rawDetectionPeriod = settingValue("detection_frame_period");
                 const std::string rawEnqueueFps = settingValue("target_enqueue_fps");
                 const std::string rawQueueMax = settingValue("frame_queue_max_size");
@@ -508,12 +545,15 @@ namespace sample_company
 
                 logutil::log(
                     logutil::Level::info,
-                    "Raw settings from Nx: detection_frame_period=" +
+                    "Raw settings from Nx: enabled=" +
+                        printableSettingValue(rawEnabled) +
+                        ", detection_frame_period=" +
                         printableSettingValue(rawDetectionPeriod) +
                         ", target_enqueue_fps=" + printableSettingValue(rawEnqueueFps) +
                         ", frame_queue_max_size=" + printableSettingValue(rawQueueMax) +
                         ", metrics_log_period_sec=" + printableSettingValue(rawMetricsPeriod));
 
+                const bool detectionEnabled = parseBoolSettingValue(rawEnabled, true);
                 const int detectionPeriod = parseIntSettingValue(
                     rawDetectionPeriod,
                     kDefaultDetectionFramePeriod,
@@ -535,14 +575,35 @@ namespace sample_company
                     1,
                     300);
 
+                const bool previousDetectionEnabled =
+                    m_detectionEnabled.load(std::memory_order_relaxed);
+                {
+                    std::unique_lock<std::mutex> lifecycleLock(m_lifecycleStateMutex);
+                    m_detectionEnabled.store(detectionEnabled, std::memory_order_relaxed);
+                }
                 m_detectionFramePeriod.store(detectionPeriod, std::memory_order_relaxed);
                 m_targetEnqueueFps.store(enqueueFps, std::memory_order_relaxed);
                 m_frameQueueMaxSize.store(static_cast<size_t>(queueMax), std::memory_order_relaxed);
                 m_metricsLogPeriodSec.store(metricsPeriod, std::memory_order_relaxed);
+                m_lastEffectiveEnqueueFps.store(
+                    detectionEnabled ? enqueueFps : 0,
+                    std::memory_order_relaxed);
+
+                if (!detectionEnabled)
+                {
+                    clearPendingFrameQueue();
+                    m_detectionDisableCleanupPending.store(true, std::memory_order_relaxed);
+                }
+                else if (!previousDetectionEnabled)
+                {
+                    m_lastEnqueueTime = std::chrono::steady_clock::time_point::min();
+                }
 
                 logutil::log(
                     logutil::Level::info,
-                    "Applied settings: detection_frame_period=" +
+                    "Applied settings: enabled=" +
+                        std::string(detectionEnabled ? "true" : "false") +
+                        ", detection_frame_period=" +
                         std::to_string(m_detectionFramePeriod.load(std::memory_order_relaxed)) +
                         ", target_enqueue_fps=" +
                         std::to_string(m_targetEnqueueFps.load(std::memory_order_relaxed)) +
@@ -688,102 +749,127 @@ namespace sample_company
                     if (!job.frame)
                         throw std::runtime_error("FrameJob is missing frame data for tracking");
 
-                    reinitializeObjectTrackerOnFrameSizeChanges(*job.frame);
+                    if (!m_detectionEnabled.load(std::memory_order_relaxed))
+                        return result;
 
                     // Call Python AI service with JPEG bytes
                     DetectionList detections = m_objectDetector->run(job.cameraId, job.jpegBytes);
 
                     // The Python service is already the authoritative source for track_id and
-                    // smoothed bbox output. Rendering those detections directly avoids a second
-                    // tracker in the plugin from dropping boxes or reassigning IDs mid-stream.
-                    updateRenderedTrackState(detections);
-
-                    const auto trackingResult = m_objectTracker->run(*job.frame, detections);
-
-                    const auto trackerEventPackets =
-                        eventsToEventMetadataPacketList(trackingResult.events, job.timestampUs);
-                    result.insert(
-                        result.end(),
-                        std::make_move_iterator(trackerEventPackets.begin()),
-                        std::make_move_iterator(trackerEventPackets.end()));
-
-                    // Emit state-dependent person presence event (start/finish).
-                    bool hasPerson = false;
-                    std::set<nx::sdk::Uuid> currentFallDetectedTrackIds;
-                    for (const auto &detection : detections)
+                    // track state. The plugin renders those detections directly and uses only
+                    // stable, non-degraded tracks to drive lifecycle events.
                     {
-                        if (detection->classLabel != "person")
-                            continue;
+                        std::unique_lock<std::mutex> lifecycleLock(m_lifecycleStateMutex);
+                        if (!m_detectionEnabled.load(std::memory_order_relaxed))
+                            return result;
 
-                        hasPerson = true;
-                        if (detection->fallDetected)
-                            currentFallDetectedTrackIds.insert(detection->trackId);
+                        updateRenderedTrackState(detections);
+
+                        const auto participatesInLifecycle =
+                            [](const std::shared_ptr<Detection>& detection) -> bool
+                        {
+                            return detection
+                                && detection->classLabel == "person"
+                                && detection->stable
+                                && !detection->degraded;
+                        };
+
+                        bool hasStablePerson = false;
+                        std::set<nx::sdk::Uuid> currentFallDetectedTrackIds;
+                        EventList newTrackEvents;
+                        for (const auto &detection : detections)
+                        {
+                            if (!participatesInLifecycle(detection))
+                                continue;
+
+                            hasStablePerson = true;
+                            if (m_seenPersonIds.insert(detection->trackId).second)
+                            {
+                                newTrackEvents.push_back(std::make_shared<Event>(Event{
+                                    EventType::object_detected,
+                                    job.timestampUs,
+                                    "person"}));
+                            }
+
+                            if (detection->fallDetected)
+                                currentFallDetectedTrackIds.insert(detection->trackId);
+                        }
+
+                        if (!newTrackEvents.empty())
+                        {
+                            const auto newTrackEventPackets =
+                                eventsToEventMetadataPacketList(newTrackEvents, job.timestampUs);
+                            result.insert(
+                                result.end(),
+                                std::make_move_iterator(newTrackEventPackets.begin()),
+                                std::make_move_iterator(newTrackEventPackets.end()));
+                        }
+
+                        if (hasStablePerson != m_personDetectionActive)
+                        {
+                            EventList personEvents;
+                            personEvents.push_back(std::make_shared<Event>(Event{
+                                hasStablePerson ? EventType::detection_started : EventType::detection_finished,
+                                job.timestampUs,
+                                "person"}));
+
+                            const auto personEventPackets =
+                                eventsToEventMetadataPacketList(personEvents, job.timestampUs);
+                            result.insert(
+                                result.end(),
+                                std::make_move_iterator(personEventPackets.begin()),
+                                std::make_move_iterator(personEventPackets.end()));
+
+                            if (!hasStablePerson)
+                                m_seenPersonIds.clear();
+
+                            m_personDetectionActive = hasStablePerson;
+                        }
+
+                        for (const auto &trackId : currentFallDetectedTrackIds)
+                        {
+                            if (m_activeFallDetectedTrackIds.count(trackId) > 0)
+                                continue;
+
+                            auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                            eventMetadata->setCaption("Fall detected");
+                            eventMetadata->setDescription(
+                                "Person " + nx::sdk::UuidHelper::toStdString(trackId) + " is in fallen state");
+                            eventMetadata->setIsActive(true);
+                            eventMetadata->setTypeId(kFallDetectedEventType);
+
+                            auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                            eventPacket->addItem(eventMetadata.get());
+                            eventPacket->setTimestampUs(job.timestampUs);
+                            result.push_back(eventPacket);
+
+                            m_activeFallDetectedTrackIds.insert(trackId);
+                        }
+
+                        std::vector<nx::sdk::Uuid> tracksToClear;
+                        for (const auto &activeTrackId : m_activeFallDetectedTrackIds)
+                        {
+                            if (currentFallDetectedTrackIds.count(activeTrackId) > 0)
+                                continue;
+
+                            auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                            eventMetadata->setCaption("Fall cleared");
+                            eventMetadata->setDescription(
+                                "Person " + nx::sdk::UuidHelper::toStdString(activeTrackId) + " is no longer fallen");
+                            eventMetadata->setIsActive(false);
+                            eventMetadata->setTypeId(kFallDetectedEventType);
+
+                            auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                            eventPacket->addItem(eventMetadata.get());
+                            eventPacket->setTimestampUs(job.timestampUs);
+                            result.push_back(eventPacket);
+
+                            tracksToClear.push_back(activeTrackId);
+                        }
+
+                        for (const auto &trackId : tracksToClear)
+                            m_activeFallDetectedTrackIds.erase(trackId);
                     }
-
-                    if (hasPerson != m_personDetectionActive)
-                    {
-                        EventList personEvents;
-                        personEvents.push_back(std::make_shared<Event>(Event{
-                            hasPerson ? EventType::detection_started : EventType::detection_finished,
-                            job.timestampUs,
-                            "person"}));
-
-                        const auto personEventPackets =
-                            eventsToEventMetadataPacketList(personEvents, job.timestampUs);
-                        result.insert(
-                            result.end(),
-                            std::make_move_iterator(personEventPackets.begin()),
-                            std::make_move_iterator(personEventPackets.end()));
-
-                        m_personDetectionActive = hasPerson;
-                    }
-
-                    // Emit state-dependent fall events per track_id.
-                    // START: newly fallen tracks.
-                    for (const auto &trackId : currentFallDetectedTrackIds)
-                    {
-                        if (m_activeFallDetectedTrackIds.count(trackId) > 0)
-                            continue;
-
-                        auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
-                        eventMetadata->setCaption("Fall detected");
-                        eventMetadata->setDescription(
-                            "Person " + nx::sdk::UuidHelper::toStdString(trackId) + " is in fallen state");
-                        eventMetadata->setIsActive(true);
-                        eventMetadata->setTypeId(kFallDetectedEventType);
-
-                        auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
-                        eventPacket->addItem(eventMetadata.get());
-                        eventPacket->setTimestampUs(job.timestampUs);
-                        result.push_back(eventPacket);
-
-                        m_activeFallDetectedTrackIds.insert(trackId);
-                    }
-
-                    // FINISH: tracks that were fallen before but are no longer fallen now.
-                    std::vector<nx::sdk::Uuid> tracksToClear;
-                    for (const auto &activeTrackId : m_activeFallDetectedTrackIds)
-                    {
-                        if (currentFallDetectedTrackIds.count(activeTrackId) > 0)
-                            continue;
-
-                        auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
-                        eventMetadata->setCaption("Fall cleared");
-                        eventMetadata->setDescription(
-                            "Person " + nx::sdk::UuidHelper::toStdString(activeTrackId) + " is no longer fallen");
-                        eventMetadata->setIsActive(false);
-                        eventMetadata->setTypeId(kFallDetectedEventType);
-
-                        auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
-                        eventPacket->addItem(eventMetadata.get());
-                        eventPacket->setTimestampUs(job.timestampUs);
-                        result.push_back(eventPacket);
-
-                        tracksToClear.push_back(activeTrackId);
-                    }
-
-                    for (const auto &trackId : tracksToClear)
-                        m_activeFallDetectedTrackIds.erase(trackId);
                 }
                 catch (const ObjectDetectionError &e)
                 {
@@ -814,6 +900,65 @@ namespace sample_company
                 }
 
                 return result;
+            }
+
+            DeviceAgent::MetadataPacketList DeviceAgent::buildDisabledCleanupPackets(
+                int64_t timestampUs)
+            {
+                MetadataPacketList result;
+                std::unique_lock<std::mutex> lifecycleLock(m_lifecycleStateMutex);
+
+                if (m_personDetectionActive)
+                {
+                    EventList personEvents;
+                    personEvents.push_back(std::make_shared<Event>(Event{
+                        EventType::detection_finished,
+                        timestampUs,
+                        "person"}));
+
+                    const auto personEventPackets =
+                        eventsToEventMetadataPacketList(personEvents, timestampUs);
+                    result.insert(
+                        result.end(),
+                        std::make_move_iterator(personEventPackets.begin()),
+                        std::make_move_iterator(personEventPackets.end()));
+                }
+
+                for (const auto& activeTrackId: m_activeFallDetectedTrackIds)
+                {
+                    auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                    eventMetadata->setCaption("Fall cleared");
+                    eventMetadata->setDescription(
+                        "Person " + nx::sdk::UuidHelper::toStdString(activeTrackId) +
+                        " is no longer fallen");
+                    eventMetadata->setIsActive(false);
+                    eventMetadata->setTypeId(kFallDetectedEventType);
+
+                    auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                    eventPacket->addItem(eventMetadata.get());
+                    eventPacket->setTimestampUs(timestampUs);
+                    result.push_back(eventPacket);
+                }
+
+                m_personDetectionActive = false;
+                m_activeFallDetectedTrackIds.clear();
+                m_seenPersonIds.clear();
+                m_currentPersons = 0;
+
+                {
+                    std::unique_lock<std::mutex> renderLock(m_renderStateMutex);
+                    m_renderedTrackStates.clear();
+                    m_lastRenderedTrackStateUpdateTime =
+                        std::chrono::steady_clock::time_point::min();
+                }
+
+                return result;
+            }
+
+            void DeviceAgent::clearPendingFrameQueue()
+            {
+                std::unique_lock<std::mutex> lk(m_frameQueueMutex);
+                m_frameQueue.clear();
             }
 
             DeviceAgent::MetadataPacketList DeviceAgent::eventsToEventMetadataPacketList(
@@ -893,22 +1038,22 @@ namespace sample_company
                     return nullptr;
 
                 const auto objectMetadataPacket = makePtr<ObjectMetadataPacket>();
+                const auto participatesInLifecycle =
+                    [](const std::shared_ptr<Detection>& detection) -> bool
+                {
+                    return detection
+                        && detection->classLabel == "person"
+                        && detection->stable
+                        && !detection->degraded;
+                };
 
                 // PASS 1: count persons in this frame.
                 m_currentPersons = 0;
-                std::set<nx::sdk::Uuid> framePersonIds;
-
                 for (const std::shared_ptr<Detection> &detection : detections)
                 {
-                    if (detection->classLabel == "person")
-                    {
+                    if (participatesInLifecycle(detection))
                         ++m_currentPersons;
-                        framePersonIds.insert(detection->trackId);
-                    }
                 }
-
-                // Keep unique-person tracking state for future analytics extensions.
-                m_seenPersonIds.insert(framePersonIds.begin(), framePersonIds.end());
 
                 // PASS 2: build ObjectMetadata and bbox attributes.
                 for (const std::shared_ptr<Detection> &detection : detections)
@@ -929,7 +1074,7 @@ namespace sample_company
                         objectMetadata->addAttribute(makePtr<Attribute>(
                             IAttribute::Type::number,
                             "Fall Detect",
-                            "0"));
+                            detection->fallDetected ? "1" : "0"));
                     }
                     else if (detection->classLabel == "cat")
                     {

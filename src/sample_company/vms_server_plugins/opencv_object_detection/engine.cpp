@@ -17,12 +17,6 @@ Engine::Engine(std::filesystem::path pluginHomeDir):
     nx::sdk::analytics::Engine(/*enableOutput*/ true),
     m_pluginHomeDir(std::move(pluginHomeDir))
 {
-    // Model nằm cùng thư mục plugin:
-    // C:\Program Files\Network Optix\Nx Meta\MediaServer\plugins\yolov8_people_analytics_plugin\yolov8n.onnx
-    m_modelPath = m_pluginHomeDir / "yolov5s.onnx";
-
-    // Nếu bạn để trong subfolder "models" thì đổi lại:
-    // m_modelPath = m_pluginHomeDir / "models" / "yolov8n.onnx";
 }
 
 Engine::~Engine()
@@ -35,14 +29,13 @@ void Engine::doObtainDeviceAgent(
 {
     *outResult = new DeviceAgent(
         deviceInfo,
-        m_pluginHomeDir,
-        m_modelPath);
+        m_pluginHomeDir);
 }
 
 std::string Engine::manifestString() const
 {
-    // Request YUV420 format (same as internal NX server format, more efficient)
-    // YV12 format is YUV 4:2:0 planar, which we properly convert to BGR for OpenCV
+    // Request YUV420 frames from NX so the plugin can convert them to OpenCV Mats
+    // before forwarding them to the Python analytics service.
     return /*suppress newline*/ 1 + R"json(
 {
     "capabilities": "needUncompressedVideoFrames_yuv420"

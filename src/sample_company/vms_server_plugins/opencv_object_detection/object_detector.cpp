@@ -1,6 +1,5 @@
-#include "object_detector.h"
+﻿#include "object_detector.h"
 #include "exceptions.h"
-#include "frame.h"
 #include "logging_utils.h"
 
 #ifdef _MSC_VER
@@ -22,6 +21,7 @@
 #include <mutex>
 #include <chrono>
 #include <algorithm>
+#include <random>
 #include <vector>
 #include <array>
 #include <thread>
@@ -40,7 +40,7 @@ namespace sample_company {
             //-------------------------------------------------------------------------------------------------
             // Base64 helper (encode buffer -> base64 string)
 
-            // (có thể để trong anonymous namespace)
+            // (cÃ³ thá»ƒ Ä‘á»ƒ trong anonymous namespace)
             namespace {
 
                 static const std::string kBase64Chars =
@@ -97,86 +97,6 @@ namespace sample_company {
                     return out;
                 }
 
-                std::string matToBase64Jpeg(const cv::Mat& frame)
-                {
-                    cv::Mat bgr;
-
-                    if (frame.empty())
-                        throw ObjectDetectionError("Empty frame Mat");
-
-                    if (frame.type() == CV_8UC3)
-                    {
-                        bgr = frame;
-                    }
-                    else if (frame.type() == CV_8UC4)
-                    {
-                        cv::cvtColor(frame, bgr, cv::COLOR_BGRA2BGR);
-                    }
-                    else if (frame.type() == CV_8UC1)
-                    {
-                        cv::cvtColor(frame, bgr, cv::COLOR_GRAY2BGR);
-                    }
-                    else
-                    {
-                        throw ObjectDetectionError("Unsupported Mat type=" + std::to_string(frame.type()));
-                    }
-
-                    // Ensure Mat is contiguous in memory
-                    if (!bgr.isContinuous())
-                    {
-                        bgr = bgr.clone();
-                    }
-
-                    if (bgr.empty())
-                        throw ObjectDetectionError("bgr Mat is empty after processing");
-
-                    // Skip imencode entirely - just use raw BGR with minimal compression
-                    // This avoids issues with missing JPEG/PNG encoders
-                    const uint8_t* data = bgr.data;
-                    size_t dataSize = bgr.total() * bgr.elemSize();
-                    
-                    logutil::logThrottled(
-                        logutil::Level::debug,
-                        "object_detector.encode.raw_bgr",
-                        std::chrono::seconds(10),
-                        "Encoding RAW_BGR frame " + std::to_string(bgr.cols) + "x" +
-                            std::to_string(bgr.rows) + " bytes=" + std::to_string(dataSize));
-                    
-                    // Simple format: magic + width + height + raw BGR data
-                    std::vector<uchar> buf;
-                    
-                    // Add magic "BGR" header
-                    buf.push_back('B');
-                    buf.push_back('G');
-                    buf.push_back('R');
-                    
-                    // Add dimensions (4 bytes each, little-endian)
-                    uint32_t w = bgr.cols;
-                    uint32_t h = bgr.rows;
-                    buf.push_back((w >> 0) & 0xFF);
-                    buf.push_back((w >> 8) & 0xFF);
-                    buf.push_back((w >> 16) & 0xFF);
-                    buf.push_back((w >> 24) & 0xFF);
-                    buf.push_back((h >> 0) & 0xFF);
-                    buf.push_back((h >> 8) & 0xFF);
-                    buf.push_back((h >> 16) & 0xFF);
-                    buf.push_back((h >> 24) & 0xFF);
-                    
-                    // Add raw BGR data
-                    buf.insert(buf.end(), data, data + dataSize);
-                    
-                    logutil::logThrottled(
-                        logutil::Level::debug,
-                        "object_detector.encode.total_buffer",
-                        std::chrono::seconds(10),
-                        "Encoded RAW_BGR payload bytes=" + std::to_string(buf.size()));
-                    
-                    if (buf.empty())
-                        throw ObjectDetectionError("Encoded buffer is empty");
-                    
-                    return base64Encode(buf.data(), buf.size());
-                }
-
                 struct DebugBbox
                 {
                     cv::Rect rect;
@@ -197,6 +117,25 @@ namespace sample_company {
                             ch = '_';
                     }
                     return out;
+                }
+
+                nx::sdk::Uuid makeRandomUuid()
+                {
+                    thread_local std::mt19937_64 rng(std::random_device{}());
+                    uint8_t bytes[nx::sdk::Uuid::kSize];
+
+                    for (size_t i = 0; i < nx::sdk::Uuid::kSize; i += sizeof(uint64_t))
+                    {
+                        const uint64_t value = rng();
+                        const size_t copySize =
+                            std::min(sizeof(value), nx::sdk::Uuid::kSize - i);
+                        std::memcpy(bytes + i, &value, copySize);
+                    }
+
+                    // RFC 4122 version 4 style UUID bits.
+                    bytes[6] = static_cast<uint8_t>((bytes[6] & 0x0F) | 0x40);
+                    bytes[8] = static_cast<uint8_t>((bytes[8] & 0x3F) | 0x80);
+                    return nx::sdk::Uuid(bytes);
                 }
 
                 std::filesystem::path frameDumpRootDir()
@@ -396,12 +335,12 @@ namespace sample_company {
                         return it->second.uuid;
                     }
 
-                    nx::sdk::Uuid u = nx::sdk::UuidHelper::randomUuid();
+                    nx::sdk::Uuid u = makeRandomUuid();
                     map.emplace(key, TrackCacheEntry{u, now});
                     return u;
                 }
 
-                // Gọi Python service, trả về DetectionList (danh sách Detection của plugin)
+                // Service-side HTTP client and circuit breaker state.
                 enum class CircuitState
                 {
                     closed,
@@ -575,192 +514,12 @@ namespace sample_company {
                         it->second.halfOpenProbeInFlight = false;
                 }
 
-                DetectionList callPythonService(const Frame& frame)
-                {
-                    DetectionList result;
-
-                    const Mat& image = frame.cvMat;
-                    if (image.empty())
-                        return result;
-
-                    static std::chrono::steady_clock::time_point lastCall = std::chrono::steady_clock::now();
-                    auto now = std::chrono::steady_clock::now();
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastCall).count();
-
-                    if (ms < 200)
-                        return {};
-                    lastCall = now;
-
-                    cv::Mat sendImg = image;
-                    const int targetW = 640;
-                    if (image.cols > targetW)
-                    {
-                        const float scale = static_cast<float>(targetW) / static_cast<float>(image.cols);
-                        const int newW = targetW;
-                        const int newH = std::max(1, static_cast<int>(std::round(image.rows * scale)));
-                        cv::resize(image, sendImg, cv::Size(newW, newH));
-                    }
-
-                    const int imgW = sendImg.cols;
-                    const int imgH = sendImg.rows;
-                    
-                    logutil::logThrottled(
-                        logutil::Level::debug,
-                        "object_detector.infer.send_img",
-                        std::chrono::seconds(10),
-                        "Preparing infer frame " + std::to_string(imgW) + "x" +
-                            std::to_string(imgH) + " type=" + std::to_string(sendImg.type()) +
-                            " continuous=" + std::to_string(sendImg.isContinuous() ? 1 : 0));
-                    
-                    std::string b64;
-                    try
-                    {
-                        b64 = matToBase64Jpeg(sendImg);
-                        logutil::logThrottled(
-                            logutil::Level::debug,
-                            "object_detector.infer.base64_ok",
-                            std::chrono::seconds(10),
-                            "Base64 payload bytes=" + std::to_string(b64.size()));
-                    }
-                    catch (const std::exception& e)
-                    {
-                        logutil::log(
-                            logutil::Level::error,
-                            std::string("matToBase64Jpeg failed: ") + e.what());
-                        throw ObjectDetectionError(std::string("Failed to encode image to base64: ") + e.what());
-                    }
-
-                    if (b64.empty())
-                    {
-                        logutil::log(logutil::Level::error, "Encoded base64 payload is empty");
-                        throw ObjectDetectionError("b64 empty after imencode - image may be invalid");
-                    }
-
-                    json req;
-                    req["camera_id"] = "unknown_camera";
-                    req["image"] = b64;
-
-                    thread_local httplib::Client cli("127.0.0.1", 18000);
-                    cli.set_keep_alive(true); // Keep connection alive để tái sử dụng
-
-                    // Tăng timeout để Python service có thời gian xử lý
-                    cli.set_connection_timeout(1, 500000); // 1.5s (1s + 500ms)
-                    cli.set_read_timeout(2, 500000);       // 2.5s (2s + 500ms)
-                    cli.set_write_timeout(1, 0);           // 1s
-
-
-                    static int s_reqCount = 0;
-                    if ((++s_reqCount % 120) == 0)
-                    {
-                        logutil::log(
-                            logutil::Level::info,
-                            "Legacy infer requests processed=" + std::to_string(s_reqCount));
-                    }
-
-                    auto res = cli.Post("/infer", req.dump(), "application/json");
-
-                    // ❗ res là pointer-like
-                    if (!res)
-                    {
-                        logutil::logThrottled(
-                            logutil::Level::warn,
-                            "object_detector.legacy.no_response",
-                            std::chrono::seconds(30),
-                            "Legacy /infer failed: no response from 127.0.0.1:18000");
-                        return {};
-                    }
-
-                    if (res->status != 200)
-                    {
-                        logutil::logThrottled(
-                            logutil::Level::warn,
-                            "object_detector.legacy.http_status",
-                            std::chrono::seconds(30),
-                            "Legacy /infer HTTP status=" + std::to_string(res->status));
-                        return {};
-                    }
-
-                    json j;
-                    try
-                    {
-                        j = json::parse(res->body);
-                    }
-                    catch (...)
-                    {
-                        return {};
-                    }
-
-                    if (!j.is_array())
-                        return {};
-
-                    std::vector<DebugBbox> debugBoxes;
-                    for (const auto& item : j)
-                    {
-                        const std::string classLabel = item.value("cls", "person");
-                        const float score = item.value("score", 0.0f);
-
-                        const float x = item.value("x", 0.0f);
-                        const float y = item.value("y", 0.0f);
-                        const float w = item.value("w", 0.0f);
-                        const float h = item.value("h", 0.0f);
-
-                        if (w <= 0.0f || h <= 0.0f)
-                            continue;
-
-                        float xNorm = x / static_cast<float>(imgW);
-                        float yNorm = y / static_cast<float>(imgH);
-                        float wNorm = w / static_cast<float>(imgW);
-                        float hNorm = h / static_cast<float>(imgH);
-
-                        if (xNorm < 0.0f) xNorm = 0.0f;
-                        if (yNorm < 0.0f) yNorm = 0.0f;
-                        if (xNorm + wNorm > 1.0f) wNorm = 1.0f - xNorm;
-                        if (yNorm + hNorm > 1.0f) hNorm = 1.0f - yNorm;
-                        if (wNorm <= 0.0f || hNorm <= 0.0f)
-                            continue;
-
-                        const int x1 = std::max(0, static_cast<int>(std::round(x)));
-                        const int y1 = std::max(0, static_cast<int>(std::round(y)));
-                        const int x2 = std::min(imgW, static_cast<int>(std::round(x + w)));
-                        const int y2 = std::min(imgH, static_cast<int>(std::round(y + h)));
-                        if (x2 > x1 && y2 > y1)
-                        {
-                            debugBoxes.push_back(DebugBbox{
-                                cv::Rect(x1, y1, x2 - x1, y2 - y1),
-                                classLabel,
-                                score});
-                        }
-
-                        auto detection = std::make_shared<Detection>(Detection{
-                            nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
-                            classLabel,
-                            score,
-                            nx::sdk::Uuid{},
-                            false
-                            });
-
-                        result.push_back(detection);
-                    }
-
-                    logutil::logThrottled(
-                        logutil::Level::debug,
-                        "object_detector.legacy.detections",
-                        std::chrono::seconds(10),
-                        "Legacy detections=" + std::to_string(result.size()) + " frame=" +
-                            std::to_string(imgW) + "x" + std::to_string(imgH));
-
-                    return result;
-                }
-
             } // namespace (anonymous)
 
             //-------------------------------------------------------------------------------------------------
             // ObjectDetector implementation
 
-            ObjectDetector::ObjectDetector(std::filesystem::path modelPath) :
-                m_modelPath(std::move(modelPath))
-            {
-            }
+            ObjectDetector::ObjectDetector() = default;
 
             void ObjectDetector::ensureInitialized()
             {
@@ -770,8 +529,8 @@ namespace sample_company {
                         "Object detector initialization error: object detector is terminated.");
                 }
 
-                // Không load model trong C++ nữa, chỉ cần đánh dấu là "loaded".
-                m_netLoaded = true;
+                // No local model is loaded in the plugin anymore. Initialization only validates
+                // that the detector has not been terminated before HTTP requests start.
             }
 
             bool ObjectDetector::isTerminated() const
@@ -784,30 +543,6 @@ namespace sample_company {
                 m_terminated = true;
             }
 
-            DetectionList ObjectDetector::run(const Frame& frame)
-            {
-                if (isTerminated())
-                    return {};
-
-                try
-                {
-                    return runImpl(frame);
-                }
-                catch (const ObjectDetectionError&)
-                {
-                    // ĐỂ CHO device_agent.cpp bắt và push event
-                    throw;
-                }
-                catch (const cv::Exception& e)
-                {
-                    throw ObjectDetectionError(std::string("OpenCV error: ") + e.what());
-                }
-                catch (const std::exception& e)
-                {
-                    throw ObjectDetectionError(std::string("Std error: ") + e.what());
-                }
-            }
-            
             // ============================================================
             // FLOW 2: New method - run inference on JPEG bytes
             // ============================================================
@@ -821,7 +556,7 @@ namespace sample_company {
                     if (jpegBytes.empty())
                         throw ObjectDetectionError("JPEG bytes are empty");
                     
-                    return callPythonServiceMultipart(cameraId, jpegBytes);
+                    return callPythonService(cameraId, jpegBytes);
                 }
                 catch (const ObjectDetectionError&)
                 {
@@ -834,10 +569,10 @@ namespace sample_company {
             }
             
             // ============================================================
-            // FLOW 2: HTTP multipart/form-data call to Python service
+            // Call the Python analytics service using the current JSON payload contract
             // Uses short timeout for MVP (fail-fast)
             // ============================================================
-            DetectionList ObjectDetector::callPythonServiceMultipart(
+            DetectionList ObjectDetector::callPythonService(
                 const std::string& cameraId,
                 const std::vector<uint8_t>& jpegBytes)
             {
@@ -1008,6 +743,8 @@ namespace sample_company {
 
                             const int trackId = item.value("track_id", 0);
                             const bool fallDetected = item.value("fall_detected", false);
+                            const bool stable = item.value("stable", true);
+                            const bool degraded = item.value("degraded", false);
 
                             if (w <= 0.0f || h <= 0.0f)
                                 continue;
@@ -1043,7 +780,9 @@ namespace sample_company {
                                 trackId > 0
                                     ? uuidFromTrackId(normalizedCameraId, trackId)
                                     : nx::sdk::Uuid{},
-                                fallDetected
+                                fallDetected,
+                                stable,
+                                degraded
                             });
 
                             result.push_back(detection);
@@ -1075,31 +814,11 @@ namespace sample_company {
                 catch (const std::exception& e)
                 {
                     circuitBreakerReleaseHalfOpenProbe(normalizedCameraId);
-                    throw ObjectDetectionError(std::string("callPythonServiceMultipart error: ") + e.what());
+                    throw ObjectDetectionError(std::string("callPythonService error: ") + e.what());
                 }
-            }
-
-            //-------------------------------------------------------------------------------------------------
-            // private
-
-            // Hàm loadModel() cũ không còn dùng nữa, nhưng giữ lại cho đủ định nghĩa (nếu header còn khai báo).
-            void ObjectDetector::loadModel()
-            {
-                // KHÔNG còn dùng OpenCV DNN / ONNX nữa.
-            }
-
-            DetectionList ObjectDetector::runImpl(const Frame& frame)
-            {
-                if (isTerminated())
-                {
-                    throw ObjectDetectorIsTerminatedError(
-                        "Object detection error: object detector is terminated.");
-                }
-
-                // Thay toàn bộ logic ONNX cũ bằng gọi Python service:
-                return callPythonService(frame);
             }
 
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins
 } // namespace sample_company
+

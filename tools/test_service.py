@@ -180,7 +180,6 @@ def test_all():
     test_images = [
         "test_image.jpg",
         "test_image.png",
-        Path.cwd().parent / "build" / "yolov8n.onnx",  # Not ideal but just checking
     ]
     
     found_image = None

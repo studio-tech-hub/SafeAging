@@ -13,10 +13,6 @@ if(metadataSdkDir STREQUAL "")
     message(FATAL_ERROR "metadataSdkDir cache variable is undefined.")
 endif()
 
-if(NOT DEFINED ARTIFACTORY_URL)
-    set(ARTIFACTORY_URL "https://artifactory.nxvms.dev/artifactory/artifacts/nx_open_integrations")
-endif()
-
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_BINARY_DIR})
 list(APPEND CMAKE_PREFIX_PATH ${CMAKE_BINARY_DIR})
 
@@ -97,7 +93,6 @@ set(OPENCV_OPTIONS
     opencv:with_quirc=False
     opencv:with_cuda=False
     opencv:with_cublas=False
-    opencv:dnn=True
     opencv:with_ffmpeg=False
 )
 
@@ -128,32 +123,8 @@ conan_cmake_install(PATH_OR_REFERENCE .
 
 find_package(OpenCV REQUIRED)
 
-# Download model files
-set(model_file_names
-    MobileNetSSD.caffemodel
-    MobileNetSSD.prototxt
-)
-foreach(model_file_name IN LISTS model_file_names)
-    set(model_file "${CMAKE_BINARY_DIR}/${model_file_name}")
-    list(APPEND model_files "${model_file}")
-    if(NOT EXISTS "${model_file}")
-        message("Downloading ${model_file_name}")
-        file(DOWNLOAD
-            "${ARTIFACTORY_URL}/opencv_object_detection_analytics_plugin/models/${model_file_name}"
-            "${model_file}"
-            SHOW_PROGRESS
-            STATUS DOWNLOAD_STATUS
-        )
-        list(GET DOWNLOAD_STATUS 0 STATUS_CODE)
-        if(NOT STATUS_CODE EQUAL 0)
-            file(REMOVE "${model_file}")
-            message(WARNING "Skip downloading model: ${ARTIFACTORY_URL}/opencv_object_detection_analytics_plugin/models/${model_file_name}")
-        endif()
-    else()
-        message("${model_file_name} already exists")
-    endif()
-
-endforeach()
+# The plugin no longer downloads or loads local model assets. Inference runs through the
+# colocated Python analytics service, so the build only needs OpenCV utility modules.
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -217,7 +188,7 @@ target_include_directories(yolov8_people_analytics_plugin PRIVATE
 target_link_libraries(yolov8_people_analytics_plugin
     nx_kit
     nx_sdk
-    opencv::core opencv::flann opencv::imgproc opencv::imgcodecs opencv::dnn opencv::opencv_dnn opencv::ml 
+    opencv::core opencv::flann opencv::imgproc opencv::imgcodecs opencv::ml 
     opencv::plot opencv::opencv_features2d opencv::opencv_calib3d opencv::datasets opencv::video opencv::tracking
 )
 
