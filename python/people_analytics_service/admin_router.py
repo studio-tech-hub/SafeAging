@@ -63,7 +63,7 @@ def _prepare_person_write(payload: dict) -> dict:
         if dob is None:
             raise HTTPException(
                 status_code=422,
-                detail="date_of_birth không hợp lệ — dùng DD/MM/YYYY (vd. 26/9/2003)",
+                detail="Invalid date_of_birth — use the date picker or YYYY-MM-DD",
             )
         data["date_of_birth"] = dob
     return data

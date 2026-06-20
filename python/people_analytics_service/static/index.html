@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>SafeAging — Bảng điều khiển</title>
+<title>SafeAging — Operations Console</title>
 <style>
   :root { --bg:#0f172a; --panel:#1e293b; --panel2:#273449; --txt:#e2e8f0; --muted:#94a3b8;
           --accent:#38bdf8; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --line:#334155; }
@@ -14,6 +14,7 @@
   header .key { margin-left:auto; display:flex; gap:8px; align-items:center; }
   input, select, button, textarea { font:inherit; }
   input, select, textarea { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  input[type="date"] { color-scheme:dark; min-width:10.5rem; }
   button { background:var(--accent); color:#062a3a; border:0; border-radius:8px; padding:8px 14px; cursor:pointer; font-weight:600; }
   button.secondary { background:var(--panel2); color:var(--txt); border:1px solid var(--line); }
   button:hover { filter:brightness(1.05); }
@@ -48,10 +49,10 @@
 <body>
 <header>
   <h1>🛡️ SafeAging</h1>
-  <span class="muted">Bảng điều khiển vận hành</span>
+  <span class="muted">Operations console</span>
   <div class="key">
     <input id="apiKey" type="password" placeholder="X-API-Key" style="width:200px" />
-    <button class="secondary" onclick="saveKey()">Lưu khóa</button>
+    <button class="secondary" onclick="saveKey()">Save key</button>
   </div>
 </header>
 <nav id="nav"></nav>
@@ -64,17 +65,19 @@
 </main>
 
 <dialog id="enrollDlg">
-  <h3 style="margin-top:0">Ghi danh người từ khung hình</h3>
+  <h3 style="margin-top:0">Enroll person from live frame</h3>
   <input type="hidden" id="enrollCamera"><input type="hidden" id="enrollTrack">
   <p class="muted" id="enrollInfo"></p>
-  <div class="field"><label>Họ tên</label><input id="enrollName" placeholder="Ông A"></div>
-  <div class="field"><label>Giới tính</label>
-    <select id="enrollGender"><option value="">--</option><option>Nam</option><option>Nữ</option></select></div>
-  <div class="row" style="gap:10px"><div class="field" style="flex:1"><label>Ngày sinh</label><input id="enrollDob" type="text" placeholder="Ngày sinh"></div>
-    <div class="field" style="flex:1"><label>Phòng</label><input id="enrollRoom"></div></div>
+  <div class="field"><label>Full name</label><input id="enrollName" placeholder="John Smith"></div>
+  <div class="field"><label>Gender</label>
+    <select id="enrollGender"><option value="">—</option><option value="Male">Male</option><option value="Female">Female</option></select></div>
+  <div class="row" style="gap:10px">
+    <div class="field" style="flex:1"><label>Date of birth</label><input id="enrollDob" type="date"></div>
+    <div class="field" style="flex:1"><label>Room</label><input id="enrollRoom" placeholder="Room"></div>
+  </div>
   <div class="row" style="justify-content:flex-end;margin-top:8px">
-    <button class="secondary" onclick="enrollDlg.close()">Hủy</button>
-    <button onclick="submitEnroll()">Ghi danh</button>
+    <button class="secondary" onclick="enrollDlg.close()">Cancel</button>
+    <button onclick="submitEnroll()">Enroll</button>
   </div>
 </dialog>
 
@@ -83,32 +86,27 @@
 <script>
 const API = location.origin;
 const TABS = [
-  ["dashboard","Tổng quan"],["live","Trực tiếp & Ghi danh"],
-  ["persons","Người"],["events","Sự kiện"],["zones","Vùng"],
+  ["dashboard","Overview"],
+  ["live","Live & Enroll"],
+  ["persons","People"],
+  ["events","Events"],
+  ["zones","Zones"],
 ];
 let current = "dashboard";
 
-function saveKey(){ localStorage.setItem("safeaging_key", document.getElementById("apiKey").value.trim()); toast("Đã lưu khóa"); render(); }
+function saveKey(){ localStorage.setItem("safeaging_key", document.getElementById("apiKey").value.trim()); toast("API key saved"); render(); }
 function key(){ return localStorage.getItem("safeaging_key")||""; }
 function toast(m){ const t=document.getElementById("toast"); t.textContent=m; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),2200); }
 
-function parseDobInput(raw){
-  const t=(raw||"").trim();
-  if(!t) return null;
-  const m=t.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
-  if(m){
-    const d=+m[1], mo=+m[2], y=+m[3];
-    if(d<1||d>31||mo<1||mo>12) return null;
-    return `${y}-${String(mo).padStart(2,"0")}-${String(d).padStart(2,"0")}`;
-  }
-  if(/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
-  return null;
+function dobValue(elId){
+  const v=(document.getElementById(elId).value||"").trim();
+  return v || null;
 }
 function formatDob(iso){
   if(!iso) return "";
-  const p=String(iso).slice(0,10).split("-");
-  if(p.length!==3) return iso;
-  return `${+p[2]}/${+p[1]}/${p[0]}`;
+  const d=new Date(String(iso).slice(0,10)+"T00:00:00");
+  if(Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-US");
 }
 function calcAgeFromIso(iso){
   if(!iso) return "";
@@ -116,8 +114,8 @@ function calcAgeFromIso(iso){
   if(p.length!==3) return "";
   const today=new Date();
   let age=today.getFullYear()-p[0];
-  const m=today.getMonth()+1, d=today.getDate();
-  if(m<p[1]||(m===p[1]&&d<p[2])) age--;
+  const m=today.getMonth()+1, day=today.getDate();
+  if(m<p[1]||(m===p[1]&&day<p[2])) age--;
   return age>=0?age:"";
 }
 
@@ -130,7 +128,6 @@ async function api(path, opts={}){
     try{ const j=await r.json(); d=j.detail||""; if(Array.isArray(d)) d=d.map(x=>x.msg||x).join("; "); }catch(e){}
     throw new Error(r.status+(d?" "+d:""));
   }
-  // DELETE / soft-delete returns 204 No Content — must not call r.json().
   if(r.status===204 || r.status===205) return null;
   const ct=r.headers.get("content-type")||"";
   if(!ct.includes("application/json")) return r;
@@ -160,55 +157,53 @@ async function render(){
     if(current==="persons") await renderPersons();
     if(current==="events") await renderEvents();
     if(current==="zones") await renderZones();
-  } catch(e){ toast("Lỗi: "+e.message); }
+  } catch(e){ toast("Error: "+e.message); }
 }
 
-// ── Dashboard ──
 async function renderDashboard(){
   const el=document.getElementById("tab-dashboard");
-  el.innerHTML='<div class="card"><h3>Đang tải…</h3></div>';
+  el.innerHTML='<div class="card"><h3>Loading…</h3></div>';
   const s=await api("/admin/analytics/summary");
   el.innerHTML=`
-    <div class="card"><h3>Tổng quan hệ thống</h3>
+    <div class="card"><h3>System overview</h3>
       <div class="grid">
-        ${stat(s.events_24h,"Sự kiện 24h")}${stat(s.falls_24h,"Té ngã 24h")}
-        ${stat(s.zone_violations_24h,"Vi phạm vùng 24h")}${stat(s.active_persons,"Người đã ghi danh")}
-        ${stat(s.active_zones,"Vùng đang bật")}${stat(s.active_cameras,"Camera hoạt động")}
-        ${stat(s.alerts.sent,"Cảnh báo đã gửi")}${stat(s.alerts.failed,"Cảnh báo lỗi")}
+        ${stat(s.events_24h,"Events (24h)")}${stat(s.falls_24h,"Falls (24h)")}
+        ${stat(s.zone_violations_24h,"Zone violations (24h)")}${stat(s.active_persons,"Enrolled people")}
+        ${stat(s.active_zones,"Active zones")}${stat(s.active_cameras,"Active cameras")}
+        ${stat(s.alerts.sent,"Alerts sent")}${stat(s.alerts.failed,"Alerts failed")}
       </div></div>`;
 }
 function stat(n,l){ return `<div class="stat"><div class="n">${n??0}</div><div class="l">${l}</div></div>`; }
 
-// ── Live & Enroll ──
 async function renderLive(){
   const el=document.getElementById("tab-live");
   const data=await api("/admin/live/tracks");
-  let html='<div class="card"><h3>Người đang xuất hiện (trực tiếp)</h3>'+
-    '<p class="muted">Bấm "Ghi danh" cho người đang là Unknown để hệ thống nhớ mặt cho lần sau.</p>';
+  let html='<div class="card"><h3>People on camera (live)</h3>'+
+    '<p class="muted">Click <b>Enroll</b> on an Unknown track to register their face for future recognition.</p>';
   const cams=Object.keys(data.cameras||{});
-  if(!cams.length) html+='<p class="muted">Chưa có camera nào đang gửi dữ liệu.</p>';
+  if(!cams.length) html+='<p class="muted">No cameras are sending data yet.</p>';
   cams.forEach(cam=>{
     const tracks=data.cameras[cam];
-    html+=`<h4>Camera: ${cam}</h4><table><tr><th>Track</th><th>Danh tính</th><th>No.</th><th></th></tr>`;
-    if(!tracks.length) html+='<tr><td colspan=4 class="muted">Không có người.</td></tr>';
+    html+=`<h4>Camera: ${cam}</h4><table><tr><th>Track</th><th>Identity</th><th>No.</th><th></th></tr>`;
+    if(!tracks.length) html+='<tr><td colspan=4 class="muted">No people detected.</td></tr>';
     tracks.forEach(t=>{
       const rec=t.recognized;
-      const idtxt=rec?`<span class="tag ok">${t.person_name}${t.gender?", "+t.gender:""}${t.person_age!=null?", "+t.person_age+" tuổi":""}</span>`
+      const idtxt=rec?`<span class="tag ok">${t.person_name}${t.gender?", "+t.gender:""}${t.person_age!=null?", "+t.person_age+" yrs":""}</span>`
                      :`<span class="tag warn">Unknown</span>`;
-      const action = rec?'' : `<button onclick="openEnroll('${cam}',${t.track_id},${t.has_crop})">Ghi danh</button>`;
+      const action = rec?'' : `<button onclick="openEnroll('${cam}',${t.track_id},${t.has_crop})">Enroll</button>`;
       html+=`<tr><td>#${t.track_id}</td><td>${idtxt}</td><td>${t.person_no??""}</td><td>${action}</td></tr>`;
     });
     html+='</table>';
   });
-  html+='<div class="row" style="margin-top:10px"><button class="secondary" onclick="render()">↻ Làm mới</button></div></div>';
+  html+='<div class="row" style="margin-top:10px"><button class="secondary" onclick="render()">↻ Refresh</button></div></div>';
   el.innerHTML=html;
 }
 function openEnroll(cam,track,hasCrop){
   document.getElementById("enrollCamera").value=cam;
   document.getElementById("enrollTrack").value=track;
   document.getElementById("enrollInfo").textContent = hasCrop
-    ? `Camera ${cam}, track #${track} — sẽ dùng ảnh khuôn mặt gần nhất.`
-    : `Camera ${cam}, track #${track} — CHƯA có ảnh khuôn mặt, hãy chờ người quay mặt về camera.`;
+    ? `Camera ${cam}, track #${track} — will use the most recent face crop.`
+    : `Camera ${cam}, track #${track} — no face crop yet; wait until the person faces the camera.`;
   document.getElementById("enrollName").value="";
   document.getElementById("enrollGender").value="";
   document.getElementById("enrollDob").value="";
@@ -216,68 +211,60 @@ function openEnroll(cam,track,hasCrop){
   document.getElementById("enrollDlg").showModal();
 }
 async function submitEnroll(){
-  const dobRaw=document.getElementById("enrollDob").value.trim();
-  const dob=parseDobInput(dobRaw);
-  if(dobRaw && !dob){ toast("Ngày sinh không hợp lệ (vd. 26/9/2003)"); return; }
   const body={ camera_id:document.getElementById("enrollCamera").value,
     track_id:parseInt(document.getElementById("enrollTrack").value),
     name:document.getElementById("enrollName").value.trim(),
     gender:document.getElementById("enrollGender").value||null,
-    date_of_birth:dob,
+    date_of_birth:dobValue("enrollDob"),
     room:document.getElementById("enrollRoom").value.trim()||null };
-  if(!body.name){ toast("Nhập họ tên"); return; }
+  if(!body.name){ toast("Enter full name"); return; }
   try{ const r=await api("/admin/enroll/from-track",{method:"POST",body});
     document.getElementById("enrollDlg").close();
-    toast("Đã ghi danh: "+r.person_name); render();
-  }catch(e){ toast("Lỗi ghi danh: "+e.message); }
+    toast("Enrolled: "+r.person_name); render();
+  }catch(e){ toast("Enroll failed: "+e.message); }
 }
 
 let _addingPerson=false;
 
-// ── Persons ──
 async function renderPersons(){
   const el=document.getElementById("tab-persons");
   const ps=await api("/admin/persons?limit=500&status=active");
-  let html='<div class="card"><h3>Thêm người (ảnh hoặc video)</h3><div class="row">'+
-    '<input id="pName" placeholder="Họ tên">'+
-    '<select id="pGender"><option value="">Giới tính</option><option>Nam</option><option>Nữ</option></select>'+
-    '<input id="pDob" placeholder="Ngày sinh">'+
-    '<input id="pRoom" placeholder="Phòng">'+
+  let html='<div class="card"><h3>Add person (photos or video)</h3><div class="row">'+
+    '<input id="pName" placeholder="Full name">'+
+    '<select id="pGender"><option value="">Gender</option><option value="Male">Male</option><option value="Female">Female</option></select>'+
+    '<input id="pDob" type="date" title="Date of birth">'+
+    '<input id="pRoom" placeholder="Room">'+
     '<input id="pFile" type="file" accept="image/*,video/*" multiple>'+
-    '<button id="pSubmit" onclick="addPersonWithFace()">Tạo + Ghi danh mặt</button></div>'+
-    '<p class="muted">Ảnh: chọn <b>5–30</b> tấm mặt rõ. Video: 1 clip — hệ thống lấy frame ~4 fps (tối đa 30), cần ≥5 frame có mặt. '+
-    'Nhập <b>ngày sinh</b> (vd. 26/9/2003) — tuổi tự tính theo ngày hiện tại. '+
-    'Xử lý face có thể mất 1–3 phút — <b>chỉ bấm một lần</b>.</p></div>';
-  html+='<div class="card"><h3>Danh sách người ('+ps.length+')</h3><table><tr><th>Tên</th><th>Giới</th><th>Ngày sinh</th><th>Tuổi</th><th>Phòng</th><th>Trạng thái</th><th></th></tr>';
+    '<button id="pSubmit" onclick="addPersonWithFace()">Create + enroll face</button></div>'+
+    '<p class="muted">Photos: pick <b>5–30</b> clear face images. Video: one clip — frames sampled ~4 fps (max 30), need ≥5 frames with a face. '+
+    'Pick a <b>date of birth</b> — age is calculated automatically. Face processing may take 1–3 minutes — <b>click once only</b>.</p></div>';
+  html+='<div class="card"><h3>People ('+ps.length+')</h3><table><tr><th>Name</th><th>Gender</th><th>Date of birth</th><th>Age</th><th>Room</th><th>Status</th><th></th></tr>';
   ps.forEach(p=>{ const age=p.age??calcAgeFromIso(p.date_of_birth);
     html+=`<tr><td>${p.name}</td><td>${p.gender||""}</td><td>${formatDob(p.date_of_birth)}</td><td>${age??""}</td><td>${p.room||""}</td>
-    <td>${p.status}</td><td><button class="secondary" onclick="delPerson('${p.id}')">Xóa</button></td></tr>`; });
+    <td>${p.status}</td><td><button class="secondary" onclick="delPerson('${p.id}')">Remove</button></td></tr>`; });
   html+='</table></div>';
   el.innerHTML=html;
 }
 async function addPersonWithFace(){
-  if(_addingPerson){ toast("Đang xử lý, vui lòng đợi…"); return; }
+  if(_addingPerson){ toast("Processing, please wait…"); return; }
   const name=document.getElementById("pName").value.trim();
   const files=[...document.getElementById("pFile").files];
-  if(!name){ toast("Nhập tên"); return; }
-  if(!files.length){ toast("Chọn 5–30 ảnh hoặc 1 video"); return; }
-  const dobRaw=document.getElementById("pDob").value.trim();
-  const dob=parseDobInput(dobRaw);
-  if(dobRaw && !dob){ toast("Ngày sinh không hợp lệ (vd. 26/9/2003)"); return; }
+  if(!name){ toast("Enter full name"); return; }
+  if(!files.length){ toast("Choose 5–30 photos or one video"); return; }
   const videos=files.filter(f=>f.type.startsWith("video/"));
   const images=files.filter(f=>f.type.startsWith("image/"));
-  if(videos.length&&images.length){ toast("Chỉ ảnh HOẶC 1 video, không trộn"); return; }
-  if(videos.length>1){ toast("Chỉ 1 video"); return; }
+  if(videos.length&&images.length){ toast("Use photos OR one video, not both"); return; }
+  if(videos.length>1){ toast("Only one video allowed"); return; }
   if(images.length&&(images.length<5||images.length>30)){
-    toast("Cần 5–30 ảnh (hiện "+images.length+")"); return; }
+    toast("Need 5–30 photos (selected "+images.length+")"); return; }
   const btn=document.getElementById("pSubmit");
   _addingPerson=true;
-  if(btn){ btn.disabled=true; btn.textContent="Đang xử lý face…"; }
-  toast("Đang ghi danh (InsightFace, có thể 1–3 phút)…");
+  if(btn){ btn.disabled=true; btn.textContent="Processing face…"; }
+  toast("Enrolling faces (InsightFace, may take 1–3 min)…");
   try{
     const p=await api("/admin/persons",{method:"POST",body:{ name,
       gender:document.getElementById("pGender").value||null,
-      date_of_birth:dob,
+      date_of_birth:dobValue("pDob"),
       room:document.getElementById("pRoom").value.trim()||null,
       status:"active" }});
     let batch;
@@ -290,42 +277,40 @@ async function addPersonWithFace(){
       batch=await api(`/admin/persons/${p.id}/embeddings/face-batch`,{method:"POST",
         body:{ images_b64, source:"upload_batch" }});
     }
-    toast(`Đã thêm ${p.name}: ${batch.embeddings_created} mẫu mặt (${batch.frames_with_face}/${batch.frames_processed} frame)`);
+    toast(`Added ${p.name}: ${batch.embeddings_created} face template(s) (${batch.frames_with_face}/${batch.frames_processed} frames)`);
     document.getElementById("pName").value="";
     document.getElementById("pDob").value="";
     document.getElementById("pFile").value="";
     render();
-  }catch(e){ toast("Lỗi: "+e.message); }
+  }catch(e){ toast("Error: "+e.message); }
   finally{
     _addingPerson=false;
-    if(btn){ btn.disabled=false; btn.textContent="Tạo + Ghi danh mặt"; }
+    if(btn){ btn.disabled=false; btn.textContent="Create + enroll face"; }
   }
 }
 async function delPerson(id){
-  if(!confirm("Ẩn người này khỏi danh sách? (soft-delete, không xóa hẳn DB)"))return;
-  try{ await api(`/admin/persons/${id}`,{method:"DELETE"}); toast("Đã xóa"); render(); }
-  catch(e){ toast("Lỗi: "+e.message); }
+  if(!confirm("Remove this person from the list? (soft-delete — record kept in database)"))return;
+  try{ await api(`/admin/persons/${id}`,{method:"DELETE"}); toast("Removed"); render(); }
+  catch(e){ toast("Error: "+e.message); }
 }
 function fileToB64(file){ return new Promise((res,rej)=>{ const r=new FileReader();
   r.onload=()=>res(r.result.split(",")[1]); r.onerror=rej; r.readAsDataURL(file); }); }
 
-// ── Events ──
 async function renderEvents(){
   const el=document.getElementById("tab-events");
   const evs=await api("/admin/events?limit=50");
-  let html='<div class="card"><h3>Sự kiện gần đây</h3><table><tr><th>Thời gian</th><th>Loại</th><th>Camera</th><th>Người</th><th>Ảnh</th></tr>';
+  let html='<div class="card"><h3>Recent events</h3><table><tr><th>Time</th><th>Type</th><th>Camera</th><th>Person</th><th>Snapshot</th></tr>';
   for(const e of evs){
-    const typeTag = e.event_type==="fall"?'<span class="tag bad">Té ngã</span>'
-      : e.event_type==="zone_violation"?'<span class="tag warn">Vùng nguy hiểm</span>'
+    const typeTag = e.event_type==="fall"?'<span class="tag bad">Fall</span>'
+      : e.event_type==="zone_violation"?'<span class="tag warn">Zone violation</span>'
       : '<span class="tag">'+e.event_type+'</span>';
     const snap = e.payload && e.payload.snapshot_key
-      ? `<img class="snap" id="snap-${e.id}" alt="…">` : '';
+      ? `<img class="snap" id="snap-${e.id}" alt="snapshot">` : '';
     html+=`<tr><td>${new Date(e.occurred_at).toLocaleString()}</td><td>${typeTag}</td><td>${e.camera_id}</td>
-      <td>${e.person_id?'<span class="tag ok">đã gắn</span>':'<span class="muted">—</span>'}</td><td>${snap}</td></tr>`;
+      <td>${e.person_id?'<span class="tag ok">linked</span>':'<span class="muted">—</span>'}</td><td>${snap}</td></tr>`;
   }
-  html+='</table><div class="row" style="margin-top:10px"><button class="secondary" onclick="render()">↻ Làm mới</button></div></div>';
+  html+='</table><div class="row" style="margin-top:10px"><button class="secondary" onclick="render()">↻ Refresh</button></div></div>';
   el.innerHTML=html;
-  // Load snapshots via authenticated fetch -> blob URL (img src can't send headers).
   for(const e of evs){
     if(e.payload && e.payload.snapshot_key){
       loadSnap(e.id).catch(()=>{ const im=document.getElementById("snap-"+e.id); if(im) im.style.display="none"; });
@@ -339,36 +324,35 @@ async function loadSnap(id){
   if(im) im.src=URL.createObjectURL(blob);
 }
 
-// ── Zones ──
 async function renderZones(){
   const el=document.getElementById("tab-zones");
   const zs=await api("/admin/zones?active_only=false");
-  let html='<div class="card"><h3>Tạo vùng (polygon)</h3><div class="row">'+
+  let html='<div class="card"><h3>Create zone (polygon)</h3><div class="row">'+
     '<input id="zCam" placeholder="camera_id">'+
-    '<input id="zName" placeholder="Tên vùng">'+
-    '<select id="zType"><option value="forbidden">forbidden (cấm)</option><option value="entry">entry</option><option value="exit">exit</option><option value="roi">roi</option></select>'+
-    '</div><div class="field" style="margin-top:8px"><label>Điểm polygon (pixel): [[x,y],[x,y],...]</label>'+
+    '<input id="zName" placeholder="Zone name">'+
+    '<select id="zType"><option value="forbidden">forbidden</option><option value="entry">entry</option><option value="exit">exit</option><option value="roi">roi</option></select>'+
+    '</div><div class="field" style="margin-top:8px"><label>Polygon points (pixels): [[x,y],[x,y],...]</label>'+
     '<textarea id="zPts" rows="2" placeholder="[[100,100],[400,100],[400,400],[100,400]]" style="width:100%"></textarea></div>'+
-    '<button onclick="addZone()">Tạo vùng</button>'+
-    '<p class="muted">Tọa độ tính theo pixel trên khung hình đầy đủ của camera.</p></div>';
-  html+='<div class="card"><h3>Danh sách vùng</h3><table><tr><th>Camera</th><th>Tên</th><th>Loại</th><th>Bật</th><th></th></tr>';
+    '<button onclick="addZone()">Create zone</button>'+
+    '<p class="muted">Coordinates are in full-frame camera pixels.</p></div>';
+  html+='<div class="card"><h3>Zones</h3><table><tr><th>Camera</th><th>Name</th><th>Type</th><th>Active</th><th></th></tr>';
   zs.forEach(z=>{ html+=`<tr><td>${z.camera_id}</td><td>${z.name}</td><td>${z.zone_type}</td>
     <td>${z.active?'<span class="tag ok">on</span>':'<span class="tag bad">off</span>'}</td>
-    <td><button class="secondary" onclick="delZone('${z.id}')">Tắt</button></td></tr>`; });
+    <td><button class="secondary" onclick="delZone('${z.id}')">Disable</button></td></tr>`; });
   html+='</table></div>';
   el.innerHTML=html;
 }
 async function addZone(){
-  let pts; try{ pts=JSON.parse(document.getElementById("zPts").value); }catch(e){ toast("Polygon không hợp lệ"); return; }
+  let pts; try{ pts=JSON.parse(document.getElementById("zPts").value); }catch(e){ toast("Invalid polygon JSON"); return; }
   const body={ camera_id:document.getElementById("zCam").value.trim(),
     name:document.getElementById("zName").value.trim(),
     zone_type:document.getElementById("zType").value,
     geometry:{points:pts}, active:true };
-  if(!body.camera_id||!body.name){ toast("Nhập camera_id và tên"); return; }
-  try{ await api("/admin/zones",{method:"POST",body}); toast("Đã tạo vùng"); render(); }catch(e){ toast(e.message); }
+  if(!body.camera_id||!body.name){ toast("Enter camera_id and zone name"); return; }
+  try{ await api("/admin/zones",{method:"POST",body}); toast("Zone created"); render(); }catch(e){ toast(e.message); }
 }
-async function delZone(id){ if(!confirm("Tắt vùng này?"))return;
-  try{ await api(`/admin/zones/${id}`,{method:"DELETE"}); toast("Đã tắt"); render(); }catch(e){ toast(e.message); } }
+async function delZone(id){ if(!confirm("Disable this zone?"))return;
+  try{ await api(`/admin/zones/${id}`,{method:"DELETE"}); toast("Zone disabled"); render(); }catch(e){ toast(e.message); } }
 
 render();
 setInterval(()=>{ if(current==="live") renderLive().catch(()=>{}); }, 4000);
