@@ -12,7 +12,7 @@ import base64
 import hmac
 import threading
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from .retention import get_status as _retention_status
@@ -24,6 +24,7 @@ from .config import API_KEY, API_KEY_REQUIRED
 from .db import get_session
 from .db import dal
 from .config import logger
+from .person_age import effective_age, parse_date_of_birth
 from .zone_engine import invalidate_zone_cache
 from .config_engine import invalidate_config_cache
 
@@ -52,9 +53,44 @@ def _require_db() -> None:
 
 # ── Pydantic schemas ───────────────────────────────────────────────────────────
 
+def _prepare_person_write(payload: dict) -> dict:
+    """Parse date_of_birth; do not persist client-supplied age (computed at read time)."""
+    data = dict(payload)
+    dob_raw = data.pop("date_of_birth", None)
+    data.pop("age", None)
+    if dob_raw:
+        dob = parse_date_of_birth(dob_raw)
+        if dob is None:
+            raise HTTPException(
+                status_code=422,
+                detail="date_of_birth không hợp lệ — dùng DD/MM/YYYY (vd. 26/9/2003)",
+            )
+        data["date_of_birth"] = dob
+    return data
+
+
+def _person_to_out(person: Any) -> "PersonOut":
+    dob = getattr(person, "date_of_birth", None)
+    return PersonOut(
+        id=person.id,
+        name=person.name,
+        gender=person.gender,
+        notes=person.notes,
+        room=person.room,
+        status=person.status,
+        created_at=person.created_at,
+        updated_at=person.updated_at,
+        date_of_birth=dob,
+        age=effective_age(date_of_birth=dob, stored_age=getattr(person, "age", None)),
+    )
+
+
 class PersonCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
-    age: Optional[int] = Field(None, ge=0, le=150)
+    date_of_birth: Optional[str] = Field(
+        None,
+        description="Ngày sinh DD/MM/YYYY hoặc YYYY-MM-DD (tuổi tính tự động)",
+    )
     gender: Optional[str] = Field(None, max_length=50)
     notes: Optional[str] = None
     room: Optional[str] = Field(None, max_length=255)
@@ -63,7 +99,10 @@ class PersonCreate(BaseModel):
 
 class PersonUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
-    age: Optional[int] = Field(None, ge=0, le=150)
+    date_of_birth: Optional[str] = Field(
+        None,
+        description="Ngày sinh DD/MM/YYYY hoặc YYYY-MM-DD",
+    )
     gender: Optional[str] = Field(None, max_length=50)
     notes: Optional[str] = None
     room: Optional[str] = Field(None, max_length=255)
@@ -71,11 +110,10 @@ class PersonUpdate(BaseModel):
 
 
 class PersonOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: uuid.UUID
     name: str
-    age: Optional[int]
+    age: Optional[int] = Field(None, description="Tuổi tính từ ngày sinh (real-time)")
+    date_of_birth: Optional[date] = None
     gender: Optional[str]
     notes: Optional[str]
     room: Optional[str]
@@ -253,7 +291,10 @@ class EnrollFromTrackBody(BaseModel):
     # name (+ optional fields) to create a new person on the fly.
     person_id: Optional[uuid.UUID] = Field(None, description="Existing person to attach the face to")
     name: Optional[str] = Field(None, min_length=1, max_length=255)
-    age: Optional[int] = Field(None, ge=0, le=150)
+    date_of_birth: Optional[str] = Field(
+        None,
+        description="Ngày sinh DD/MM/YYYY hoặc YYYY-MM-DD",
+    )
     gender: Optional[str] = Field(None, max_length=50)
     room: Optional[str] = Field(None, max_length=255)
     notes: Optional[str] = None
@@ -293,15 +334,16 @@ async def list_persons(
     _require_db()
     async with get_session() as session:
         persons = await dal.list_persons(session, status=status, limit=limit)
-    return [PersonOut.model_validate(p) for p in persons]
+    return [ _person_to_out(p) for p in persons ]
 
 
 @router.post("/persons", response_model=PersonOut, status_code=201, summary="Create person")
 async def create_person(body: PersonCreate):
     _require_db()
+    payload = _prepare_person_write(body.model_dump())
     async with get_session() as session:
-        person = await dal.create_person(session, **body.model_dump())
-        out = PersonOut.model_validate(person)  # capture before commit expires
+        person = await dal.create_person(session, **payload)
+        out = _person_to_out(person)
         await session.commit()
     logger.info(f"[admin] Created person id={out.id} name={out.name!r}")
     return out
@@ -314,20 +356,21 @@ async def get_person(person_id: uuid.UUID):
         person = await dal.get_person(session, person_id)
     if person is None:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-    return PersonOut.model_validate(person)
+    return _person_to_out(person)
 
 
 @router.put("/persons/{person_id}", response_model=PersonOut, summary="Update person")
 async def update_person(person_id: uuid.UUID, body: PersonUpdate):
     _require_db()
-    payload = {k: v for k, v in body.model_dump().items() if v is not None}
-    if not payload:
+    raw = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not raw:
         raise HTTPException(status_code=422, detail="No fields provided for update")
+    payload = _prepare_person_write(raw)
     async with get_session() as session:
         person = await dal.update_person(session, person_id, **payload)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-        out = PersonOut.model_validate(person)
+        out = _person_to_out(person)
         await session.commit()
     logger.info(f"[admin] Updated person id={person_id} fields={list(payload.keys())}")
     return out
@@ -858,6 +901,7 @@ async def live_tracks(camera_id: Optional[str] = Query(None, description="Filter
                 "person_id": ident.get("person_id"),
                 "person_name": ident.get("name") or ("Unknown" if ident else None),
                 "person_no": ident.get("no"),
+                "person_age": ident.get("age"),
                 "gender": ident.get("gender"),
                 "bbox": {"x": bbox[0], "y": bbox[1], "x2": bbox[2], "y2": bbox[3]},
                 "has_crop": tid in (state.get("recent_crops") or {}),
@@ -954,15 +998,15 @@ async def enroll_from_track(body: EnrollFromTrackBody):
             if person is None:
                 raise HTTPException(status_code=404, detail=f"Person {body.person_id} not found")
         else:
-            person = await dal.create_person(
-                session,
-                name=body.name,
-                age=body.age,
-                gender=body.gender,
-                room=body.room,
-                notes=body.notes,
-                status="active",
-            )
+            create_payload = _prepare_person_write({
+                "name": body.name,
+                "date_of_birth": body.date_of_birth,
+                "gender": body.gender,
+                "room": body.room,
+                "notes": body.notes,
+                "status": "active",
+            })
+            person = await dal.create_person(session, **create_payload)
             created_person = True
         person_pk = person.id
         person_name = person.name

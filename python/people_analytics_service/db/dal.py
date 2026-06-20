@@ -146,6 +146,8 @@ async def list_face_gallery(session: AsyncSession) -> list[dict]:
             PersonEmbedding.person_id,
             PersonModel.name,
             PersonModel.gender,
+            PersonModel.date_of_birth,
+            PersonModel.age,
             PersonEmbedding.embedding,
         )
         .join(PersonModel, PersonEmbedding.person_id == PersonModel.id)
@@ -161,6 +163,8 @@ async def list_face_gallery(session: AsyncSession) -> list[dict]:
             "person_id": row.person_id,
             "name": row.name,
             "gender": row.gender,
+            "date_of_birth": row.date_of_birth,
+            "age": row.age,
             "embedding": row.embedding,
         }
         for row in result.fetchall()

@@ -11,7 +11,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -71,10 +71,11 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 );
 
 CREATE TABLE IF NOT EXISTS persons (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    age        INTEGER,
-    gender     TEXT,
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    age             INTEGER,
+    date_of_birth   TEXT,
+    gender          TEXT,
     notes      TEXT,
     room       TEXT,
     status     TEXT NOT NULL DEFAULT 'active',
@@ -158,6 +159,7 @@ class PersonRecord:
     id: uuid.UUID
     name: str
     age: int | None
+    date_of_birth: date | None
     gender: str | None
     notes: str | None
     room: str | None
@@ -243,6 +245,7 @@ def init_edge_store(path: str) -> None:
         conn = _connect()
         try:
             conn.executescript(_SCHEMA_SQL)
+            _migrate_schema(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', ?)",
                 (str(_SCHEMA_VERSION),),
@@ -250,6 +253,12 @@ def init_edge_store(path: str) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(persons)")}
+    if "date_of_birth" not in cols:
+        conn.execute("ALTER TABLE persons ADD COLUMN date_of_birth TEXT")
 
 
 def is_initialized() -> bool:
@@ -271,11 +280,29 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _parse_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def _date_to_str(value: date | str | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)[:10]
+
+
 def _row_person(row: sqlite3.Row) -> PersonRecord:
     return PersonRecord(
         id=_parse_uuid(row["id"]),  # type: ignore[arg-type]
         name=row["name"],
         age=row["age"],
+        date_of_birth=_parse_date(row["date_of_birth"]),
         gender=row["gender"],
         notes=row["notes"],
         room=row["room"],
@@ -398,6 +425,7 @@ def create_person(**kwargs: Any) -> PersonRecord:
         "id": _uuid_str(person_id),
         "name": kwargs["name"],
         "age": kwargs.get("age"),
+        "date_of_birth": _date_to_str(kwargs.get("date_of_birth")),
         "gender": kwargs.get("gender"),
         "notes": kwargs.get("notes"),
         "room": kwargs.get("room"),
@@ -410,8 +438,8 @@ def create_person(**kwargs: Any) -> PersonRecord:
         try:
             conn.execute(
                 "INSERT INTO persons "
-                "(id, name, age, gender, notes, room, status, created_at, updated_at) "
-                "VALUES (:id, :name, :age, :gender, :notes, :room, :status, "
+                "(id, name, age, date_of_birth, gender, notes, room, status, created_at, updated_at) "
+                "VALUES (:id, :name, :age, :date_of_birth, :gender, :notes, :room, :status, "
                 ":created_at, :updated_at)",
                 row,
             )
@@ -430,6 +458,8 @@ def update_person(person_id: uuid.UUID, **kwargs: Any) -> PersonRecord | None:
     for key, value in kwargs.items():
         if key == "updated_at" and isinstance(value, datetime):
             value = _dt_to_str(value)
+        elif key == "date_of_birth":
+            value = _date_to_str(value)
         sets.append(f"{key} = ?")
         params.append(value)
     params.append(_uuid_str(person_id))
@@ -522,7 +552,7 @@ def list_face_gallery() -> list[dict]:
         conn = _connect()
         try:
             rows = conn.execute(
-                "SELECT pe.person_id, p.name, p.gender, pe.embedding "
+                "SELECT pe.person_id, p.name, p.gender, p.date_of_birth, p.age, pe.embedding "
                 "FROM person_embeddings pe "
                 "JOIN persons p ON pe.person_id = p.id "
                 "WHERE p.status = 'active' AND pe.embedding_type = 'face' "
@@ -533,6 +563,8 @@ def list_face_gallery() -> list[dict]:
                     "person_id": _parse_uuid(r["person_id"]),
                     "name": r["name"],
                     "gender": r["gender"],
+                    "date_of_birth": _parse_date(r["date_of_birth"]),
+                    "age": r["age"],
                     "embedding": r["embedding"],
                 }
                 for r in rows

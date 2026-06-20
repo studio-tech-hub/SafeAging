@@ -46,6 +46,7 @@ class FaceMatch:
     person_id: str
     name: str
     gender: Optional[str]
+    age: Optional[int]
     score: float
 
 
@@ -188,12 +189,18 @@ def _bg_load_gallery() -> None:
 
         rows = run_async(_async_load_gallery())
         parsed: list[tuple] = []
+        from .person_age import effective_age
+
         for r in rows:
             try:
                 vec = bytes_to_embedding(r["embedding"])
                 if vec.shape[0] != FACE_EMBEDDING_DIM:
                     continue
-                parsed.append((str(r["person_id"]), r["name"], r.get("gender"), vec))
+                age = effective_age(
+                    date_of_birth=r.get("date_of_birth"),
+                    stored_age=r.get("age"),
+                )
+                parsed.append((str(r["person_id"]), r["name"], r.get("gender"), age, vec))
             except Exception:
                 continue
         with _gallery_lock:
@@ -245,11 +252,11 @@ def match_embedding(query: np.ndarray, threshold: Optional[float] = None) -> Opt
 
     best: Optional[FaceMatch] = None
     best_score = -1.0
-    for pid, name, gender, ref in gallery:
+    for pid, name, gender, age, ref in gallery:
         score = float(np.dot(query, ref))
         if score > best_score:
             best_score = score
-            best = FaceMatch(person_id=pid, name=name, gender=gender, score=score)
+            best = FaceMatch(person_id=pid, name=name, gender=gender, age=age, score=score)
 
     if best is not None and best_score >= thr:
         return best

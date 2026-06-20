@@ -1188,6 +1188,7 @@ namespace sample_company {
         const std::string personGender = jsonStr("person_gender");
         const std::string personId = jsonStr("person_id");
         const int personNo = jsonInt("person_no", -1);
+        const int personAge = jsonInt("person_age", -1);
 
                             if (w <= 0.0f || h <= 0.0f)
                                 continue;
@@ -1234,6 +1235,7 @@ namespace sample_company {
             personGender,
             personId,
             personNo,
+            personAge,
         });
 
                             result.push_back(detection);

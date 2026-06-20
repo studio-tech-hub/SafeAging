@@ -14,11 +14,12 @@ offline and later synced without ID conflicts.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -51,6 +52,7 @@ class Person(Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     age: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    date_of_birth: Mapped[date | None] = mapped_column(Date, nullable=True)
     gender: Mapped[str | None] = mapped_column(String(50), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     room: Mapped[str | None] = mapped_column(String(255), nullable=True)

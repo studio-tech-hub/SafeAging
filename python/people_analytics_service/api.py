@@ -168,6 +168,7 @@ class Detection(BaseModel):
     person_id: Optional[str] = None
     person_name: Optional[str] = None
     person_gender: Optional[str] = None
+    person_age: Optional[int] = None
     person_no: Optional[int] = None
     recognized: bool = False
 
@@ -448,6 +449,7 @@ def _apply_face_identity(
                     "person_id": match.person_id,
                     "name": match.name,
                     "gender": match.gender,
+                    "age": match.age,
                     "no": no,
                     "score": match.score,
                     "last_attempt": camera_frame_idx,
@@ -458,6 +460,7 @@ def _apply_face_identity(
                     "person_id": None,
                     "name": None,
                     "gender": None,
+                    "age": None,
                     "no": None,
                     "last_attempt": camera_frame_idx,
                 }
@@ -469,6 +472,7 @@ def _apply_face_identity(
             det.person_id = cached.get("person_id")
             det.person_name = cached.get("name")
             det.person_gender = cached.get("gender")
+            det.person_age = cached.get("age")
             det.person_no = cached.get("no")
         else:
             det.recognized = False

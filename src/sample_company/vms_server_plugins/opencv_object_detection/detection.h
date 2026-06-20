@@ -40,6 +40,7 @@ struct Detection
     const std::string personGender{};       //< "Nam" | "Nữ" | ""
     const std::string personId{};           //< Person UUID string, or ""
     const int personNo = -1;                //< Stable per-camera person index; -1 = none
+    const int personAge = -1;               //< Real-time age from date of birth; -1 = unknown
 };
 
 using DetectionList = std::vector<std::shared_ptr<Detection>>;

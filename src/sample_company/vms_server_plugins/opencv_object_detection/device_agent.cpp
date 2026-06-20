@@ -1938,6 +1938,13 @@ namespace sample_company
                         "Person No.",
                         std::to_string(detection->personNo)));
                 }
+                if (detection->personAge >= 0)
+                {
+                    objectMetadata->addAttribute(makePtr<Attribute>(
+                        IAttribute::Type::number,
+                        "Age",
+                        std::to_string(detection->personAge)));
+                }
                 if (!detection->personId.empty())
                 {
                     objectMetadata->addAttribute(makePtr<Attribute>(
@@ -1947,12 +1954,14 @@ namespace sample_company
                 }
             }
 
-            // Single combined caption for convenient overlay: "Ông A, Nam, No. 1" or "Unknown".
+            // Single combined caption: "Ông A, Nam, 22 tuổi, No. 1" or "Unknown".
             std::string identity = displayName;
             if (detection->recognized)
             {
                 if (!detection->personGender.empty())
                     identity += ", " + detection->personGender;
+                if (detection->personAge >= 0)
+                    identity += ", " + std::to_string(detection->personAge) + " tuổi";
                 if (detection->personNo >= 0)
                     identity += ", No. " + std::to_string(detection->personNo);
             }
