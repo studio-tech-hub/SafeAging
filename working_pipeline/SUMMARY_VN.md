@@ -1,471 +1,358 @@
-# 📋 TÓM TẮT - Hệ Thống Quản Lý Con Người Tại Viện Dưỡng Lão
+# 📋 Tóm Tắt Kiến Trúc - SafeAging
 
-**Ngày tạo:** 18/01/2026  
-**Trạng thái:** Sẵn sàng triển khai  
-**Thời gian thực hiện:** 8 tuần  
+**Ngày cập nhật:** 10/05/2026  
+**Trạng thái:** Kiến trúc chốt cho Phase P1  
+**Mục tiêu triển khai:** Làm trên Windows trước, triển khai production sau trên AI Box (edge inference) + hạ tầng trung tâm
 
 ---
 
 ## 🎯 Mục Tiêu Dự Án
 
-Phát triển hệ thống quản lý con người toàn diện cho viện dưỡng lão với:
-- ✅ Nhận diện & đếm người trong khung hình
-- ✅ Lưu thông tin người (Tên, tuổi, giới tính) via face recognition
-- ✅ Định nghĩa vùng nguy hiểm/vùng cấm
-- ✅ Cảnh báo khi người vào vùng cấm (qua email)
-- ✅ Phát hiện hành động té ngã ngay lập tức (email alert trong < 5 giây)
+Xây dựng hệ thống phân tích người cho môi trường viện dưỡng lão với các mục tiêu chính:
+
+- Phát hiện và theo dõi người trong khung hình từ camera NX
+- Ghi nhận sự kiện như đếm người, ngã, vào vùng cấm
+- Quản lý dữ liệu nghiệp vụ như người, vùng, cảnh báo, cấu hình camera
+- Lưu ảnh snapshot/crop để phục vụ điều tra hoặc nhận diện
+- Đảm bảo hệ thống vẫn chạy khi DB trung tâm tạm thời mất kết nối
 
 ---
 
-## 📊 Phân Chia Công Việc: 2 Người 2 Nhóm
+## ✅ Quyết Định Kiến Trúc Đã Chốt
 
-### **TEAM A: Kỹ Sư Service (Backend)**
-**Trách nhiệm:** Logic xử lý, database, tích hợp AI
+### Mô hình production
 
-**Công nghệ:**
-- Python + FastAPI (REST API)
-- PostgreSQL (cơ sở dữ liệu)
-- Azure Face API (nhận diện khuôn mặt)
-- SendGrid (gửi email)
+```text
+Camera
+→ Nx Server + Nx Plugin
+→ AI Service (edge, chạy trên AI Box)
+→ PostgreSQL (metadata DB trung tâm)
+→ MinIO / S3-compatible Object Storage (ảnh/snapshot/crop)
 
-**Sản phẩm (8 tuần):**
-| Tuần | Công việc | Kết quả |
-|------|----------|--------|
-| 1-2 | Schema DB + fall detection | Database + algorithm |
-| 3-4 | Face API + Email service | Tích hợp ngoài |
-| 5-6 | Tối ưu hiệu năng | Performance target |
-| 7-8 | Dashboard + monitoring | Production ready |
+Nx Archive / NAS
+→ video / playback / timeline
+```
+
+### Boundary rules
+
+- Plugin chỉ gọi AI Service
+- Plugin không truy cập PostgreSQL trực tiếp
+- AI Service là lớp duy nhất làm việc với DB trung tâm
+- Nx chịu trách nhiệm video/archive/playback
+- AI Service chịu trách nhiệm inference, business logic, event, sync và retry
+
+### Giao tiếp kỹ thuật
+
+- **Plugin ↔ AI Service:** REST/HTTP
+- **Không dùng gRPC trong Phase P1**
+- **Transport inference hiện tại:** giữ `POST /infer` theo JSON + base64 để tương thích với plugin hiện có
+- **Nâng cấp transport sau này:** có thể chuyển sang `multipart/form-data` mà không đổi response contract
+
+### Edge local persistence
+
+- **Chốt dùng SQLite**
+- Không đưa Redis vào scope P1
+- SQLite trên edge sẽ dùng cho:
+  - local outbox
+  - local config cache
+  - sync state
 
 ---
 
-### **TEAM B: Kỹ Sư Plugin (NX VMS)**
-**Trách nhiệm:** Xử lý video, tích hợp NX VMS, tính ổn định
+## 🧱 Phân Tách Trách Nhiệm Dữ Liệu
 
-**Công nghệ:**
-- C++ + NX VMS SDK
-- CMake + OpenCV
-- libcurl (HTTP client)
+### 1. Video / Archive / Playback
 
-**Sản phẩm (8 tuần):**
-| Tuần | Công việc | Kết quả |
-|------|----------|--------|
-| 1-2 | Cải thiện HTTP client | Robust communication |
-| 3-4 | Fall detection + Zone check | Phát hiện sự kiện |
-| 5-6 | Tối ưu + Docker | Production ready |
-| 7-8 | Multi-camera support | Scale up |
+- Thuộc về **Nx Archive / NAS**
+- Không lưu video thô trong PostgreSQL
 
----
+### 2. Metadata nghiệp vụ
 
-## 🔄 Pipeline Giao Tiếp
+- Thuộc về **PostgreSQL**
+- Bao gồm:
+  - `persons`
+  - `person_embeddings`
+  - `zones`
+  - `events`
+  - `alerts`
+  - `camera_configs`
 
-### **API Chính (Plugin → Service, Port 18000)**
+### 3. Snapshot / Crop Images
 
-```
-1. POST /detect
-   Input:  Frame dạng base64
-   Output: Bounding box + confidence
-   Latency: < 50ms
+- Thuộc về **MinIO / S3-compatible object storage**
+- Có thể dùng NAS/file share ở môi trường tạm thời, nhưng production khuyến nghị MinIO
 
-2. POST /analytics/fall-detection
-   Input:  Lịch sử bounding boxes (3-10 frames)
-   Output: {is_falling: true/false, confidence: 0-1}
-   Latency: < 100ms
+### 4. Database chỉ lưu metadata
 
-3. POST /analytics/zone-check
-   Input:  {camera_id, person_id, position}
-   Output: {zones: [...violations...]}
-   Latency: < 50ms
-
-4. GET /person/{person_id}
-   Input:  Person ID
-   Output: {name, age, gender, room, contact}
-   Latency: < 30ms
-
-5. GET /health
-   Input:  (none)
-   Output: Status + stats
-   Latency: < 10ms
-```
-
-### **Dòng Chảy Dữ Liệu**
-
-```
-Plugin (C++)
-    ↓ HTTP POST frame
-Service (Python)
-    ↓ Run YOLOv8
-    ↓ Detect people
-    ↓ Track motion
-    ↓ Analyze patterns
-    ├─→ Fall detector → DB (event)
-    ├─→ Zone check → DB (violation)
-    ├─→ Get person info → Azure Face API
-    ├─→ Send email → SendGrid
-    └─→ Log metrics → Prometheus
-    ↓
-Database (PostgreSQL)
-    ├─ Persons (tên, tuổi, giới tính)
-    ├─ Events (fall, zone_violation)
-    ├─ Face embeddings
-    └─ Zones (vùng cấm)
-```
+- `image_path`
+- `image_url`
+- `object_key`
+- metadata của event/person/zone/alert
 
 ---
 
-## 💾 Cơ Sở Dữ Liệu
+## 🔄 Chính Sách Khi Mất Kết Nối Mạng / DB
 
-### **PostgreSQL Schema (6 bảng)**
+### Khi AI Service mất kết nối PostgreSQL trung tâm
 
-```sql
-persons
-├─ id, name, age, gender, room_number
-├─ emergency_contact
-├─ face_image, face_embedding
-└─ status, created_at, updated_at
+- Inference **vẫn tiếp tục chạy**
+- Event **không được drop ngay**
+- Event phải được ghi vào **SQLite outbox**
+- Worker nền retry đồng bộ lại với PostgreSQL và object storage
+- Retry dùng **exponential backoff**
 
-events
-├─ id, event_type (fall/zone_violation)
-├─ person_id, camera_id, track_id
-├─ severity (low/medium/high/critical)
-└─ description, metadata, created_at
+### Local cache bắt buộc phải có
 
-face_embeddings
-├─ id, person_id, embedding (512-dim)
-├─ camera_id, capture_date
-└─ confidence
+- `zones`
+- `person_embeddings`
+- `watchlists`
+- `camera_configs`
+- `AI thresholds/rules`
 
-zones
-├─ id, camera_id, zone_name
-├─ zone_type (forbidden/danger)
-├─ polygon (coordinates)
-└─ is_active, created_at
+### Khi DB phục hồi
 
-alerts
-├─ id, event_id, person_id
-├─ alert_type (email/sms/push)
-├─ recipient, status
-└─ sent_at, error_message
-
-tracking_data (tạm thời)
-├─ person_id, track_id, camera_id
-├─ position (x, y), velocity
-└─ bbox, timestamp
-```
+- Worker nền tự sync lại event pending
+- Sync config nếu version trung tâm mới hơn cache local
 
 ---
 
-## 🌐 Dịch Vụ Bên Thứ 3 Đề Xuất
+## 🩺 Chuẩn Trạng Thái Health
 
-| Dịch Vụ | Chức Năng | Giá | Khuyến Cáo |
-|---------|----------|-----|-----------|
-| **Azure Face API** | Nhận diện khuôn mặt | $1-10/1k | ✅ Best choice (GDPR) |
-| **SendGrid** | Gửi email | $20/tháng | ✅ Reliable + templates |
-| **AWS SES** | Email alternative | $0.10/1k | Cost-effective |
-| **Twilio** | SMS alerts | $0.0075/SMS | Cho alert critical |
-| **Firebase FCM** | Push notifications | Free | Mobile app |
-| **Prometheus** | Metrics | Free | Open-source |
-| **Grafana** | Dashboards | Free | Visualization |
-| **ELK Stack** | Log management | Free | Elasticsearch + Kibana |
+### Top-level status
 
----
+- `healthy`
+- `degraded`
+- `not_ready`
 
-## 🚀 Roadmap 8 Tuần
+### Reason / condition codes
 
-### **Tuần 1-2: Xây Dựng Nền Tảng**
+- `db_unreachable`
+- `service_unreachable`
+- `config_stale`
+- `outbox_backlog_high`
 
-**TEAM A:**
-- [ ] Design database schema
-- [ ] Build ORM layer (SQLAlchemy)
-- [ ] Implement fall detection algorithm
-- [ ] Create service endpoints (/detect, /analytics/*)
-- [ ] Unit tests
+### Ý nghĩa
 
-**TEAM B:**
-- [ ] Refactor object_detector.cpp
-- [ ] Implement HTTP client with retries
-- [ ] Add health monitoring
-- [ ] Comprehensive logging
-- [ ] Unit tests
+- `healthy`: mọi dependency chính đang hoạt động bình thường
+- `degraded`: hệ thống vẫn chạy nhưng có suy giảm chức năng hoặc rủi ro vận hành
+- `not_ready`: service đang startup, warmup model, hoặc đang sync config ban đầu
 
-**Checkpoint:** Basic integration test works
+### Ví dụ
 
----
-
-### **Tuần 3-4: Tích Hợp**
-
-**TEAM A:**
-- [ ] Azure Face API integration
-- [ ] SendGrid email service
-- [ ] Person profile management
-- [ ] Zone validation logic
-- [ ] Integration tests
-
-**TEAM B:**
-- [ ] Fall detection trigger in plugin
-- [ ] Zone check integration
-- [ ] Person profile lookup
-- [ ] NX event generation
-- [ ] Integration tests
-
-**Checkpoint:** End-to-end fall detection working
-
----
-
-### **Tuần 5-6: Tối Ưu Hóa**
-
-**TEAM A:**
-- [ ] Performance optimization
-- [ ] Caching strategy (Redis)
-- [ ] Multi-camera coordination
-- [ ] Load testing
-
-**TEAM B:**
-- [ ] Memory optimization
-- [ ] Resilience patterns
-- [ ] Docker containerization
-- [ ] Stress testing
-
-**Checkpoint:** All performance targets met
-
----
-
-### **Tuần 7-8: Triển Khai Production**
-
-**TEAM A:**
-- [ ] Analytics dashboard
-- [ ] Monitoring setup
-- [ ] Documentation
-- [ ] Production deployment
-
-**TEAM B:**
-- [ ] Deployment automation
-- [ ] Logging aggregation
-- [ ] Incident response procedures
-- [ ] Final testing
-
-**Checkpoint:** Production ready & live
-
----
-
-## 📈 Mục Tiêu Hiệu Năng
-
-**Service (Python):**
-```
-Inference: < 50ms per frame
-API response: < 100ms @ 30fps
-DB queries: < 50ms
-Memory: < 4GB
-```
-
-**Plugin (C++):**
-```
-HTTP latency: 100-500ms (healthy)
-Processing: < 50ms per frame
-Memory: < 500MB per camera
-CPU: < 30% per camera
-```
-
-**Business:**
-```
-Fall detection latency: < 5 seconds
-Zone violation alert: < 2 seconds
-Alert delivery: > 99% within 5 seconds
-Detection accuracy: > 95%
-Service uptime: > 99.5%
+```json
+{
+  "status": "degraded",
+  "ready": true,
+  "reason_codes": ["db_unreachable", "outbox_backlog_high"],
+  "dependencies": {
+    "postgres": "down",
+    "object_storage": "up",
+    "config_cache": "fresh"
+  }
+}
 ```
 
 ---
 
-## 🔐 An Toàn & Bảo Mật
+## 🛠️ Công Nghệ Chốt Cho Phase P1
 
-```
-Data Protection:
-├─ Face embeddings encrypted at rest (AES-256)
-├─ PostgreSQL with SSL/TLS
-├─ JWT authentication for API
-└─ GDPR compliance for face data
-
-Network Security:
-├─ HTTPS/TLS for all external APIs
-├─ API rate limiting
-├─ Database access control
-└─ Secret management via .env
-
-Privacy:
-├─ Face data deletion policies
-├─ Audit logs for sensitive operations
-├─ Per-camera access control
-└─ Data retention policies
-```
+| Thành phần | Lựa chọn |
+|-----------|----------|
+| Video / playback | Nx Archive / NAS |
+| Plugin ↔ Service | REST/HTTP |
+| Metadata DB trung tâm | PostgreSQL 16+ |
+| Object storage | MinIO |
+| Edge outbox/cache | SQLite |
+| Monitoring | Prometheus + Grafana |
+| Logging | Structured JSON logging |
+| Email alert | Worker nền + provider ngoài (ví dụ SendGrid/AWS SES) |
 
 ---
 
-## 📦 Triển Khai Docker
+## 📦 Trách Nhiệm Của Từng Thành Phần
 
-```yaml
-Services:
-├─ Service (Python) × 2 instances
-├─ PostgreSQL (database)
-├─ Redis (cache)
-├─ Nginx (load balancer)
-├─ Prometheus (metrics)
-├─ Grafana (dashboards)
-├─ Elasticsearch (logs)
-└─ Kibana (log analysis)
+### Nx Server + Plugin
 
-docker-compose up -d   # Start all
-docker-compose down -v # Stop & cleanup
-docker-compose logs -f service_1 # View logs
-```
+- Nhận frame từ camera
+- Gọi `POST /infer`
+- Poll `GET /health`
+- Đẩy metadata/event sang NX
+- Hiển thị diagnostic event rõ ràng khi service degraded hoặc unavailable
 
----
+### AI Service
 
-## 📞 Giao Tiếp Hằng Ngày
+- Chạy model inference
+- Theo dõi người, fall detection, zone logic
+- Ghi event vào local outbox trước
+- Sync event, alert, snapshot metadata về PostgreSQL và MinIO
+- Cache config local để tiếp tục chạy khi DB down
 
-### **Daily Standup (15 phút)**
-```
-09:30 AM
-├─ TEAM A: Completed + Today + Blockers
-├─ TEAM B: Completed + Today + Blockers
-└─ Action: Xử lý blocker ngay
-```
+### PostgreSQL trung tâm
 
-### **Weekly Sync (1 giờ)**
-```
-Friday 10:00 AM
-├─ Demo features (20 min)
-├─ Identify blockers (15 min)
-├─ Plan next week (20 min)
-└─ Update documentation (5 min)
-```
+- Nơi lưu metadata chuẩn của toàn hệ thống
+- Không chứa video thô
+- Không bị plugin truy cập trực tiếp
 
-### **Async Communication:**
-```
-- Slack: Quick questions (< 1 min response)
-- PR comments: Technical discussion
-- Schedule sync: Blocking issues
-```
+### MinIO / Object Storage
+
+- Lưu snapshot, crop image, ảnh nhận diện
+- DB chỉ lưu path/key/url
 
 ---
 
-## ✅ Checklist Tuần 1
+## 🚀 Roadmap P1 Cho Một Người Làm
 
-**Chuẩn Bị:**
-- [ ] Clone repo + setup Git branching
-- [ ] Schedule daily standup (09:30 AM)
-- [ ] Create shared Slack channel
-- [ ] Assign TEAM A & B members
-- [ ] Setup development environments
+### Tuần 1: Dựng nền local dev trên Windows
 
-**Ngày 1:**
-- [ ] Team kickoff meeting (1 hour)
-- [ ] Architecture walkthrough
-- [ ] Review API contracts
-- [ ] Setup testing frameworks
+- Dựng `docker-compose.dev.yml`
+- Chạy local:
+  - PostgreSQL
+  - MinIO
+  - Prometheus
+- Chuẩn hóa env/config cho service
+- Chốt schema metadata trung tâm
 
-**Ngày 2-5:**
-- [ ] TEAM A: Start database design
-- [ ] TEAM B: Start plugin refactoring
-- [ ] Daily 15-min standups
-- [ ] Reference docs for questions
+### Tuần 2: Service persistence nền tảng
 
-**Ngày 5:**
-- [ ] Weekly sync meeting
-- [ ] Demo progress
-- [ ] Plan Week 2
+- Thêm PostgreSQL cho:
+  - persons
+  - events
+  - zones
+  - alerts
+  - camera_configs
+- Thêm migration và DAL/ORM
 
----
+### Tuần 3: SQLite local outbox + cache
 
-## 📚 Tài Liệu Chi Tiết
+- Tạo local SQLite database trên edge
+- Thêm:
+  - outbox jobs
+  - config cache
+  - sync state
+- Bổ sung idempotent `event_id`
 
-| File | Kích thước | Nội dung |
-|------|-----------|---------|
-| **ARCHITECTURE_AND_ROADMAP.md** | 8000 words | System design + roadmap |
-| **IMPLEMENTATION_TEMPLATES.md** | 3000 words | Code examples |
-| **DEPLOYMENT_AND_OPERATIONS.md** | 4000 words | Production setup |
-| **PROJECT_SUMMARY.md** | 2000 words | Executive summary |
-| **VISUAL_ARCHITECTURE_GUIDE.md** | 2000 words | Diagrams & quick reference |
-| **DOCUMENTATION_INDEX.md** | 2000 words | Navigation guide |
+### Tuần 4: API nghiệp vụ thật
 
-**Total:** 20,000+ words, production-ready architecture
+- Thêm API:
+  - person
+  - zone
+  - event
+  - reset
+- Tách rõ API infer và API business/admin
 
----
+### Tuần 5: Background worker + retry
 
-## 🎯 Bắt Đầu Ngay Hôm Nay
+- Worker nền cho:
+  - event persistence
+  - alert/email
+  - object storage upload
+- Exponential backoff
+- Không làm nặng luồng `/infer`
 
-### **Step 1: Đọc tài liệu (2 giờ)**
-```
-1. Đọc file này (15 phút)
-2. ARCHITECTURE_AND_ROADMAP.md (90 phút)
-3. VISUAL_ARCHITECTURE_GUIDE.md (30 phút)
-```
+### Tuần 6: Observability + health chuẩn
 
-### **Step 2: Quy Hoạch Tuần 1 (1 giờ)**
-```
-1. Review team responsibilities
-2. Discuss architecture approach
-3. Setup development environments
-4. Schedule daily standups
-```
+- Thêm `GET /metrics`
+- Prometheus metrics
+- JSON structured logs
+- Health states + reason codes
+- Ngưỡng cảnh báo cho backlog/config stale
 
-### **Step 3: Bắt Đầu Coding (Tuần 1)**
-```
-TEAM A: Copy models từ IMPLEMENTATION_TEMPLATES.md
-TEAM B: Copy HTTP client từ IMPLEMENTATION_TEMPLATES.md
-Cả 2: Setup testing frameworks
-```
+### Tuần 7: Plugin reliability
 
----
+- Health polling từ plugin sang service
+- Diagnostic event rõ ràng cho:
+  - service down
+  - service degraded
+  - queue pressure
+  - circuit breaker state
+- Review queue policy và threshold cảnh báo
 
-## 🎓 Lợi Ích Của Architecture Này
+### Tuần 8: Test + packaging + release cleanup
 
-✅ **Separation of Concerns** - Mỗi team làm việc độc lập  
-✅ **Clear API Contract** - Dễ tích hợp, dễ debug  
-✅ **Scalable** - Từ 5 camera → 100+ camera  
-✅ **Professional** - Monitoring, alerting, backup built-in  
-✅ **Secure** - Encryption, GDPR compliance  
-✅ **Cost-effective** - Dùng open-source + strategic SaaS  
+- Unit test và integration test
+- Load test nhiều camera
+- Chuẩn hóa build script, manifest, versioning, release artifact
+- Loại bỏ dấu vết legacy khỏi packaging
 
 ---
 
-## 📞 Liên Hệ & Hỗ Trợ
+## 🎯 Mapping Trực Tiếp Sang Các Task P1
 
-**Nếu có câu hỏi:**
-1. Tìm kiếm trong 6 documents
-2. Check VISUAL_ARCHITECTURE_GUIDE.md (diagrams)
-3. Check PROJECT_SUMMARY.md (FAQ)
-4. Schedule 30-min sync với team
+### Plugin
 
-**Trách Nhiệm:**
-- Project Lead: ARCHITECTURE_AND_ROADMAP.md
-- TEAM A: IMPLEMENTATION_TEMPLATES.md (sections 1-3)
-- TEAM B: IMPLEMENTATION_TEMPLATES.md (sections 4-7)
-- DevOps: DEPLOYMENT_AND_OPERATIONS.md
+- `Plugin P1.1`
+  - Health polling từ plugin sang service
+  - Diagnostic event rõ ràng theo `healthy/degraded/not_ready`
+
+- `Plugin P1.2`
+  - Chuẩn hóa packaging/build/versioning/release artifact
+  - Dọn legacy naming và hardcoded version
+
+- `Plugin P1.3`
+  - Integration test cho queue/backpressure, circuit breaker, reconnect, metadata consistency
+
+- `Plugin P1.4`
+  - Giữ queue policy realtime nhưng thêm metric và threshold cảnh báo rõ
+
+### Service
+
+- `Service P1.1`
+  - PostgreSQL cho metadata trung tâm
+
+- `Service P1.2`
+  - API thật cho person, zone, event, reset
+
+- `Service P1.3`
+  - Background worker cho alert/email, event persistence, object upload
+
+- `Service P1.4`
+  - Unit test + integration test + load test
+
+- `Service P1.5`
+  - Prometheus metrics, JSON logging, metrics endpoint sử dụng được
+
+---
+
+## ✅ Checklist Bắt Đầu Trên Windows
+
+- [ ] Cài Docker Desktop
+- [ ] Dựng PostgreSQL local bằng Docker
+- [ ] Dựng MinIO local bằng Docker
+- [ ] Dựng Prometheus local bằng Docker
+- [ ] Chuẩn hóa `.env` cho service
+- [ ] Thiết kế schema PostgreSQL trung tâm
+- [ ] Thiết kế schema SQLite edge
+- [ ] Chốt JSON contract cho `/health`
+- [ ] Chốt danh sách metric cho `/metrics`
+
+---
+
+## 📈 Mục Tiêu Vận Hành
+
+- Inference vẫn chạy khi PostgreSQL down
+- Event không mất khi DB hoặc object storage lỗi tạm thời
+- Plugin không cần biết DB trung tâm
+- Snapshot/crop không nằm trong PostgreSQL
+- Health state và diagnostic event có ngôn ngữ thống nhất
+- Có thể triển khai từ Windows dev sang AI Box sau này mà không đổi kiến trúc lõi
 
 ---
 
 ## 🚀 Tóm Tắt Nhanh
 
-| Yếu Tố | Chi Tiết |
-|--------|---------|
-| **Thời gian** | 8 tuần |
-| **Nhân sự** | 2 người (TEAM A + TEAM B) |
-| **Công nghệ chính** | Python FastAPI + C++ NX Plugin |
-| **Database** | PostgreSQL |
-| **Nhân diện khuôn mặt** | Azure Face API |
-| **Email** | SendGrid |
-| **Monitoring** | Prometheus + Grafana + ELK |
-| **Deployment** | Docker + Load Balancer |
-| **API** | HTTP REST (JSON) |
-| **Performance** | Inference < 50ms, Alert < 5sec |
-| **Uptime** | > 99.5% |
+| Hạng mục | Quyết định chốt |
+|---------|------------------|
+| Nhân sự | 1 người làm, roadmap tuần tự |
+| Kiến trúc deploy | AI Service chạy edge trên AI Box |
+| DB trung tâm | PostgreSQL 16+ |
+| Ảnh/snapshot | MinIO |
+| Video | Nx Archive / NAS |
+| Plugin ↔ Service | REST |
+| Cache/Outbox local | SQLite |
+| Monitoring | Prometheus + Grafana |
+| Logging | Structured JSON |
+| Nguyên tắc cốt lõi | AI vẫn chạy khi DB down |
 
 ---
 
-**Bạn đã sẵn sàng triển khai! 🎯**
-
----
-
-**Version:** 1.0  
-**Ngày tạo:** 18/01/2026  
-**Trạng thái:** Production Ready
+**Version:** 2.0

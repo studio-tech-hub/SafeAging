@@ -1,0 +1,16 @@
+# AI Box overlay — QCS6490 kernel lacks SysV shm; PostgreSQL cannot run in Docker here.
+# Analytics uses EDGE_SQLITE_PATH (/app/runtime/edge_state.db) for persons, embeddings,
+# zones, events — admin UI and face gallery work without Postgres.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.aibox-hostdb.yml up -d
+
+services:
+  postgres:
+    profiles: ["docker-postgres"]
+
+  analytics:
+    depends_on: !override
+      minio:
+        condition: service_started
+    environment:
+      - DATABASE_URL=

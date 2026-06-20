@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - prometheus:9090
+
+  # Analytics service — GET /metrics
+  # Returns 404 until Service P1.5 is implemented.
+  # Prometheus will show scrape failures in the UI; that is expected until then.
+  - job_name: safeaging-analytics
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - analytics:18000

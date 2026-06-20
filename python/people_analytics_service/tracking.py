@@ -1,5 +1,6 @@
 import threading
 import time
+from collections import deque
 from typing import Any, Dict, List, Tuple
 
 import cv2
@@ -15,6 +16,7 @@ from .config import (
     MATCH_IOU_THRESHOLD,
     MAX_CENTER_DISTANCE_RATIO,
     MAX_MATCH_AGE,
+    METRICS_WINDOW_SIZE,
     OUTPUT_DEDUPE_IOU,
     PERSON_MIN_HW_RATIO,
     POST_NMS_IOU,
@@ -34,6 +36,50 @@ camera_states: Dict[str, Dict[str, Any]] = {}
 camera_states_lock = threading.RLock()
 
 
+def _new_metrics_window():
+    return deque(maxlen=METRICS_WINDOW_SIZE)
+
+
+def _mean_or_zero(samples) -> float:
+    if not samples:
+        return 0.0
+    return float(sum(samples) / len(samples))
+
+
+def compute_percentile(samples, percentile: float) -> float:
+    if not samples:
+        return 0.0
+    return float(np.percentile(np.asarray(list(samples), dtype=np.float64), percentile))
+
+
+def _camera_metrics_snapshot_unlocked(state: Dict[str, Any]) -> Dict[str, Any]:
+    infer_times_ms = list(state.get("infer_times_ms", ()))
+    decode_times_ms = list(state.get("decode_times_ms", ()))
+    preprocess_times_ms = list(state.get("preprocess_times_ms", ()))
+    yolo_times_ms = list(state.get("yolo_times_ms", ()))
+    track_counts = list(state.get("track_counts", ()))
+
+    return {
+        "request_count": int(state.get("request_count", 0)),
+        "error_count": int(state.get("error_count", 0)),
+        "last_error": state.get("last_error"),
+        "last_infer_ms": float(state.get("last_infer_ms", 0.0)),
+        "last_decode_ms": float(state.get("last_decode_ms", 0.0)),
+        "last_preprocess_ms": float(state.get("last_preprocess_ms", 0.0)),
+        "last_yolo_ms": float(state.get("last_yolo_ms", 0.0)),
+        "last_track_count": int(state.get("last_track_count", 0)),
+        "avg_inference_ms": _mean_or_zero(infer_times_ms),
+        "p50_inference_ms": compute_percentile(infer_times_ms, 50),
+        "p95_inference_ms": compute_percentile(infer_times_ms, 95),
+        "avg_decode_ms": _mean_or_zero(decode_times_ms),
+        "avg_preprocess_ms": _mean_or_zero(preprocess_times_ms),
+        "avg_yolo_ms": _mean_or_zero(yolo_times_ms),
+        "avg_track_count": _mean_or_zero(track_counts),
+        "metrics_window_size": int(state.get("metrics_window_size", METRICS_WINDOW_SIZE)),
+        "last_update_ts": float(state.get("last_update_ts", 0.0)),
+    }
+
+
 def get_camera_state(camera_id: str) -> Dict[str, Any]:
     with camera_states_lock:
         if camera_id not in camera_states:
@@ -51,7 +97,21 @@ def get_camera_state(camera_id: str) -> Dict[str, Any]:
                 "total_count": 0,
                 "last_output": [],
                 "last_time": 0.0,
-                "inference_times": [],
+                "metrics_window_size": METRICS_WINDOW_SIZE,
+                "infer_times_ms": _new_metrics_window(),
+                "decode_times_ms": _new_metrics_window(),
+                "preprocess_times_ms": _new_metrics_window(),
+                "yolo_times_ms": _new_metrics_window(),
+                "track_counts": _new_metrics_window(),
+                "request_count": 0,
+                "error_count": 0,
+                "last_error": None,
+                "last_infer_ms": 0.0,
+                "last_decode_ms": 0.0,
+                "last_preprocess_ms": 0.0,
+                "last_yolo_ms": 0.0,
+                "last_track_count": 0,
+                "last_update_ts": 0.0,
                 "created_at": time.time(),
                 "fall_detector": FallDetectionManager(
                     velocity_threshold=FALL_VELOCITY_THRESHOLD,
@@ -61,6 +121,51 @@ def get_camera_state(camera_id: str) -> Dict[str, Any]:
                 ) if ENABLE_FALL_DETECTION else None,
             }
         return camera_states[camera_id]
+
+
+def increment_camera_request(state: Dict[str, Any]) -> int:
+    with state["lock"]:
+        state["request_count"] = int(state.get("request_count", 0)) + 1
+        state["last_update_ts"] = time.time()
+        return state["request_count"]
+
+
+def increment_camera_error(state: Dict[str, Any], error_message: str | None = None) -> int:
+    with state["lock"]:
+        state["error_count"] = int(state.get("error_count", 0)) + 1
+        if error_message:
+            state["last_error"] = error_message
+        state["last_update_ts"] = time.time()
+        return state["error_count"]
+
+
+def record_camera_metrics(
+    state: Dict[str, Any],
+    *,
+    infer_ms: float,
+    decode_ms: float,
+    preprocess_ms: float,
+    yolo_ms: float,
+    track_count: int,
+) -> Dict[str, Any]:
+    with state["lock"]:
+        state["infer_times_ms"].append(float(infer_ms))
+        state["decode_times_ms"].append(float(decode_ms))
+        state["preprocess_times_ms"].append(float(preprocess_ms))
+        state["yolo_times_ms"].append(float(yolo_ms))
+        state["track_counts"].append(int(track_count))
+        state["last_infer_ms"] = float(infer_ms)
+        state["last_decode_ms"] = float(decode_ms)
+        state["last_preprocess_ms"] = float(preprocess_ms)
+        state["last_yolo_ms"] = float(yolo_ms)
+        state["last_track_count"] = int(track_count)
+        state["last_update_ts"] = time.time()
+        return _camera_metrics_snapshot_unlocked(state)
+
+
+def get_camera_metrics_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    with state["lock"]:
+        return _camera_metrics_snapshot_unlocked(state)
 
 
 def extract_appearance(frame: np.ndarray, bbox: tuple[float, float, float, float]) -> dict:

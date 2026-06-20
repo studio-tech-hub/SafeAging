@@ -1,0 +1,77 @@
+# ── C++ / build artifacts ─────────────────────────────────────────────────────
+build/
+build_release/
+Release/
+Debug/
+x64/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.cmake
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+ENV/
+.venv/
+myvenv/
+
+# ── Model files (large — downloaded at runtime via entrypoint) ────────────────
+*.pt
+*.pth
+*.onnx
+*.weights
+*.h5
+*.pb
+*.tflite
+*.dlc
+
+# ── IDE / OS ─────────────────────────────────────────────────────────────────
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+
+# ── Debug / runtime output ────────────────────────────────────────────────────
+frame_samples/
+debug_frames/
+runtime/
+*.log
+*.tmp
+
+# ── 3rd party vendored headers (not needed inside Python image) ───────────────
+3rd_party/
+
+# ── Git ───────────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Docs / tools (not needed at runtime) ─────────────────────────────────────
+working_pipeline/
+tools/

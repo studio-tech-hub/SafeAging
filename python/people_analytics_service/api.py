@@ -1,16 +1,19 @@
-﻿import base64
+﻿import asyncio
+import base64
 import hmac
+import struct
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, ConfigDict
 
 from .config import (
     API_KEY,
@@ -20,10 +23,12 @@ from .config import (
     CORS_ALLOW_ORIGINS,
     DEVICE,
     ENABLE_CLAHE,
+    ENABLE_FACE_RECOGNITION,
     ENABLE_FALL_DETECTION,
     ENABLE_FRAME_ENHANCEMENT,
     ENABLE_HISTORY_REMATCH,
     ENABLE_MULTI_SCALE,
+    FACE_RECOG_INTERVAL_FRAMES,
     ENABLE_POST_NMS,
     ENABLE_ROI,
     ENABLE_UNDISTORT,
@@ -31,6 +36,8 @@ from .config import (
     HOLD_SUPPRESS_IOU,
     IOU_THRESHOLD,
     MIN_DETECTION_AREA,
+    METRICS_LOG_INTERVAL,
+    METRICS_WINDOW_SIZE,
     MODEL_PATH,
     NEW_TRACK_MIN_CONFIDENCE,
     OUTPUT_DEDUPE_IOU,
@@ -60,7 +67,26 @@ from .config import (
     log_config_summary,
     logger,
 )
+from .db import dispose_engine, init_engine
+from .health import compute_status, dependency_snapshot, refresh_probes
+from .admin_router import router as admin_router
+from . import outbox_worker
+from .outbox_worker import OutboxEvent
+from .metrics import (
+    ACTIVE_TRACKS,
+    DECODE_LATENCY,
+    DETECTIONS_PER_FRAME,
+    INFER_ERRORS,
+    INFER_LATENCY,
+    INFER_REQUESTS,
+    PREPROCESS_LATENCY,
+    SERVICE_INFO,
+    YOLO_LATENCY,
+)
 from .model import load_model
+from . import face_engine
+from .zone_engine import check_zones, get_zones_for_camera_sync
+from .config_engine import get_per_camera_config_sync
 from .preprocess import (
     apply_roi,
     auto_adjust_brightness,
@@ -75,11 +101,15 @@ from .tracking import (
     camera_states,
     camera_states_lock,
     dedupe_output_tracks,
+    get_camera_metrics_snapshot,
     get_camera_state,
     global_track_assignment,
     has_duplicate_track_overlap,
+    increment_camera_error,
+    increment_camera_request,
     iou,
     post_nms_dedupe,
+    record_camera_metrics,
     smooth_bbox,
     suppress_overlapping_holds,
     update_track_motion,
@@ -88,15 +118,31 @@ from .tracking import (
 
 log_config_summary()
 
-app = FastAPI(title="YOLOv8 Analytics Service")
+app = FastAPI(title="YOLO26 Analytics Service")
 if CORS_ALLOW_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ALLOW_ORIGINS,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
         allow_headers=["*"],
     )
+
+# S P1.2 – Admin CRUD API (persons, zones, events, reset)
+app.include_router(admin_router)
+
+# ── Operator web UI (static single-page app) ──────────────────────────────────
+import os as _os
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+_STATIC_DIR = _os.path.join(_os.path.dirname(__file__), "static")
+if _os.path.isdir(_STATIC_DIR):
+    app.mount("/ui", StaticFiles(directory=_STATIC_DIR, html=True), name="ui")
+
+    @app.get("/", include_in_schema=False)
+    async def _root_redirect():
+        return RedirectResponse(url="/ui/")
 
 class InferRequest(BaseModel):
     image: str                 # base64 (jpg/png/bmp)
@@ -110,14 +156,120 @@ class Detection(BaseModel):
     w: float
     h: float
     track_id: int
-    fall_detected: bool = False  # NEW: Fall detection flag
+    fall_detected: bool = False
     stable: bool = True
     degraded: bool = False
+    # P2.2 — Zone engine fields
+    zone_id: Optional[str] = None
+    zone_type: Optional[str] = None
+    zone_violation: bool = False
+    # Face recognition / identity fields — consumed by the NX plugin to render
+    # "(Ông A, Nam, No.1)" on the bounding box. Null/Unknown when not recognised.
+    person_id: Optional[str] = None
+    person_name: Optional[str] = None
+    person_gender: Optional[str] = None
+    person_no: Optional[int] = None
+    recognized: bool = False
 
 class HealthResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     status: str
     timestamp: str
     service_uptime_seconds: float
+    ready: bool
+    startup_completed: bool
+    model_loaded: bool
+    device: str
+    warmup_ok: bool
+    warmup_error: Optional[str] = None
+    model_load_error: Optional[str] = None
+    auth_enabled: bool
+    require_https: bool
+    tls_enabled: bool
+    last_ready_check: Optional[str] = None
+    # Extended in S P1.5 — consumed by Plugin P1.1 for degraded-mode diagnostics
+    reason_codes: List[str] = []
+    dependencies: Dict[str, str] = {}
+    # P P1.4 – pipeline stats for operator correlation with plugin queue/drop warnings
+    pipeline: Dict[str, Any] = {}
+
+
+class ReadinessState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.startup_completed = False
+        self.model_loaded = False
+        self.model_load_error: Optional[str] = None
+        self.warmup_ok = False
+        self.warmup_error: Optional[str] = None
+        self.device = str(DEVICE)
+        self.auth_enabled = API_KEY_REQUIRED
+        self.require_https = REQUIRE_HTTPS
+        self.tls_enabled = bool(TLS_CERT_FILE and TLS_KEY_FILE)
+        self.last_ready_check: Optional[str] = None
+
+    def reset_for_startup(self) -> None:
+        self.update(
+            startup_completed=False,
+            model_loaded=False,
+            model_load_error=None,
+            warmup_ok=False,
+            warmup_error=None,
+            device=str(DEVICE),
+            auth_enabled=API_KEY_REQUIRED,
+            require_https=REQUIRE_HTTPS,
+            tls_enabled=bool(TLS_CERT_FILE and TLS_KEY_FILE),
+            last_ready_check=None,
+        )
+
+    def update(self, **kwargs: Any) -> None:
+        with self._lock:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    def snapshot(self, mark_checked: bool = True) -> Dict[str, Any]:
+        now = datetime.now().isoformat()
+        uptime = time.time() - service_start_time
+
+        with self._lock:
+            if mark_checked:
+                self.last_ready_check = now
+
+            snapshot = {
+                "startup_completed": self.startup_completed,
+                "model_loaded": self.model_loaded,
+                "device": self.device,
+                "warmup_ok": self.warmup_ok,
+                "warmup_error": self.warmup_error,
+                "model_load_error": self.model_load_error,
+                "auth_enabled": self.auth_enabled,
+                "require_https": self.require_https,
+                "tls_enabled": self.tls_enabled,
+                "last_ready_check": self.last_ready_check,
+            }
+
+        ready = (
+            snapshot["startup_completed"]
+            and snapshot["model_loaded"]
+            and snapshot["warmup_ok"]
+        )
+        if ready:
+            status = "healthy"
+        elif snapshot["startup_completed"] and snapshot["model_loaded"] and snapshot["warmup_error"]:
+            status = "degraded"
+        else:
+            status = "not_ready"
+
+        snapshot.update(
+            {
+                "status": status,
+                "timestamp": now,
+                "service_uptime_seconds": uptime,
+                "ready": ready,
+            }
+        )
+        return snapshot
 
 # ============================
 # Global State
@@ -129,6 +281,199 @@ counter_lock = threading.Lock()
 rate_limit_lock = threading.RLock()
 ip_request_buckets: Dict[str, deque[float]] = defaultdict(deque)
 camera_request_buckets: Dict[str, deque[float]] = defaultdict(deque)
+readiness_state = ReadinessState()
+
+
+def _format_exception(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _resolve_model_device(yolo_model=None) -> str:
+    if yolo_model is None:
+        return str(DEVICE)
+
+    predictor = getattr(yolo_model, "predictor", None)
+    predictor_device = getattr(predictor, "device", None)
+    if predictor_device is not None:
+        return str(predictor_device)
+
+    inner_model = getattr(yolo_model, "model", None)
+    if inner_model is not None:
+        try:
+            return str(next(inner_model.parameters()).device)
+        except (AttributeError, StopIteration, TypeError):
+            pass
+
+    direct_device = getattr(yolo_model, "device", None)
+    if direct_device is not None:
+        return str(direct_device)
+
+    return str(DEVICE)
+
+
+def _warmup_model(yolo_model) -> str:
+    # Warm a small square frame to initialize PyTorch/CUDA context without
+    # paying the full cost of the largest production imgsz at startup.
+    warmup_imgsz = max(64, min(int(YOLO_IMGSZ), 640))
+    warmup_frame = np.zeros((warmup_imgsz, warmup_imgsz, 3), dtype=np.uint8)
+    yolo_model.predict(
+        warmup_frame,
+        conf=CONFIDENCE_THRESHOLD,
+        iou=IOU_THRESHOLD,
+        classes=[0],
+        imgsz=warmup_imgsz,
+        verbose=False,
+        augment=False,
+        device=DEVICE,
+        half=USE_HALF,
+    )[0]
+    return _resolve_model_device(yolo_model)
+
+
+def _record_camera_infer_error(state: Dict[str, Any], error_message: str) -> None:
+    increment_error_counter()
+    increment_camera_error(state, error_message=error_message)
+
+
+def _decode_current_transport_image(image_payload_b64: str, camera_id: str) -> tuple[np.ndarray, str, int, int]:
+    """Decode the current JSON + base64 transport kept for plugin compatibility.
+
+    TODO: Keep this path for the current C++ plugin, but migrate toward a
+    multipart/form-data or raw binary upload path to remove base64 overhead.
+    """
+    encoded_payload_bytes = len(image_payload_b64.encode("utf-8"))
+    img_bytes = base64.b64decode(image_payload_b64)
+    raw_payload_bytes = len(img_bytes)
+
+    if img_bytes.startswith(b"BGR"):
+        # Current plugin transport: base64(JSON) around a custom raw BGR blob.
+        # Keep unchanged for compatibility until a real binary or multipart path exists.
+        w, h = struct.unpack("<II", img_bytes[3:11])
+        bgr_data = img_bytes[11:]
+        frame = np.frombuffer(bgr_data, dtype=np.uint8).reshape((h, w, 3))
+        frame = auto_adjust_brightness(frame, target_brightness=180.0)
+        logger.debug(
+            f"[{camera_id}] Decoded transport=bgr_base64_raw payload_bytes={raw_payload_bytes} "
+            f"encoded_bytes={encoded_payload_bytes} size={w}x{h}"
+        )
+        return frame, "bgr_base64_raw", encoded_payload_bytes, raw_payload_bytes
+
+    img_array = np.frombuffer(img_bytes, np.uint8)
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    logger.debug(
+        f"[{camera_id}] Decoded transport=image_base64 payload_bytes={raw_payload_bytes} "
+        f"encoded_bytes={encoded_payload_bytes}"
+    )
+    return frame, "image_base64", encoded_payload_bytes, raw_payload_bytes
+
+
+def _crop_person_head_region(frame: np.ndarray, det: "Detection", W: int, H: int) -> Optional[np.ndarray]:
+    """Crop the upper region of a person bbox (head + shoulders) for face detection.
+
+    Faces are concentrated in the top portion of a standing person; cropping
+    there gives the detector a larger, cleaner face and is cheaper than the
+    full body. Coords are in the same input-frame space as the detection.
+    """
+    x1 = det.x
+    y1 = det.y
+    bw = det.w
+    bh = det.h
+    margin_x = bw * 0.12
+    cx1 = int(max(0, x1 - margin_x))
+    cx2 = int(min(W, x1 + bw + margin_x))
+    cy1 = int(max(0, y1))
+    cy2 = int(min(H, y1 + bh * 0.6))
+    if cx2 - cx1 < 8 or cy2 - cy1 < 8:
+        return None
+    return frame[cy1:cy2, cx1:cx2]
+
+
+def _apply_face_identity(
+    state: Dict[str, Any],
+    detections: List["Detection"],
+    frame: np.ndarray,
+    camera_frame_idx: int,
+    camera_lock: Any,
+) -> None:
+    """Resolve and attach person identity (name/gender/No.) to stable detections.
+
+    Recognition is throttled per track and cached so the rendered label stays
+    stable across frames. Unknown persons keep retrying every interval; once a
+    track is recognised the identity sticks for that track's lifetime.
+    """
+    if not face_engine.available():
+        return
+
+    with camera_lock:
+        identity: Dict[int, Dict[str, Any]] = state.setdefault("identity", {})
+        person_no_map: Dict[str, int] = state.setdefault("person_no_map", {})
+        recent_crops: Dict[int, np.ndarray] = state.setdefault("recent_crops", {})
+
+    H, W = frame.shape[:2]
+
+    for det in detections:
+        if not det.stable or det.degraded or det.cls != "person":
+            continue
+
+        tid = det.track_id
+        cached = identity.get(tid)
+
+        attempt = False
+        if cached is None:
+            attempt = True
+        elif not cached.get("recognized"):
+            last = cached.get("last_attempt", -10_000)
+            if camera_frame_idx - last >= FACE_RECOG_INTERVAL_FRAMES:
+                attempt = True
+
+        if attempt:
+            crop = _crop_person_head_region(frame, det, W, H)
+            if crop is not None and crop.size > 0:
+                # Keep a recent crop so an operator can enroll this (possibly
+                # Unknown) track from the live frame via the admin API.
+                with camera_lock:
+                    recent_crops[tid] = crop.copy()
+            match = face_engine.recognize_crop(crop) if crop is not None else None
+            if match is not None:
+                no = person_no_map.get(match.person_id)
+                if no is None:
+                    with camera_lock:
+                        no = person_no_map.get(match.person_id)
+                        if no is None:
+                            no = int(state.get("next_person_no", 1))
+                            person_no_map[match.person_id] = no
+                            state["next_person_no"] = no + 1
+                cached = {
+                    "recognized": True,
+                    "person_id": match.person_id,
+                    "name": match.name,
+                    "gender": match.gender,
+                    "no": no,
+                    "score": match.score,
+                    "last_attempt": camera_frame_idx,
+                }
+            else:
+                cached = {
+                    "recognized": False,
+                    "person_id": None,
+                    "name": None,
+                    "gender": None,
+                    "no": None,
+                    "last_attempt": camera_frame_idx,
+                }
+            with camera_lock:
+                identity[tid] = cached
+
+        if cached and cached.get("recognized"):
+            det.recognized = True
+            det.person_id = cached.get("person_id")
+            det.person_name = cached.get("name")
+            det.person_gender = cached.get("gender")
+            det.person_no = cached.get("no")
+        else:
+            det.recognized = False
+            det.person_name = "Unknown"
+
 
 def _get_client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for", "").strip()
@@ -213,10 +558,24 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Pragma"] = "no-cache"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+
+    # The operator UI needs a relaxed CSP (self-hosted inline app + image fetches).
+    # API endpoints keep the strict locked-down policy.
+    path = request.url.path
+    if path == "/" or path.startswith("/ui"):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'"
+        )
+    else:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
     return response
 
 def increment_request_counter() -> int:
@@ -236,13 +595,76 @@ def get_counter_snapshot() -> tuple:
         return request_counter, error_counter
 
 @app.get("/health", response_model=HealthResponse)
-def health_check():
-    """Health check endpoint for NX plugin"""
-    uptime = time.time() - service_start_time
-    return HealthResponse(
-        status="healthy",
-        timestamp=datetime.now().isoformat(),
-        service_uptime_seconds=uptime
+async def health_check(response: Response):
+    """Readiness endpoint for operators and the NX plugin.
+
+    Returns status "healthy" | "degraded" | "not_ready" plus reason_codes
+    and per-dependency status so Plugin P1.1 can emit specific diagnostic events.
+    Dependency probes are cached (30 s TTL) to keep this endpoint fast.
+    """
+    snapshot = readiness_state.snapshot()
+
+    # Probe dependencies (no-op if cache is fresh)
+    await refresh_probes()
+    deps = dependency_snapshot()
+
+    model_ok = (
+        snapshot["startup_completed"]
+        and snapshot["model_loaded"]
+        and snapshot["warmup_ok"]
+    )
+    status, reason_codes = compute_status(model_ok=model_ok, deps=deps)
+
+    snapshot["status"] = status
+    snapshot["reason_codes"] = reason_codes
+    snapshot["dependencies"] = deps
+
+    # P P1.4 – aggregate per-camera pipeline stats for operator correlation
+    with camera_states_lock:
+        camera_ids = list(camera_states.keys())
+    total_requests = 0
+    total_errors = 0
+    per_camera: Dict[str, Any] = {}
+    for cam_id in camera_ids:
+        try:
+            cam_state = get_camera_state(cam_id)
+            snap = get_camera_metrics_snapshot(cam_state)
+            total_requests += snap.get("request_count", 0)
+            total_errors += snap.get("error_count", 0)
+            per_camera[cam_id] = {
+                "requests": snap.get("request_count", 0),
+                "errors": snap.get("error_count", 0),
+                "avg_infer_ms": round(snap.get("avg_inference_ms", 0.0), 1),
+                "p95_infer_ms": round(snap.get("p95_inference_ms", 0.0), 1),
+                "tracks": snap.get("last_track_count", 0),
+            }
+        except Exception:
+            pass
+    snapshot["pipeline"] = {
+        "active_cameras": len(per_camera),
+        "total_requests": total_requests,
+        "total_errors": total_errors,
+        "error_rate": round(total_errors / total_requests, 4) if total_requests > 0 else 0.0,
+        "cameras": per_camera,
+    }
+
+    health_payload = HealthResponse(**snapshot)
+    if not health_payload.ready:
+        response.status_code = 503
+    return health_payload
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Prometheus metrics scrape endpoint.
+
+    Exposes all safeaging_* counters/gauges/histograms plus standard Python
+    process metrics (CPU, memory, GC). Scraped by Prometheus every 15 s.
+    No authentication required — restrict at the network/firewall level.
+    """
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
     )
 
 # ============================
@@ -270,51 +692,56 @@ def infer(req: InferRequest, request: Request):
         "track_id": 1
     }
     """
-    req_seq = increment_request_counter()
-    start_time = time.time()
-    
+    increment_request_counter()   # global counter for /status total, not used for per-camera logic
+    request_started_at = time.perf_counter()
+
     camera_id = req.camera_id or "default"
     enforce_security(request, camera_id=camera_id, require_auth=True)
+    state = get_camera_state(camera_id)
+    camera_request_count = increment_camera_request(state)
+    # Use per-camera counter for all debug/log frequency checks (replaces global req_seq)
+    cam_seq = camera_request_count
+    decode_time_ms = 0.0
+    preprocess_time_ms = 0.0
+    yolo_time_ms = 0.0
+    transport_name = "unknown"
+    transport_encoded_bytes = 0
+    transport_raw_bytes = 0
     
     try:
         # ============================================
-        # 1) Decode base64 image with auto brightness fix
+        # 1) Decode current transport layer
+        # Keep JSON + base64 for plugin compatibility; isolate it here so a
+        # future multipart/raw-binary transport can replace this cleanly.
         # ============================================
         try:
-            img_bytes = base64.b64decode(req.image)
-            
-            # Check if it's BGR format (new C++ format) or JPEG/PNG (old format)
-            if img_bytes.startswith(b'BGR'):
-                # New BGR format: "BGR" + width(4 bytes) + height(4 bytes) + raw BGR data
-                import struct
-                header = img_bytes[:11]  # 3 (BGR) + 4 (width) + 4 (height)
-                w, h = struct.unpack('<II', img_bytes[3:11])
-                bgr_data = img_bytes[11:]
-                
-                # Reconstruct Mat from raw BGR data
-                frame = np.frombuffer(bgr_data, dtype=np.uint8).reshape((h, w, 3))
-                logger.debug(f"[{camera_id}] Decoded BGR format: {w}x{h}")
-                
-                # AUTO BRIGHTNESS ADJUSTMENT (always applied for BGR frames)
-                frame = auto_adjust_brightness(frame, target_brightness=180.0)
-            else:
-                # Old format: JPEG/PNG encoded image
-                img_array = np.frombuffer(img_bytes, np.uint8)
-                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                logger.debug(f"[{camera_id}] Decoded JPEG/PNG format")
+            decode_start = time.perf_counter()
+            frame, transport_name, transport_encoded_bytes, transport_raw_bytes = _decode_current_transport_image(
+                req.image,
+                camera_id,
+            )
+            decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
             
             if frame is None:
-                increment_error_counter()
-                logger.warning(f"[{camera_id}] Failed to decode image - got None")
+                error_message = "Failed to decode image - got None"
+                _record_camera_infer_error(state, error_message)
+                logger.warning(f"[{camera_id}] {error_message}")
                 return []
                  
         except Exception as e:
-            increment_error_counter()
-            logger.warning(f"[{camera_id}] Image decode error: {type(e).__name__}: {e}")
+            decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
+            error_message = f"Image decode error: {type(e).__name__}: {e}"
+            _record_camera_infer_error(state, error_message)
+            logger.warning(f"[{camera_id}] {error_message}")
             return []
 
         H, W = frame.shape[:2]
-        
+
+        # Keep a reference to the originally decoded full frame for event snapshots.
+        # Detection coords are later remapped back to this input space, so snapshots
+        # stored for review/enrollment match the bbox coordinates we persist.
+        snapshot_source_frame = frame
+
         # Debug: Check if frame is mostly empty/dark
         mean_bgr = cv2.mean(frame)
         frame_mean = float((mean_bgr[0] + mean_bgr[1] + mean_bgr[2]) / 3.0)
@@ -322,16 +749,19 @@ def infer(req: InferRequest, request: Request):
         frame_min_val, frame_max_val, _, _ = cv2.minMaxLoc(gray_for_stats)
         frame_max = int(frame_max_val)
         frame_min = int(frame_min_val)
-        if req_seq % 20 == 0:
-            logger.info(f"[{camera_id}] Frame: {W}x{H}, mean={frame_mean:.1f}, min={frame_min}, max={frame_max}")
+        if cam_seq % 20 == 0:
+            logger.debug(f"[{camera_id}] Frame: {W}x{H}, mean={frame_mean:.1f}, min={frame_min}, max={frame_max}")
+            logger.debug(
+                f"[{camera_id}] Transport: {transport_name}, "
+                f"encoded_bytes={transport_encoded_bytes}, raw_bytes={transport_raw_bytes}"
+            )
             if SAVE_DEBUG_SAMPLES:
-                # Save frame to disk only when explicitly enabled via env var.
                 try:
                     import os
                     os.makedirs('frame_samples', exist_ok=True)
-                    sample_path = f'frame_samples/frame_{req_seq:06d}.jpg'
+                    sample_path = f'frame_samples/{camera_id}_{cam_seq:06d}.jpg'
                     cv2.imwrite(sample_path, frame)
-                    logger.info(f"[{camera_id}] Saved frame sample to {sample_path}")
+                    logger.debug(f"[{camera_id}] Saved frame sample to {sample_path}")
                 except Exception as e:
                     logger.warning(f"Failed to save frame sample: {e}")
         logger.debug(f"[{camera_id}] Frame size: {W}x{H}")
@@ -343,11 +773,12 @@ def infer(req: InferRequest, request: Request):
         # 1.4) Undistortion (for wide-angle/fisheye cameras)
         # ============================================
         if ENABLE_UNDISTORT:
-            undistort_start = time.time()
+            undistort_start = time.perf_counter()
             frame, undistort_crop_offset = undistort_frame(frame)
-            undistort_time = time.time() - undistort_start
-            if req_seq % 20 == 0:
-                logger.info(f"[{camera_id}] Undistortion: {undistort_time*1000:.1f}ms")
+            undistort_time_ms = (time.perf_counter() - undistort_start) * 1000.0
+            preprocess_time_ms += undistort_time_ms
+            if cam_seq % 20 == 0:
+                logger.debug(f"[{camera_id}] Undistortion: {undistort_time_ms:.1f}ms")
         pre_roi_shape = frame.shape
 
         # ============================================
@@ -356,12 +787,13 @@ def infer(req: InferRequest, request: Request):
         roi_box = None
         roi_type = None
         if ENABLE_ROI:
-            roi_start = time.time()
+            roi_start = time.perf_counter()
             frame, roi_box, roi_type = apply_roi(frame)
-            roi_time = time.time() - roi_start
+            roi_time_ms = (time.perf_counter() - roi_start) * 1000.0
+            preprocess_time_ms += roi_time_ms
             H_roi, W_roi = frame.shape[:2]
-            if req_seq % 20 == 0:
-                logger.info(f"[{camera_id}] ROI ({roi_type}): {H_roi}x{W_roi}, time={roi_time*1000:.1f}ms")
+            if cam_seq % 20 == 0:
+                logger.debug(f"[{camera_id}] ROI ({roi_type}): {H_roi}x{W_roi}, time={roi_time_ms:.1f}ms")
         else:
             roi_box = (0, 0, frame.shape[1], frame.shape[0])
 
@@ -371,30 +803,43 @@ def infer(req: InferRequest, request: Request):
         # 1.6) Preprocess frame for wide-angle optimization
         # ============================================
         if ENABLE_CLAHE or ENABLE_FRAME_ENHANCEMENT:
-            inference_start = time.time()
+            preprocess_start = time.perf_counter()
             frame = preprocess_frame(frame)
-            preprocess_time = time.time() - inference_start
-            if req_seq % 20 == 0:
-                logger.info(f"[{camera_id}] Frame preprocessing: {preprocess_time*1000:.1f}ms (CLAHE={ENABLE_CLAHE}, Enhancement={ENABLE_FRAME_ENHANCEMENT})")
+            preprocess_step_ms = (time.perf_counter() - preprocess_start) * 1000.0
+            preprocess_time_ms += preprocess_step_ms
+            if cam_seq % 20 == 0:
+                logger.debug(
+                    f"[{camera_id}] Frame preprocessing: {preprocess_step_ms:.1f}ms "
+                    f"(CLAHE={ENABLE_CLAHE}, Enhancement={ENABLE_FRAME_ENHANCEMENT})"
+                )
+
+        # ============================================
+        # 1.7) Per-camera config override (P2.2)
+        # ============================================
+        cam_cfg = get_per_camera_config_sync(camera_id)
+        _conf_threshold = (cam_cfg["confidence_threshold"] if cam_cfg and cam_cfg.get("confidence_threshold") is not None
+                           else CONFIDENCE_THRESHOLD)
+        _iou_threshold = (cam_cfg["iou_threshold"] if cam_cfg and cam_cfg.get("iou_threshold") is not None
+                          else IOU_THRESHOLD)
 
         # ============================================
         # 2) Run YOLO inference (person class only)
         # ============================================
         try:
-            # Load model if needed (lazy load)
+            # Startup preloads the model; keep this as a defensive fallback.
             yolo_model = load_model()
-            
+
             # Save pre-inference frame (after ROI crop) - every 200 frames
-            if SAVE_DEBUG_SAMPLES and req_seq % 200 == 0:
+            if SAVE_DEBUG_SAMPLES and cam_seq % 200 == 0:
                 try:
                     import os
                     os.makedirs('frame_samples', exist_ok=True)
-                    sample_pre = f'frame_samples/frame_{req_seq:06d}_pre_yolo.jpg'
+                    sample_pre = f'frame_samples/{camera_id}_{cam_seq:06d}_pre_yolo.jpg'
                     cv2.imwrite(sample_pre, frame)
                 except Exception as e:
                     logger.debug(f"Failed to save pre-YOLO frame: {e}")
             
-            inference_start = time.time()
+            yolo_start = time.perf_counter()
             
             # Choose inference strategy
             if ENABLE_MULTI_SCALE:
@@ -403,21 +848,21 @@ def infer(req: InferRequest, request: Request):
             else:
                 # Standard single-scale inference - PRODUCTION MODE
                 r = yolo_model.predict(
-                    frame, 
-                    conf=CONFIDENCE_THRESHOLD,  # 0.45 by default - catches people reliably
-                    iou=IOU_THRESHOLD,  # 0.45 - standard NMS
+                    frame,
+                    conf=_conf_threshold,
+                    iou=_iou_threshold,
                     classes=[0],  # person only
-                    imgsz=YOLO_IMGSZ,  # 960 for better small object detection (after ROI crop)
+                    imgsz=YOLO_IMGSZ,
                     verbose=False,
-                    augment=False,  # No test-time augmentation in production
+                    augment=False,
                     device=DEVICE,
                     half=USE_HALF,
                 )[0]
             
-            inference_time_ms = (time.time() - inference_start) * 1000
+            yolo_time_ms = (time.perf_counter() - yolo_start) * 1000.0
             
             # Save post-inference frame with detections - every 200 frames
-            if SAVE_DEBUG_SAMPLES and req_seq % 200 == 0:
+            if SAVE_DEBUG_SAMPLES and cam_seq % 200 == 0:
                 try:
                     import os
                     os.makedirs('frame_samples', exist_ok=True)
@@ -426,7 +871,7 @@ def infer(req: InferRequest, request: Request):
                         for box in r.boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                             cv2.rectangle(frame_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    sample_post = f'frame_samples/frame_{req_seq:06d}_post_yolo.jpg'
+                    sample_post = f'frame_samples/{camera_id}_{cam_seq:06d}_post_yolo.jpg'
                     cv2.imwrite(sample_post, frame_with_boxes)
                 except Exception as e:
                     logger.debug(f"Failed to save post-YOLO frame: {e}")
@@ -434,18 +879,21 @@ def infer(req: InferRequest, request: Request):
             # Log detection details for debugging
             boxes_for_log = r.boxes if r.boxes is not None else []
             num_boxes = len(boxes_for_log)
-            if req_seq % 20 == 0:
-                logger.info(f"[{camera_id}] YOLO: {num_boxes} objects (conf={CONFIDENCE_THRESHOLD}, inference={inference_time_ms:.1f}ms)")
+            if cam_seq % 20 == 0:
+                logger.debug(
+                    f"[{camera_id}] YOLO: {num_boxes} objects "
+                    f"(conf={_conf_threshold:.2f}, iou={_iou_threshold:.2f}, inference={yolo_time_ms:.1f}ms)"
+                )
                 if num_boxes > 0:
                     for i, box in enumerate(boxes_for_log[:3]):  # Show first 3
-                        logger.info(f"  Box {i}: cls={int(box.cls[0].item())}, conf={float(box.conf[0].item()):.2f}")
+                        logger.debug(f"  Box {i}: cls={int(box.cls[0].item())}, conf={float(box.conf[0].item()):.2f}")
         except Exception as e:
-            increment_error_counter()
-            logger.error(f"[{camera_id}] YOLO inference error: {type(e).__name__}: {e}")
+            error_message = f"YOLO inference error: {type(e).__name__}: {e}"
+            _record_camera_infer_error(state, error_message)
+            logger.error(f"[{camera_id}] {error_message}")
             return []
 
         now = time.time()
-        state = get_camera_state(camera_id)
         camera_lock = state["lock"]
         with camera_lock:
             state["frame_idx"] = int(state.get("frame_idx", 0)) + 1
@@ -815,7 +1263,9 @@ def infer(req: InferRequest, request: Request):
                     logger.info(f"[{camera_id}] Fall Status: {fall_stats['total_fallen']} person(s) fallen out of {fall_stats['total_tracked']} tracked")
                     
             except Exception as e:
-                logger.error(f"[{camera_id}] Fall detection error: {type(e).__name__}: {e}")
+                error_message = f"Fall detection error: {type(e).__name__}: {e}"
+                _record_camera_infer_error(state, error_message)
+                logger.error(f"[{camera_id}] {error_message}")
                 # Fall detection errors don't stop inference, just log and continue
 
         # ============================================
@@ -828,6 +1278,37 @@ def infer(req: InferRequest, request: Request):
             pre_roi_shape=pre_roi_shape,
             undistort_crop_offset=undistort_crop_offset,
         )
+
+        # ============================================
+        # 3.6) Face recognition — real-time identity on the bounding box
+        # Runs after remap so crop coords match the snapshot frame space.
+        # Throttled per track; identity cached for stable labels.
+        # ============================================
+        if ENABLE_FACE_RECOGNITION and detections:
+            try:
+                _apply_face_identity(
+                    state=state,
+                    detections=detections,
+                    frame=snapshot_source_frame,
+                    camera_frame_idx=camera_frame_idx,
+                    camera_lock=camera_lock,
+                )
+            except Exception as _fe:
+                logger.debug("[%s] Face recognition error: %s", camera_id, _fe)
+
+        # ============================================
+        # 3.7) Zone check (P2.2)
+        # Runs after remap so zone geometry and detection coords
+        # are both in the full input-frame pixel space.
+        # ============================================
+        zone_violations_this_frame: list = []
+        if detections:
+            try:
+                active_zones = get_zones_for_camera_sync(camera_id)
+                if active_zones:
+                    zone_violations_this_frame = check_zones(detections, active_zones, camera_id)
+            except Exception as _ze:
+                logger.warning("[%s] Zone check error: %s", camera_id, _ze)
 
         # ============================================
         # 4) Anti-flicker: reuse last output if empty
@@ -881,6 +1362,17 @@ def infer(req: InferRequest, request: Request):
 
             state["next_id"] = next_id
 
+            # Purge cached face identity / crops for tracks that are no longer active
+            active_track_ids = {tr["id"] for tr in active_tracks}
+            identity_cache = state.get("identity")
+            if identity_cache:
+                for dead_tid in [t for t in identity_cache if t not in active_track_ids]:
+                    identity_cache.pop(dead_tid, None)
+            recent_crops_cache = state.get("recent_crops")
+            if recent_crops_cache:
+                for dead_tid in [t for t in recent_crops_cache if t not in active_track_ids]:
+                    recent_crops_cache.pop(dead_tid, None)
+
             # ============================================
             # 6) Count tracking with proper ID deduplication
             # ============================================
@@ -914,28 +1406,131 @@ def infer(req: InferRequest, request: Request):
             # Maintain backward compatibility with seen_ids set for any external code
             state["seen_ids"] = set(state["seen_ids_with_time"].keys())
 
-            inference_time = time.time() - start_time
-            state["inference_times"].append(inference_time)
-            if len(state["inference_times"]) > 30:
-                state["inference_times"] = state["inference_times"][-30:]
+            # S P1.3: track which IDs have already been reported to the outbox
+            _reported_ids: set = state.setdefault("outbox_reported_ids", set())
+            new_outbox_ids: set = stable_unique_ids - _reported_ids
+            _reported_ids.update(stable_unique_ids)
 
-            avg_inference_time = sum(state["inference_times"]) / len(state["inference_times"])
-            max_inference_time = max(state["inference_times"])
             tracks_count = len(state["tracks"])
             unique_count = len(state["seen_ids"])
-        
-        logger.info(
-            f"[{camera_id}] Detections: {len(detections)} | "
-            f"Tracks: {tracks_count} | "
-            f"Unique: {unique_count} | "
-            f"Time: {inference_time*1000:.1f}ms (avg: {avg_inference_time*1000:.1f}ms)"
+
+        total_infer_ms = (time.perf_counter() - request_started_at) * 1000.0
+        metrics_snapshot = record_camera_metrics(
+            state,
+            infer_ms=total_infer_ms,
+            decode_ms=decode_time_ms,
+            preprocess_ms=preprocess_time_ms,
+            yolo_ms=yolo_time_ms,
+            track_count=tracks_count,
         )
+
+        # Prometheus observations (success path)
+        INFER_REQUESTS.labels(camera_id=camera_id, status="success").inc()
+        INFER_LATENCY.labels(camera_id=camera_id).observe(total_infer_ms / 1000.0)
+        DECODE_LATENCY.labels(camera_id=camera_id).observe(decode_time_ms / 1000.0)
+        PREPROCESS_LATENCY.labels(camera_id=camera_id).observe(preprocess_time_ms / 1000.0)
+        YOLO_LATENCY.labels(camera_id=camera_id).observe(yolo_time_ms / 1000.0)
+        DETECTIONS_PER_FRAME.labels(camera_id=camera_id).observe(float(len(detections)))
+        ACTIVE_TRACKS.labels(camera_id=camera_id).set(float(tracks_count))
+
+        if camera_request_count == 1 or camera_request_count % METRICS_LOG_INTERVAL == 0:
+            logger.info(
+                f"[{camera_id}] Summary: detections={len(detections)} "
+                f"tracks={tracks_count} unique={unique_count} "
+                f"infer_ms={total_infer_ms:.1f} decode_ms={decode_time_ms:.1f} "
+                f"preprocess_ms={preprocess_time_ms:.1f} yolo_ms={yolo_time_ms:.1f} "
+                f"p50_ms={metrics_snapshot['p50_inference_ms']:.1f} "
+                f"p95_ms={metrics_snapshot['p95_inference_ms']:.1f} "
+                f"errors={metrics_snapshot['error_count']}"
+            )
+
+        # ── S P1.3: non-blocking outbox enqueue ──────────────────────────────
+        _now_utc = datetime.now(tz=timezone.utc)
+
+        fall_dets = [d for d in detections if d.fall_detected]
+        has_new_detections = any(d.track_id in new_outbox_ids for d in detections)
+        needs_snapshot = bool(fall_dets or zone_violations_this_frame or has_new_detections)
+
+        # Encode the event snapshot JPEG at most once per frame, only when an event fires.
+        _snap_jpeg: Optional[bytes] = None
+        if needs_snapshot:
+            try:
+                ok, _snap_buf = cv2.imencode(
+                    ".jpg", snapshot_source_frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
+                )
+                if ok:
+                    _snap_jpeg = bytes(_snap_buf)
+            except Exception as _enc_exc:
+                logger.debug("[%s] Snapshot encode failed: %s", camera_id, _enc_exc)
+
+        def _det_person_fields(det: "Detection") -> dict:
+            return {
+                "person_id": det.person_id,
+                "person_name": det.person_name,
+            }
+
+        # Fall events — always carry a snapshot
+        for _det in fall_dets:
+            outbox_worker.enqueue_event(OutboxEvent(
+                camera_id=camera_id,
+                event_type="fall",
+                occurred_at=_now_utc,
+                track_id=_det.track_id,
+                cls=_det.cls,
+                confidence=_det.score,
+                bbox_x=_det.x,
+                bbox_y=_det.y,
+                bbox_w=_det.w,
+                bbox_h=_det.h,
+                snapshot_jpeg=_snap_jpeg,
+                **_det_person_fields(_det),
+            ))
+
+        # New confirmed-track events — first appearance, now with a snapshot for review/enrollment
+        for _det in detections:
+            if _det.track_id in new_outbox_ids:
+                outbox_worker.enqueue_event(OutboxEvent(
+                    camera_id=camera_id,
+                    event_type="detection",
+                    occurred_at=_now_utc,
+                    track_id=_det.track_id,
+                    cls=_det.cls,
+                    confidence=_det.score,
+                    bbox_x=_det.x,
+                    bbox_y=_det.y,
+                    bbox_w=_det.w,
+                    bbox_h=_det.h,
+                    snapshot_jpeg=_snap_jpeg,
+                    **_det_person_fields(_det),
+                ))
+
+        # Zone violation events (P2.2) — one event per violation per entry, now with a snapshot
+        for _zv in zone_violations_this_frame:
+            _zv_det = next((d for d in detections if d.track_id == _zv.track_id), None)
+            outbox_worker.enqueue_event(OutboxEvent(
+                camera_id=camera_id,
+                event_type="zone_violation",
+                occurred_at=_now_utc,
+                track_id=_zv.track_id,
+                cls="person",
+                confidence=_zv_det.score if _zv_det else 0.0,
+                bbox_x=_zv_det.x if _zv_det else 0.0,
+                bbox_y=_zv_det.y if _zv_det else 0.0,
+                bbox_w=_zv_det.w if _zv_det else 0.0,
+                bbox_h=_zv_det.h if _zv_det else 0.0,
+                zone_id=_zv.zone_id,
+                snapshot_jpeg=_snap_jpeg,
+                **(_det_person_fields(_zv_det) if _zv_det else {}),
+            ))
 
         return detections
 
     except Exception as e:
-        increment_error_counter()
-        logger.error(f"[{camera_id}] Unexpected error in /infer: {type(e).__name__}: {e}", exc_info=True)
+        error_message = f"Unexpected error in /infer: {type(e).__name__}: {e}"
+        _record_camera_infer_error(state, error_message)
+        logger.error(f"[{camera_id}] {error_message}", exc_info=True)
+        INFER_REQUESTS.labels(camera_id=camera_id, status="error").inc()
+        INFER_ERRORS.labels(camera_id=camera_id, kind="unknown").inc()
         return []
 
 
@@ -954,13 +1549,27 @@ def status(request: Request):
 
     for cam_id, state in camera_items:
         with state["lock"]:
+            metrics_snapshot = get_camera_metrics_snapshot(state)
+            last_update_ts = metrics_snapshot["last_update_ts"]
             cam_info = {
                 "frame_idx": int(state.get("frame_idx", 0)),
                 "tracks": len(state["tracks"]),
                 "unique_persons": len(state["seen_ids"]),
                 "created_at": datetime.fromtimestamp(state["created_at"]).isoformat(),
-                "avg_inference_ms": (sum(state["inference_times"]) / len(state["inference_times"]) * 1000)
-                                   if state["inference_times"] else 0.0
+                "request_count": metrics_snapshot["request_count"],
+                "error_count": metrics_snapshot["error_count"],
+                "last_infer_ms": metrics_snapshot["last_infer_ms"],
+                "avg_inference_ms": metrics_snapshot["avg_inference_ms"],
+                "p50_inference_ms": metrics_snapshot["p50_inference_ms"],
+                "p95_inference_ms": metrics_snapshot["p95_inference_ms"],
+                "avg_decode_ms": metrics_snapshot["avg_decode_ms"],
+                "avg_preprocess_ms": metrics_snapshot["avg_preprocess_ms"],
+                "avg_yolo_ms": metrics_snapshot["avg_yolo_ms"],
+                "last_track_count": metrics_snapshot["last_track_count"],
+                "avg_track_count": metrics_snapshot["avg_track_count"],
+                "last_error": metrics_snapshot["last_error"],
+                "last_update_ts": datetime.fromtimestamp(last_update_ts).isoformat() if last_update_ts > 0 else None,
+                "metrics_window_size": metrics_snapshot["metrics_window_size"],
             }
 
             # Add fall detection stats if enabled
@@ -980,17 +1589,60 @@ def status(request: Request):
     total_requests, total_errors = get_counter_snapshot()
 
     return {
-        "service": "YOLOv8 People Analytics + Fall Detection",
+        "service": "YOLO26 People Analytics + Fall Detection",
         "status": "running",
         "uptime_seconds": uptime,
         "total_requests": total_requests,
         "total_errors": total_errors,
         "error_rate": (total_errors / total_requests * 100) if total_requests > 0 else 0.0,
         "active_cameras": len(camera_items),
+        "metrics_window_size": METRICS_WINDOW_SIZE,
         "fall_detection": "ENABLED" if ENABLE_FALL_DETECTION else "DISABLED",
         "cameras": cameras_info,
         "model": MODEL_PATH,
         "timestamp": datetime.now().isoformat()
+    }
+
+
+# ============================
+# Per-camera Config Endpoint (P2.2)
+# ============================
+@app.get("/config/{camera_id}")
+async def get_camera_config_endpoint(camera_id: str, request: Request):
+    """Return per-camera inference config from the database.
+
+    The plugin can poll this endpoint on startup and periodically to
+    receive camera-specific overrides (confidence threshold, frame period, etc.).
+    Fields that are null mean "use service default".
+    """
+    from .db import get_session
+    from .db.dal import get_camera_config, list_zones
+    from .config import CONFIDENCE_THRESHOLD as _DEFAULT_CONF, IOU_THRESHOLD as _DEFAULT_IOU
+
+    cfg = None
+    zones_summary: list = []
+    if request.app.state.__dict__.get("db_ok", True):
+        try:
+            async with get_session() as session:
+                cfg = await get_camera_config(session, camera_id)
+                zones = await list_zones(session, camera_id=camera_id, active_only=True)
+                zones_summary = [{"id": str(z.id), "name": z.name, "zone_type": z.zone_type} for z in zones]
+        except Exception as _e:
+            logger.debug("[config] DB unavailable for camera config: %s", _e)
+
+    return {
+        "camera_id": camera_id,
+        "confidence_threshold": cfg.confidence_threshold if cfg else None,
+        "iou_threshold": cfg.iou_threshold if cfg else None,
+        "frame_period": cfg.frame_period if cfg else None,
+        "zone_ids": cfg.zone_ids if cfg else [],
+        "extra": cfg.extra if cfg else {},
+        "active_zones": zones_summary,
+        "service_defaults": {
+            "confidence_threshold": _DEFAULT_CONF,
+            "iou_threshold": _DEFAULT_IOU,
+        },
+        "updated_at": cfg.updated_at.isoformat() if cfg else None,
     }
 
 
@@ -1022,6 +1674,11 @@ def reset_camera(camera_id: str, request: Request):
         state["track_history"].clear()
         state["next_id"] = 1
         state["frame_idx"] = 0
+        if state.get("identity"):
+            state["identity"].clear()
+        if state.get("person_no_map"):
+            state["person_no_map"].clear()
+        state["next_person_no"] = 1
         if state["fall_detector"]:
             state["fall_detector"].reset_fall()
 
@@ -1050,6 +1707,11 @@ def reset_all(request: Request):
             state["track_history"].clear()
             state["next_id"] = 1
             state["frame_idx"] = 0
+            if state.get("identity"):
+                state["identity"].clear()
+            if state.get("person_no_map"):
+                state["person_no_map"].clear()
+            state["next_person_no"] = 1
             if state["fall_detector"]:
                 state["fall_detector"].reset_fall()
 
@@ -1109,6 +1771,8 @@ def reset_fall_all(request: Request):
 @app.on_event("startup")
 async def startup_event():
     """Called when service starts"""
+    readiness_state.reset_for_startup()
+
     # Load camera calibration if undistort is enabled
     if ENABLE_UNDISTORT:
         load_calibration()
@@ -1133,9 +1797,138 @@ async def startup_event():
         logger.info(f"CORS allow origins: {', '.join(CORS_ALLOW_ORIGINS)}")
     logger.info(f"Reset count for camera: POST http://{SERVICE_HOST}:{SERVICE_PORT}/reset/default")
     logger.info(f"Reset all cameras: POST http://{SERVICE_HOST}:{SERVICE_PORT}/reset_all")
+    logger.info(f"Admin API docs:    http://{SERVICE_HOST}:{SERVICE_PORT}/docs  (persons/zones/events/reset)")
     if ENABLE_FALL_DETECTION:
         logger.info(f"Reset fall detection for camera: POST http://{SERVICE_HOST}:{SERVICE_PORT}/reset_fall/default")
         logger.info(f"Reset fall detection for all cameras: POST http://{SERVICE_HOST}:{SERVICE_PORT}/reset_fall_all")
+
+    # ── Database engine ───────────────────────────────────────────────────────
+    # Non-blocking: if the DB URL is missing or unreachable the service starts
+    # anyway and reports "degraded" in /health until the connection recovers.
+    try:
+        init_engine()
+        from .db.session import is_edge_mode
+
+        if is_edge_mode():
+            from .config import EDGE_SQLITE_PATH
+            logger.info(f"Edge SQLite store ready ({EDGE_SQLITE_PATH})")
+        else:
+            logger.info("Database engine initialised (pool ready)")
+    except Exception as _db_exc:
+        logger.warning(
+            f"Database engine init skipped — service will run in degraded mode: {_db_exc}"
+        )
+
+    from .async_bridge import init_async_bridge
+    init_async_bridge(asyncio.get_running_loop())
+
+    # ── S P1.3 Outbox worker ──────────────────────────────────────────────────
+    loop = asyncio.get_event_loop()
+    outbox_worker.init_outbox(loop)
+    await outbox_worker.start_worker()
+    logger.info("Outbox worker started")
+
+    # ── S P2.3 Alert engine config ────────────────────────────────────────────
+    from . import alert_engine
+    from .config import (
+        ALERT_DEDUPE_SEC, ALERT_MAX_RETRIES,
+        ALERT_RATE_LIMIT_MAX, ALERT_RATE_LIMIT_WINDOW_SEC,
+    )
+    alert_engine.configure(
+        dedupe_sec=ALERT_DEDUPE_SEC,
+        rate_limit_max=ALERT_RATE_LIMIT_MAX,
+        rate_limit_window_sec=ALERT_RATE_LIMIT_WINDOW_SEC,
+        max_retries=ALERT_MAX_RETRIES,
+    )
+
+    # ── S P2.4 Retention worker ────────────────────────────────────────────────
+    from . import retention as _retention
+    from .config import RETENTION_DAYS, RETENTION_CHECK_HOURS
+    _retention.start_retention_worker(
+        retention_days=RETENTION_DAYS,
+        check_hours=RETENTION_CHECK_HOURS,
+    )
+
+    logger.info("Model load start")
+    yolo_model = None
+    try:
+        yolo_model = load_model()
+        runtime_device = _resolve_model_device(yolo_model)
+        readiness_state.update(
+            model_loaded=True,
+            model_load_error=None,
+            device=runtime_device,
+        )
+        logger.info(f"Model load success (device={runtime_device})")
+    except Exception as exc:
+        load_error = _format_exception(exc)
+        readiness_state.update(
+            model_loaded=False,
+            model_load_error=load_error,
+            warmup_ok=False,
+            warmup_error="warmup skipped because model load failed",
+            device=str(DEVICE),
+        )
+        logger.error(f"Model load fail: {load_error}", exc_info=True)
+    else:
+        logger.info("Warmup start")
+        try:
+            runtime_device = _warmup_model(yolo_model)
+            readiness_state.update(
+                warmup_ok=True,
+                warmup_error=None,
+                device=runtime_device,
+            )
+            logger.info(f"Warmup success (device={runtime_device})")
+        except Exception as exc:
+            warmup_error = _format_exception(exc)
+            runtime_device = _resolve_model_device(yolo_model)
+            readiness_state.update(
+                warmup_ok=False,
+                warmup_error=warmup_error,
+                device=runtime_device,
+            )
+            logger.error(f"Warmup fail on {runtime_device}: {warmup_error}", exc_info=True)
+    finally:
+        readiness_state.update(startup_completed=True)
+        startup_health = readiness_state.snapshot(mark_checked=False)
+        logger.info(
+            "Startup readiness: "
+            f"status={startup_health['status']} "
+            f"ready={startup_health['ready']} "
+            f"model_loaded={startup_health['model_loaded']} "
+            f"warmup_ok={startup_health['warmup_ok']} "
+            f"device={startup_health['device']} "
+            f"auth_enabled={startup_health['auth_enabled']}"
+        )
+        SERVICE_INFO.info({
+            "version": "1.0.0",
+            "model_path": str(MODEL_PATH),
+            "device": str(startup_health["device"]),
+        })
+        logger.info("Metrics endpoint: GET /metrics (Prometheus scrape)")
+
+    # Face models (buffalo_l ~280MB) download in background so /health and /ui
+    # respond immediately after YOLO warmup — do not block application startup.
+    if ENABLE_FACE_RECOGNITION:
+        asyncio.create_task(_background_face_warmup(), name="face-warmup")
+
+
+async def _background_face_warmup() -> None:
+    try:
+        logger.info("Face recognition warmup started (background)")
+        ready = await asyncio.to_thread(face_engine.warmup)
+        if ready:
+            face_engine.invalidate_gallery()
+            logger.info("Face recognition ready (insightface loaded)")
+        else:
+            logger.warning(
+                "Face recognition unavailable — insightface not installed or model load failed; "
+                "detections will not be labelled with identities"
+            )
+    except Exception as _fexc:
+        logger.warning("Face recognition warmup skipped: %s", _fexc)
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1144,5 +1937,9 @@ async def shutdown_event():
     total_requests, total_errors = get_counter_snapshot()
     logger.info(f"Total requests: {total_requests}")
     logger.info(f"Total errors: {total_errors}")
+    await outbox_worker.stop_worker(drain_timeout=5.0)
+    logger.info("Outbox worker stopped")
+    await dispose_engine()
+    logger.info("Database engine disposed")
 
 

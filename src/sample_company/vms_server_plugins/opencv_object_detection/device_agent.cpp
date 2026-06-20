@@ -8,6 +8,7 @@
 #include <chrono>
 #include <exception>
 #include <cctype>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -88,18 +89,66 @@ namespace sample_company
                     return name.empty() ? "unknown_camera" : name;
                 }
 
+                // Returns the stable Nx camera UUID used as the service-side camera_id key.
+                // Prefers deviceInfo->id() (UUID, stable across renames) and falls back to
+                // the display name only when no id is available.
+                std::string resolveStableCameraId(const nx::sdk::IDeviceInfo* deviceInfo)
+                {
+                    if (!deviceInfo)
+                        return "unknown_camera";
+
+                    if constexpr (HasIdMethod<nx::sdk::IDeviceInfo>::value)
+                    {
+                        const char* raw = deviceInfo->id();
+                        if (raw && *raw)
+                            return raw;
+                    }
+
+                    if constexpr (HasNameMethod<nx::sdk::IDeviceInfo>::value)
+                    {
+                        const char* raw = deviceInfo->name();
+                        if (raw && *raw)
+                            return raw;
+                    }
+
+                    return "unknown_camera";
+                }
+
+                std::string trimSettingValue(const std::string& raw)
+                {
+                    size_t begin = 0;
+                    while (begin < raw.size()
+                        && std::isspace(static_cast<unsigned char>(raw[begin])))
+                    {
+                        ++begin;
+                    }
+
+                    size_t end = raw.size();
+                    while (end > begin
+                        && std::isspace(static_cast<unsigned char>(raw[end - 1])))
+                    {
+                        --end;
+                    }
+
+                    return raw.substr(begin, end - begin);
+                }
+
                 int parseIntSettingValue(
                     const std::string& raw,
                     int defaultValue,
                     int minValue,
                     int maxValue)
                 {
-                    if (raw.empty())
+                    const std::string valueText = trimSettingValue(raw);
+                    if (valueText.empty())
                         return defaultValue;
 
                     try
                     {
-                        int value = std::stoi(raw);
+                        size_t parsedChars = 0;
+                        int value = std::stoi(valueText, &parsedChars);
+                        if (parsedChars != valueText.size())
+                            return defaultValue;
                         if (value < minValue)
                             value = minValue;
                         if (value > maxValue)
@@ -114,10 +163,10 @@ namespace sample_company
 
                 bool parseBoolSettingValue(const std::string& raw, bool defaultValue)
                 {
-                    if (raw.empty())
+                    std::string value = trimSettingValue(raw);
+                    if (value.empty())
                         return defaultValue;
 
-                    std::string value = raw;
                     std::transform(value.begin(), value.end(), value.begin(),
                         [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
 
@@ -126,6 +175,73 @@ namespace sample_company
                     if (value == "0" || value == "false" || value == "no" || value == "off")
                         return false;
                     return defaultValue;
+                }
+
+                std::string parseTextSettingValue(
+                    const std::string& raw,
+                    const std::string& defaultValue)
+                {
+                    const std::string value = trimSettingValue(raw);
+                    return value.empty() ? defaultValue : value;
+                }
+
+                std::filesystem::path resolveRelativeDebugDumpRoot(
+                    const std::filesystem::path& pluginHomeDir,
+                    const std::string& configuredDir,
+                    bool* outUsedFallback = nullptr)
+                {
+                    if (outUsedFallback)
+                        *outUsedFallback = false;
+
+                    const auto fallbackRoot =
+                        (pluginHomeDir / DebugDumpConfig::kDefaultDumpDir).lexically_normal();
+                    const auto fallbackToDefault = [&]() -> std::filesystem::path
+                    {
+                        if (outUsedFallback)
+                            *outUsedFallback = true;
+                        return fallbackRoot;
+                    };
+
+                    const std::filesystem::path configuredPath(trimSettingValue(configuredDir));
+                    if (configuredPath.empty())
+                        return fallbackRoot;
+
+                    if (configuredPath.is_absolute()
+                        || configuredPath.has_root_name()
+                        || configuredPath.has_root_directory())
+                    {
+                        return fallbackToDefault();
+                    }
+
+                    const std::filesystem::path normalized = configuredPath.lexically_normal();
+                    if (normalized.empty() || normalized == ".")
+                        return fallbackRoot;
+
+                    for (const auto& part: normalized)
+                    {
+                        if (part == std::filesystem::path(".."))
+                            return fallbackToDefault();
+                    }
+
+                    return (pluginHomeDir / normalized).lexically_normal();
+                }
+
+                std::string printableSettingValue(const std::string& raw)
+                {
+                    const std::string value = trimSettingValue(raw);
+                    return value.empty() ? std::string("<empty>") : value;
+                }
+
+                std::string maskedSecretSettingValue(const std::string& raw)
+                {
+                    return trimSettingValue(raw).empty()
+                        ? std::string("not_set")
+                        : std::string("***configured***");
+                }
+
+                const char* boolToString(bool value)
+                {
+                    return value ? "true" : "false";
                 }
 
                 void updateMaxDepth(std::atomic<size_t>& currentMax, size_t depth)
@@ -143,14 +259,18 @@ namespace sample_company
                 : ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ true),
                   m_pluginHomeDir(std::move(pluginHomeDir)),
                   m_cameraName(resolveCameraName(deviceInfo)),
+                  m_cameraId(resolveStableCameraId(deviceInfo)),
                   m_objectDetector(std::make_unique<ObjectDetector>()),
                   m_objectTracker(std::make_unique<ObjectTracker>()),
-                  m_workerThread(&DeviceAgent::workerThreadRun, this), // FLOW 2: Start worker thread
-                  m_workerShouldStop(false)
+                  m_workerThread(&DeviceAgent::workerThreadRun, this),
+                  m_workerShouldStop(false),
+                  m_healthPollThread(&DeviceAgent::healthPollThreadRun, this), // P P1.1
+                  m_configPollThread(&DeviceAgent::configPollThreadRun, this)  // P2.2
             {
                 logutil::log(
                     logutil::Level::info,
-                    "DeviceAgent camera_name=\"" + m_cameraName + "\"");
+                    "DeviceAgent camera_name=\"" + m_cameraName + "\""
+                        " camera_id=\"" + m_cameraId + "\"");
                 logutil::log(
                     logutil::Level::info,
                     "Plugin log file: " + logutil::configuredLogFilePath());
@@ -158,15 +278,232 @@ namespace sample_company
 
             DeviceAgent::~DeviceAgent()
             {
-                // FLOW 2: Signal worker thread to stop and wait for it
+                // Stop frame worker thread
                 {
                     std::unique_lock<std::mutex> lk(m_frameQueueMutex);
                     m_workerShouldStop = true;
                 }
                 m_frameQueueCV.notify_one();
                 if (m_workerThread.joinable())
-                {
                     m_workerThread.join();
+
+                // P P1.1 – stop health poll thread
+                m_healthPollShouldStop.store(true);
+                m_healthPollCV.notify_one();
+                if (m_healthPollThread.joinable())
+                    m_healthPollThread.join();
+
+                // P2.2 – stop config poll thread
+                m_configPollShouldStop.store(true);
+                m_configPollCV.notify_one();
+                if (m_configPollThread.joinable())
+                    m_configPollThread.join();
+            }
+
+            // ============================================================
+            // P P1.1 – Health poll thread: probes GET /health every N seconds,
+            // emits Nx diagnostic events on status transitions.
+            // ============================================================
+            void DeviceAgent::healthPollThreadRun()
+            {
+                // Wait a short initial delay so the service has time to warm up
+                // before the first probe is attempted.
+                {
+                    std::unique_lock<std::mutex> lk(m_healthPollMutex);
+                    m_healthPollCV.wait_for(
+                        lk,
+                        std::chrono::seconds(kHealthPollInitialDelaySec),
+                        [this]() { return m_healthPollShouldStop.load(); });
+                    if (m_healthPollShouldStop.load())
+                        return;
+                }
+
+                std::string lastStatus; //< empty = no probe done yet
+
+                while (true)
+                {
+                    const HealthCheckResult result = m_objectDetector->checkHealth();
+
+                    const std::string& newStatus = result.reachable
+                        ? result.status
+                        : "not_reachable";
+
+                    // Build detail string shared across event types
+                    std::string details;
+                    if (!result.reachable)
+                    {
+                        details = "error=" + result.raw_error;
+                    }
+                    else
+                    {
+                        if (!result.reason_codes.empty())
+                        {
+                            details += "reason=[";
+                            for (const auto& rc : result.reason_codes)
+                                details += rc + " ";
+                            details += "] ";
+                        }
+                        for (const auto& [dep, depStatus] : result.dependencies)
+                            details += dep + "=" + depStatus + " ";
+                    }
+                    if (details.empty())
+                        details = "status=" + newStatus;
+
+                    logutil::logThrottled(
+                        logutil::Level::info,
+                        "device_agent.health_poll." + m_cameraName,
+                        std::chrono::seconds(60),
+                        "Health probe camera=\"" + m_cameraName + "\" " + details);
+
+                    if (newStatus != lastStatus)
+                    {
+                        if (newStatus == "healthy")
+                        {
+                            // Recovery event — only emit if we had a prior non-healthy state
+                            if (!lastStatus.empty() && lastStatus != "healthy")
+                            {
+                                pushPluginDiagnosticEvent(
+                                    nx::sdk::IPluginDiagnosticEvent::Level::info,
+                                    "Analytics service recovered",
+                                    ("status=healthy camera=\"" + m_cameraName + "\"").c_str());
+                                logutil::log(
+                                    logutil::Level::info,
+                                    "Health poll: service recovered camera=\"" + m_cameraName + "\"");
+                            }
+                        }
+                        else if (newStatus == "degraded")
+                        {
+                            pushPluginDiagnosticEvent(
+                                nx::sdk::IPluginDiagnosticEvent::Level::warning,
+                                "Analytics service degraded",
+                                details.c_str());
+                            logutil::log(
+                                logutil::Level::warn,
+                                "Health poll: service degraded camera=\"" + m_cameraName +
+                                    "\" " + details);
+                        }
+                        else // not_ready | not_reachable | unknown
+                        {
+                            pushPluginDiagnosticEvent(
+                                nx::sdk::IPluginDiagnosticEvent::Level::error,
+                                "Analytics service not available",
+                                (details + " camera=\"" + m_cameraName + "\"").c_str());
+                            logutil::log(
+                                logutil::Level::error,
+                                "Health poll: service not available camera=\"" +
+                                    m_cameraName + "\" " + details);
+                        }
+                        lastStatus = newStatus;
+                    }
+
+                    // Wait for next poll interval (interruptible by stop signal)
+                    {
+                        std::unique_lock<std::mutex> lk(m_healthPollMutex);
+                        const int intervalSec = std::max(
+                            5, m_healthPollIntervalSec.load(std::memory_order_relaxed));
+                        m_healthPollCV.wait_for(
+                            lk,
+                            std::chrono::seconds(intervalSec),
+                            [this]() { return m_healthPollShouldStop.load(); });
+                        if (m_healthPollShouldStop.load())
+                            break;
+                    }
+                }
+            }
+
+            // ============================================================
+            // P2.2 – Config poll thread: queries GET /config/{camera_id}
+            // every N seconds; applies frame_period if provided.
+            // ============================================================
+            void DeviceAgent::configPollThreadRun()
+            {
+                // Short initial delay (service is warming up at plugin start).
+                {
+                    std::unique_lock<std::mutex> lk(m_configPollMutex);
+                    m_configPollCV.wait_for(
+                        lk,
+                        std::chrono::seconds(kConfigPollInitialDelaySec),
+                        [this]() { return m_configPollShouldStop.load(); });
+                    if (m_configPollShouldStop.load())
+                        return;
+                }
+
+                // P2.3 – Register this camera with the service so the service knows its
+                // display name. Best-effort: a failure just logs and the poll loop continues.
+                {
+                    const bool ok = m_objectDetector->registerCamera(m_cameraId, m_cameraName);
+                    if (ok)
+                        logutil::log(logutil::Level::info,
+                            "Camera registered with service camera_id=\"" + m_cameraId +
+                                "\" display_name=\"" + m_cameraName + "\"");
+                    else
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "device_agent.register_camera." + m_cameraId,
+                            std::chrono::seconds(60),
+                            "Camera registration failed (service may not be ready yet) id=\"" + m_cameraId + "\"");
+                }
+
+                while (true)
+                {
+                    const CameraConfigFetch cfg = m_objectDetector->fetchCameraConfig(m_cameraId);
+
+                    if (!cfg.reachable)
+                    {
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "device_agent.config_poll." + m_cameraId,
+                            std::chrono::seconds(120),
+                            "Config poll unreachable camera_id=\"" + m_cameraId +
+                                "\" name=\"" + m_cameraName + "\" error=" + cfg.raw_error);
+                    }
+                    else
+                    {
+                        std::string summary;
+
+                        if (cfg.frame_period >= 1)
+                        {
+                            const int prev = m_detectionFramePeriod.load(std::memory_order_relaxed);
+                            if (cfg.frame_period != prev)
+                            {
+                                m_detectionFramePeriod.store(cfg.frame_period, std::memory_order_relaxed);
+                                summary += "frame_period=" + std::to_string(cfg.frame_period) + "(applied) ";
+                            }
+                            else
+                            {
+                                summary += "frame_period=" + std::to_string(cfg.frame_period) + " ";
+                            }
+                        }
+
+                        if (cfg.confidence_threshold >= 0.0f)
+                            summary += "conf=" + std::to_string(cfg.confidence_threshold) + "(service-side) ";
+
+                        if (cfg.iou_threshold >= 0.0f)
+                            summary += "iou=" + std::to_string(cfg.iou_threshold) + "(service-side) ";
+
+                        if (summary.empty())
+                            summary = "(no overrides)";
+
+                        logutil::logThrottled(
+                            logutil::Level::info,
+                            "device_agent.config_poll." + m_cameraId,
+                            std::chrono::seconds(300),
+                            "Per-camera config camera_id=\"" + m_cameraId +
+                                "\" name=\"" + m_cameraName + "\" " + summary);
+                    }
+
+                    // Wait for next interval (interruptible by stop signal).
+                    {
+                        std::unique_lock<std::mutex> lk(m_configPollMutex);
+                        const int intervalSec = std::max(
+                            30, m_configPollIntervalSec.load(std::memory_order_relaxed));
+                        m_configPollCV.wait_for(
+                            lk,
+                            std::chrono::seconds(intervalSec),
+                            [this]() { return m_configPollShouldStop.load(); });
+                        if (m_configPollShouldStop.load())
+                            break;
+                    }
                 }
             }
 
@@ -174,25 +511,50 @@ namespace sample_company
             {
                 return /*suppress newline*/ 1 + R"json(
 {
-    "eventTypes": [
-        {
-            "id": ")json" +
+    "typeLibrary": {
+        "objectTypes": [
+            {
+                "id": ")json" +
+                       kPersonObjectType + R"json(",
+                "name": "HUMAN DETECTED"
+            },
+            {
+                "id": ")json" +
+                       kCatObjectType + R"json(",
+                "name": "Cat"
+            },
+            {
+                "id": ")json" +
+                       kDogObjectType + R"json(",
+                "name": "Dog"
+            }
+        ],
+        "eventTypes": [
+            {
+                "id": ")json" +
                        kDetectionEventType + R"json(",
-            "name": "Object detected"
-        },
-        {
-            "id": ")json" +
+                "name": "Object detected"
+            },
+            {
+                "id": ")json" +
                        kProlongedDetectionEventType + R"json(",
-            "name": "Object detected (prolonged)",
-            "flags": "stateDependent"
-        },
-        {
-            "id": ")json" +
+                "name": "Object detected (prolonged)",
+                "flags": "stateDependent"
+            },
+            {
+                "id": ")json" +
                        kFallDetectedEventType + R"json(",
-            "name": "Fall detected",
-            "flags": "stateDependent"
-        }
-    ],
+                "name": "Fall detected",
+                "flags": "stateDependent"
+            },
+            {
+                "id": ")json" +
+                       kZoneViolationEventType + R"json(",
+                "name": "Zone violation",
+                "flags": "stateDependent"
+            }
+        ]
+    },
     "supportedTypes": [
         {
             "objectTypeId": ")json" +
@@ -206,7 +568,169 @@ namespace sample_company
             "objectTypeId": ")json" +
                        kDogObjectType + R"json("
         }
-    ]
+    ],
+    "deviceAgentSettingsModel": {
+        "type": "Settings",
+        "items": [
+            {
+                "type": "CheckBox",
+                "name": "enabled",
+                "caption": "Enable Detection",
+                "defaultValue": true
+            },
+            {
+                "type": "SpinBox",
+                "name": "detection_frame_period",
+                "caption": "Detection Frame Period",
+                "defaultValue": 2,
+                "description": "Run detection every Nth frame (2 = every other frame)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "target_enqueue_fps",
+                "caption": "Target Enqueue FPS",
+                "defaultValue": 3,
+                "description": "Max frame enqueue rate to AI worker. Use 2-3 on CPU/dev; 5-8 on AI Box after tuning."
+            },
+            {
+                "type": "SpinBox",
+                "name": "frame_queue_max_size",
+                "caption": "Frame Queue Max Size",
+                "defaultValue": 1,
+                "description": "Max buffered frames before dropping oldest (1 = prefer freshest frame)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "metrics_log_period_sec",
+                "caption": "Metrics Period (sec)",
+                "defaultValue": 10,
+                "description": "Periodic pipeline metrics interval."
+            },
+            {
+                "type": "TextField",
+                "name": "service_host",
+                "caption": "Service Host",
+                "defaultValue": "127.0.0.1",
+                "description": "Host name or IP address of the Python analytics service."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_port",
+                "caption": "Service Port",
+                "defaultValue": 18000,
+                "description": "TCP port of the Python analytics service."
+            },
+            {
+                "type": "PasswordField",
+                "name": "service_api_key",
+                "caption": "Service API Key",
+                "defaultValue": "",
+                "description": "Optional X-API-Key header value sent to the analytics service."
+            },
+            {
+                "type": "CheckBox",
+                "name": "service_use_https",
+                "caption": "Use HTTPS",
+                "defaultValue": false,
+                "description": "Enable HTTPS when connecting to the analytics service."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_connect_timeout_ms",
+                "caption": "Connect Timeout (ms)",
+                "defaultValue": 2000,
+                "description": "Socket connect timeout for analytics service requests."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_read_timeout_ms",
+                "caption": "Read Timeout (ms)",
+                "defaultValue": 15000,
+                "description": "Response read timeout for analytics service requests."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_write_timeout_ms",
+                "caption": "Write Timeout (ms)",
+                "defaultValue": 2000,
+                "description": "Request body write timeout for analytics service requests."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_retry_count",
+                "caption": "Retry Count",
+                "defaultValue": 3,
+                "description": "Number of retry attempts after the initial request."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_retry_backoff_ms",
+                "caption": "Retry Backoff (ms)",
+                "defaultValue": 250,
+                "description": "Delay between analytics service retry attempts."
+            },
+            {
+                "type": "CheckBox",
+                "name": "debug_dump_enabled",
+                "caption": "Debug Frame Dump Enabled",
+                "defaultValue": false,
+                "description": "Enable frame dumping to disk for debugging (default off)."
+            },
+            {
+                "type": "TextField",
+                "name": "debug_dump_dir",
+                "caption": "Debug Dump Directory",
+                "defaultValue": "debug_frames",
+                "description": "Relative path for debug frame dump directory."
+            },
+            {
+                "type": "CheckBox",
+                "name": "debug_dump_input",
+                "caption": "Debug Dump Input Frames",
+                "defaultValue": false,
+                "description": "Dump input frames (when debug enabled)."
+            },
+            {
+                "type": "CheckBox",
+                "name": "debug_dump_output",
+                "caption": "Debug Dump Output Frames",
+                "defaultValue": false,
+                "description": "Dump output frames with bounding boxes (when debug enabled)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "debug_dump_every_n_frames",
+                "caption": "Debug Dump Every N Frames",
+                "defaultValue": 1,
+                "description": "Sample rate for frame dumping (1 = every frame, 10 = every 10th frame)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "queue_depth_warn_pct",
+                "caption": "Queue Depth Warning (%)",
+                "defaultValue": 80,
+                "minValue": 0,
+                "maxValue": 100,
+                "description": "Emit a warning diagnostic when queue depth exceeds this percentage of its maximum capacity (0 = disabled)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "drop_rate_warn_per_sec",
+                "caption": "Drop Rate Warning (frames/sec)",
+                "defaultValue": 5,
+                "minValue": 0,
+                "description": "Emit a warning diagnostic when the frame drop rate exceeds this threshold in frames per second (0 = disabled)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "health_poll_interval_sec",
+                "caption": "Health Poll Interval (sec)",
+                "defaultValue": 30,
+                "minValue": 5,
+                "description": "How often the plugin polls GET /health on the analytics service and emits diagnostic events on status changes."
+            }
+        ]
+    }
 }
 )json";
             }
@@ -379,7 +903,7 @@ namespace sample_company
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
                         job.frame = std::make_shared<Frame>(frame);
-                        job.cameraId = m_cameraName;
+                        job.cameraId = m_cameraId; //< stable UUID, not display name
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
 
@@ -505,6 +1029,64 @@ namespace sample_company
                         m_lastMetricsDiagTime = now;
                     }
 
+                    // P P1.4 – threshold-based warning diagnostics
+                    const size_t queueMax =
+                        std::max(size_t{1}, m_frameQueueMaxSize.load(std::memory_order_relaxed));
+                    const int queuePct = static_cast<int>(queueLen * 100 / queueMax);
+                    const double dropRate = (periodSec > 0.0)
+                        ? (static_cast<double>(deltaDropped) / periodSec)
+                        : 0.0;
+
+                    const int warnPct = m_queueDepthWarnPct.load(std::memory_order_relaxed);
+                    if (warnPct > 0 && queuePct >= warnPct)
+                    {
+                        if (m_lastQueueDepthThresholdWarnTime ==
+                                std::chrono::steady_clock::time_point::min() ||
+                            now - m_lastQueueDepthThresholdWarnTime >=
+                                std::chrono::seconds(kThresholdWarnThrottleSec))
+                        {
+                            const std::string details =
+                                "queue=" + std::to_string(queueLen) +
+                                "/" + std::to_string(queueMax) +
+                                " (" + std::to_string(queuePct) + "%" +
+                                " >= threshold " + std::to_string(warnPct) + "%)";
+                            logutil::log(
+                                logutil::Level::warn,
+                                "Queue depth threshold exceeded: " + details);
+                            pushPluginDiagnosticEvent(
+                                nx::sdk::IPluginDiagnosticEvent::Level::warning,
+                                "Queue depth threshold exceeded",
+                                details.c_str());
+                            m_lastQueueDepthThresholdWarnTime = now;
+                        }
+                    }
+
+                    const int warnRate = m_dropRateWarnPerSec.load(std::memory_order_relaxed);
+                    if (warnRate > 0 && dropRate >= static_cast<double>(warnRate))
+                    {
+                        if (m_lastDropRateThresholdWarnTime ==
+                                std::chrono::steady_clock::time_point::min() ||
+                            now - m_lastDropRateThresholdWarnTime >=
+                                std::chrono::seconds(kThresholdWarnThrottleSec))
+                        {
+                            const std::string details =
+                                "drop_rate=" + std::to_string(dropRate).substr(0, 5) +
+                                " frames/sec" +
+                                " >= threshold " + std::to_string(warnRate) +
+                                " frames/sec"
+                                " (dropped=" + std::to_string(deltaDropped) +
+                                " in " + std::to_string(periodSec).substr(0, 4) + "s)";
+                            logutil::log(
+                                logutil::Level::warn,
+                                "Drop rate threshold exceeded: " + details);
+                            pushPluginDiagnosticEvent(
+                                nx::sdk::IPluginDiagnosticEvent::Level::warning,
+                                "Drop rate threshold exceeded",
+                                details.c_str());
+                            m_lastDropRateThresholdWarnTime = now;
+                        }
+                    }
+
                     m_lastMetricsInCount = inCount;
                     m_lastMetricsProcessedCount = processedCount;
                     m_lastMetricsDroppedCount = droppedCount;
@@ -537,11 +1119,19 @@ namespace sample_company
                 const std::string rawEnqueueFps = settingValue("target_enqueue_fps");
                 const std::string rawQueueMax = settingValue("frame_queue_max_size");
                 const std::string rawMetricsPeriod = settingValue("metrics_log_period_sec");
-
-                const auto printableSettingValue = [](const std::string& value)
-                {
-                    return value.empty() ? std::string("<empty>") : value;
-                };
+                const std::string rawServiceHost = settingValue("service_host");
+                const std::string rawServicePort = settingValue("service_port");
+                const std::string rawServiceApiKey = settingValue("service_api_key");
+                const std::string rawServiceUseHttps = settingValue("service_use_https");
+                const std::string rawServiceConnectTimeoutMs =
+                    settingValue("service_connect_timeout_ms");
+                const std::string rawServiceReadTimeoutMs =
+                    settingValue("service_read_timeout_ms");
+                const std::string rawServiceWriteTimeoutMs =
+                    settingValue("service_write_timeout_ms");
+                const std::string rawServiceRetryCount = settingValue("service_retry_count");
+                const std::string rawServiceRetryBackoffMs =
+                    settingValue("service_retry_backoff_ms");
 
                 logutil::log(
                     logutil::Level::info,
@@ -551,7 +1141,21 @@ namespace sample_company
                         printableSettingValue(rawDetectionPeriod) +
                         ", target_enqueue_fps=" + printableSettingValue(rawEnqueueFps) +
                         ", frame_queue_max_size=" + printableSettingValue(rawQueueMax) +
-                        ", metrics_log_period_sec=" + printableSettingValue(rawMetricsPeriod));
+                        ", metrics_log_period_sec=" + printableSettingValue(rawMetricsPeriod) +
+                        ", service_host=" + printableSettingValue(rawServiceHost) +
+                        ", service_port=" + printableSettingValue(rawServicePort) +
+                        ", service_api_key=" + maskedSecretSettingValue(rawServiceApiKey) +
+                        ", service_use_https=" + printableSettingValue(rawServiceUseHttps) +
+                        ", service_connect_timeout_ms=" +
+                            printableSettingValue(rawServiceConnectTimeoutMs) +
+                        ", service_read_timeout_ms=" +
+                            printableSettingValue(rawServiceReadTimeoutMs) +
+                        ", service_write_timeout_ms=" +
+                            printableSettingValue(rawServiceWriteTimeoutMs) +
+                        ", service_retry_count=" +
+                            printableSettingValue(rawServiceRetryCount) +
+                        ", service_retry_backoff_ms=" +
+                            printableSettingValue(rawServiceRetryBackoffMs));
 
                 const bool detectionEnabled = parseBoolSettingValue(rawEnabled, true);
                 const int detectionPeriod = parseIntSettingValue(
@@ -574,6 +1178,44 @@ namespace sample_company
                     kDefaultMetricsLogPeriodSec,
                     1,
                     300);
+                AiServiceClientConfig serviceConfig;
+                serviceConfig.host = parseTextSettingValue(
+                    rawServiceHost,
+                    AiServiceClientConfig::kDefaultHost);
+                serviceConfig.port = parseIntSettingValue(
+                    rawServicePort,
+                    AiServiceClientConfig::kDefaultPort,
+                    1,
+                    65535);
+                serviceConfig.apiKey = parseTextSettingValue(rawServiceApiKey, "");
+                serviceConfig.useHttps = parseBoolSettingValue(
+                    rawServiceUseHttps,
+                    AiServiceClientConfig::kDefaultUseHttps);
+                serviceConfig.connectTimeoutMs = parseIntSettingValue(
+                    rawServiceConnectTimeoutMs,
+                    AiServiceClientConfig::kDefaultConnectTimeoutMs,
+                    100,
+                    std::numeric_limits<int>::max());
+                serviceConfig.readTimeoutMs = parseIntSettingValue(
+                    rawServiceReadTimeoutMs,
+                    AiServiceClientConfig::kDefaultReadTimeoutMs,
+                    100,
+                    std::numeric_limits<int>::max());
+                serviceConfig.writeTimeoutMs = parseIntSettingValue(
+                    rawServiceWriteTimeoutMs,
+                    AiServiceClientConfig::kDefaultWriteTimeoutMs,
+                    100,
+                    std::numeric_limits<int>::max());
+                serviceConfig.retryCount = parseIntSettingValue(
+                    rawServiceRetryCount,
+                    AiServiceClientConfig::kDefaultRetryCount,
+                    0,
+                    std::numeric_limits<int>::max());
+                serviceConfig.retryBackoffMs = parseIntSettingValue(
+                    rawServiceRetryBackoffMs,
+                    AiServiceClientConfig::kDefaultRetryBackoffMs,
+                    0,
+                    std::numeric_limits<int>::max());
 
                 const bool previousDetectionEnabled =
                     m_detectionEnabled.load(std::memory_order_relaxed);
@@ -588,6 +1230,7 @@ namespace sample_company
                 m_lastEffectiveEnqueueFps.store(
                     detectionEnabled ? enqueueFps : 0,
                     std::memory_order_relaxed);
+                m_objectDetector->setServiceConfig(serviceConfig);
 
                 if (!detectionEnabled)
                 {
@@ -610,7 +1253,117 @@ namespace sample_company
                         ", frame_queue_max_size=" +
                         std::to_string(m_frameQueueMaxSize.load(std::memory_order_relaxed)) +
                         ", metrics_log_period_sec=" +
-                        std::to_string(m_metricsLogPeriodSec.load(std::memory_order_relaxed)));
+                        std::to_string(m_metricsLogPeriodSec.load(std::memory_order_relaxed)) +
+                        ", service_host=" + serviceConfig.host +
+                        ", service_port=" + std::to_string(serviceConfig.port) +
+                        ", service_use_https=" + std::string(boolToString(serviceConfig.useHttps)) +
+                        ", service_api_key=" + maskedSecretSettingValue(serviceConfig.apiKey) +
+                        ", service_connect_timeout_ms=" +
+                            std::to_string(serviceConfig.connectTimeoutMs) +
+                        ", service_read_timeout_ms=" +
+                            std::to_string(serviceConfig.readTimeoutMs) +
+                        ", service_write_timeout_ms=" +
+                            std::to_string(serviceConfig.writeTimeoutMs) +
+                        ", service_retry_count=" +
+                            std::to_string(serviceConfig.retryCount) +
+                        ", service_retry_backoff_ms=" +
+                            std::to_string(serviceConfig.retryBackoffMs));
+
+                // Parse debug settings
+                const std::string rawDebugDumpEnabled = settingValue("debug_dump_enabled");
+                const std::string rawDebugDumpDir = settingValue("debug_dump_dir");
+                const std::string rawDebugDumpInput = settingValue("debug_dump_input");
+                const std::string rawDebugDumpOutput = settingValue("debug_dump_output");
+                const std::string rawDebugDumpEveryNFrames = settingValue("debug_dump_every_n_frames");
+
+                const bool debugDumpEnabled = parseBoolSettingValue(rawDebugDumpEnabled, false);
+                const std::string debugDumpDir = parseTextSettingValue(
+                    rawDebugDumpDir,
+                    DebugDumpConfig::kDefaultDumpDir);
+                const bool debugDumpInput = parseBoolSettingValue(rawDebugDumpInput, false);
+                const bool debugDumpOutput = parseBoolSettingValue(rawDebugDumpOutput, false);
+                const int debugDumpEveryNFrames = parseIntSettingValue(
+                    rawDebugDumpEveryNFrames,
+                    DebugDumpConfig::kDefaultEveryNFrames,
+                    1,
+                    1000);
+                bool debugDumpDirFallback = false;
+
+                DebugDumpConfig debugConfig;
+                debugConfig.enabled = debugDumpEnabled;
+                debugConfig.rootDir = resolveRelativeDebugDumpRoot(
+                    m_pluginHomeDir,
+                    debugDumpDir,
+                    &debugDumpDirFallback).string();
+                debugConfig.dumpInput = debugDumpInput;
+                debugConfig.dumpOutput = debugDumpOutput;
+                debugConfig.everyNFrames = debugDumpEveryNFrames;
+
+                {
+                    std::lock_guard<std::mutex> lk(m_debugConfigMutex);
+                    m_debugConfig = debugConfig;
+                }
+                m_objectDetector->setDebugDumpConfig(debugConfig);
+
+                if (debugDumpEnabled)
+                {
+                    if (debugDumpDirFallback)
+                    {
+                        logutil::log(
+                            logutil::Level::warn,
+                            "Invalid debug_dump_dir rejected; using default relative directory: " +
+                                std::string(DebugDumpConfig::kDefaultDumpDir));
+                    }
+
+                    logutil::log(
+                        logutil::Level::info,
+                        "Debug frame dump enabled: dir=" + debugConfig.rootDir +
+                            ", input=" + std::string(debugDumpInput ? "true" : "false") +
+                            ", output=" + std::string(debugDumpOutput ? "true" : "false") +
+                            ", every_n_frames=" + std::to_string(debugDumpEveryNFrames));
+                }
+
+                // P P1.4 – parse warning thresholds
+                const int queueDepthWarnPct = parseIntSettingValue(
+                    settingValue("queue_depth_warn_pct"),
+                    kDefaultQueueDepthWarnPct,
+                    0,
+                    100);
+                const int dropRateWarnPerSec = parseIntSettingValue(
+                    settingValue("drop_rate_warn_per_sec"),
+                    kDefaultDropRateWarnPerSec,
+                    0,
+                    std::numeric_limits<int>::max());
+
+                m_queueDepthWarnPct.store(queueDepthWarnPct, std::memory_order_relaxed);
+                m_dropRateWarnPerSec.store(dropRateWarnPerSec, std::memory_order_relaxed);
+
+                logutil::log(
+                    logutil::Level::info,
+                    "Threshold settings: queue_depth_warn_pct=" +
+                        std::to_string(queueDepthWarnPct) +
+                        (queueDepthWarnPct == 0 ? " (disabled)" : "%") +
+                        ", drop_rate_warn_per_sec=" +
+                        std::to_string(dropRateWarnPerSec) +
+                        (dropRateWarnPerSec == 0 ? " (disabled)" : " frames/sec"));
+
+                // P P1.1 – health poll interval
+                const int healthPollIntervalSec = parseIntSettingValue(
+                    settingValue("health_poll_interval_sec"),
+                    kDefaultHealthPollIntervalSec,
+                    5,
+                    3600);
+                m_healthPollIntervalSec.store(healthPollIntervalSec, std::memory_order_relaxed);
+                logutil::log(
+                    logutil::Level::info,
+                    "Health poll interval=" + std::to_string(healthPollIntervalSec) + "s");
+
+                // Kick the health poll thread so it re-reads config without waiting
+                // out the remainder of the current sleep interval.
+                m_healthPollCV.notify_one();
+
+                // P2.2 – kick the config poll thread on settings change
+                m_configPollCV.notify_one();
 
                 return nullptr;
             }
@@ -622,7 +1375,7 @@ namespace sample_company
                 pushPluginDiagnosticEvent(
                     nx::sdk::IPluginDiagnosticEvent::Level::info,
                     "PLUGIN VERSION",
-                    "yolov8_people_analytics_plugin.dll build=2025-12-14 v2");
+                    "yolo26_people_analytics_plugin.dll build=2025-12-14 v2");
 
                 if (m_terminated)
                     return;
@@ -776,6 +1529,10 @@ namespace sample_company
 
                         bool hasStablePerson = false;
                         std::set<nx::sdk::Uuid> currentFallDetectedTrackIds;
+                        std::set<nx::sdk::Uuid> currentZoneViolationTrackIds; // P2.1
+                        // P2.1 — map track → zone info for event descriptions
+                        std::map<nx::sdk::Uuid, std::string> trackZoneType;
+                        std::map<nx::sdk::Uuid, std::string> trackZoneId;
                         EventList newTrackEvents;
                         for (const auto &detection : detections)
                         {
@@ -793,6 +1550,14 @@ namespace sample_company
 
                             if (detection->fallDetected)
                                 currentFallDetectedTrackIds.insert(detection->trackId);
+
+                            // P2.1 — collect newly violated zone tracks
+                            if (detection->zoneViolation && !detection->zoneType.empty())
+                            {
+                                currentZoneViolationTrackIds.insert(detection->trackId);
+                                trackZoneType[detection->trackId] = detection->zoneType;
+                                trackZoneId[detection->trackId]   = detection->zoneId;
+                            }
                         }
 
                         if (!newTrackEvents.empty())
@@ -869,6 +1634,58 @@ namespace sample_company
 
                         for (const auto &trackId : tracksToClear)
                             m_activeFallDetectedTrackIds.erase(trackId);
+
+                        // P2.1 — Zone violation events (stateful, mirrors fall pattern)
+                        for (const auto &trackId : currentZoneViolationTrackIds)
+                        {
+                            if (m_activeZoneViolationTrackIds.count(trackId) > 0)
+                                continue; // already active — don't re-fire
+
+                            const std::string zt = trackZoneType.count(trackId)
+                                ? trackZoneType.at(trackId) : "restricted";
+                            const std::string zid = trackZoneId.count(trackId)
+                                ? trackZoneId.at(trackId) : "";
+
+                            auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                            eventMetadata->setCaption("Zone violation");
+                            eventMetadata->setDescription(
+                                "Person " + nx::sdk::UuidHelper::toStdString(trackId) +
+                                " entered " + zt + " zone" +
+                                (zid.empty() ? "" : " (id=" + zid.substr(0, 8) + ")"));
+                            eventMetadata->setIsActive(true);
+                            eventMetadata->setTypeId(kZoneViolationEventType);
+
+                            auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                            eventPacket->addItem(eventMetadata.get());
+                            eventPacket->setTimestampUs(job.timestampUs);
+                            result.push_back(eventPacket);
+
+                            m_activeZoneViolationTrackIds.insert(trackId);
+                        }
+
+                        std::vector<nx::sdk::Uuid> zoneToClear;
+                        for (const auto &activeTrackId : m_activeZoneViolationTrackIds)
+                        {
+                            if (currentZoneViolationTrackIds.count(activeTrackId) > 0)
+                                continue;
+                            // Track left zone or disappeared — clear the active event
+                            auto eventMetadata = nx::sdk::makePtr<nx::sdk::analytics::EventMetadata>();
+                            eventMetadata->setCaption("Zone violation cleared");
+                            eventMetadata->setDescription(
+                                "Person " + nx::sdk::UuidHelper::toStdString(activeTrackId) +
+                                " left restricted zone");
+                            eventMetadata->setIsActive(false);
+                            eventMetadata->setTypeId(kZoneViolationEventType);
+
+                            auto eventPacket = nx::sdk::makePtr<nx::sdk::analytics::EventMetadataPacket>();
+                            eventPacket->addItem(eventMetadata.get());
+                            eventPacket->setTimestampUs(job.timestampUs);
+                            result.push_back(eventPacket);
+
+                            zoneToClear.push_back(activeTrackId);
+                        }
+                        for (const auto &trackId : zoneToClear)
+                            m_activeZoneViolationTrackIds.erase(trackId);
                     }
                 }
                 catch (const ObjectDetectionError &e)
@@ -1064,18 +1881,86 @@ namespace sample_company
                     objectMetadata->setConfidence(detection->confidence);
                     objectMetadata->setTrackId(detection->trackId);
 
-                    if (detection->classLabel == "person")
-                    {
-                        objectMetadata->setTypeId(kPersonObjectType);
-                        objectMetadata->addAttribute(makePtr<Attribute>(
-                            IAttribute::Type::number,
-                            "Count Detect",
-                            std::to_string(m_currentPersons)));
-                        objectMetadata->addAttribute(makePtr<Attribute>(
-                            IAttribute::Type::number,
-                            "Fall Detect",
-                            detection->fallDetected ? "1" : "0"));
-                    }
+        if (detection->classLabel == "person")
+        {
+            objectMetadata->setTypeId(kPersonObjectType);
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::number,
+                "Count Detect",
+                std::to_string(m_currentPersons)));
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::number,
+                "Fall Detect",
+                detection->fallDetected ? "1" : "0"));
+
+            // P2.1 — zone violation attributes
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Zone Violation",
+                detection->zoneViolation ? "true" : "false"));
+            if (detection->zoneViolation && !detection->zoneType.empty())
+            {
+                objectMetadata->addAttribute(makePtr<Attribute>(
+                    IAttribute::Type::string,
+                    "Zone Type",
+                    detection->zoneType));
+            }
+
+            // P2.1 — severity: critical if fall + zone violation, high if either, normal otherwise
+            const std::string severity =
+                (detection->fallDetected && detection->zoneViolation) ? "critical" :
+                (detection->fallDetected || detection->zoneViolation) ? "high" : "normal";
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Severity",
+                severity));
+
+            // Face recognition identity — rendered as "(Ông A, Nam, No. 1)".
+            const std::string displayName =
+                !detection->personName.empty() ? detection->personName : std::string("Unknown");
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Person Name",
+                displayName));
+            if (detection->recognized)
+            {
+                if (!detection->personGender.empty())
+                {
+                    objectMetadata->addAttribute(makePtr<Attribute>(
+                        IAttribute::Type::string,
+                        "Gender",
+                        detection->personGender));
+                }
+                if (detection->personNo >= 0)
+                {
+                    objectMetadata->addAttribute(makePtr<Attribute>(
+                        IAttribute::Type::number,
+                        "Person No.",
+                        std::to_string(detection->personNo)));
+                }
+                if (!detection->personId.empty())
+                {
+                    objectMetadata->addAttribute(makePtr<Attribute>(
+                        IAttribute::Type::string,
+                        "Person Id",
+                        detection->personId));
+                }
+            }
+
+            // Single combined caption for convenient overlay: "Ông A, Nam, No. 1" or "Unknown".
+            std::string identity = displayName;
+            if (detection->recognized)
+            {
+                if (!detection->personGender.empty())
+                    identity += ", " + detection->personGender;
+                if (detection->personNo >= 0)
+                    identity += ", No. " + std::to_string(detection->personNo);
+            }
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Identity",
+                identity));
+        }
                     else if (detection->classLabel == "cat")
                     {
                         objectMetadata->setTypeId(kCatObjectType);
@@ -1113,6 +1998,17 @@ namespace sample_company
                 }
             }
 
+            // ── Legacy synchronous path ──────────────────────────────────────────────
+            // NOT called during normal operation. The active path is:
+            //   pushUncompressedVideoFrame() → worker queue → processFrameJob()
+            // This method is kept to satisfy the ConsumingDeviceAgent interface but
+            // is never invoked because doSetNeededMetadataTypes() always succeeds.
+            //
+            // The local m_objectTracker call below is intentionally isolated here.
+            // The authoritative track_id comes from the Python service (via
+            // processFrameJob). Do NOT call m_objectTracker from the worker path.
+            // TODO P2: Remove this method and m_objectTracker entirely once
+            //          ConsumingDeviceAgent no longer requires it.
             DeviceAgent::MetadataPacketList DeviceAgent::processFrame(
                 const IUncompressedVideoFrame *videoFrame)
             {
@@ -1128,26 +2024,23 @@ namespace sample_company
 
                 try
                 {
-                    // ⚠️ Frame constructor có thể ném exception (unsupported pixel format, cvtColor fail, etc)
                     Frame frame(videoFrame, m_frameIndex);
                     reinitializeObjectTrackerOnFrameSizeChanges(frame);
 
                     logutil::logThrottled(
-                        logutil::Level::debug,
-                        "device_agent.process_frame.call_detector",
-                        std::chrono::seconds(10),
-                        "Calling detector from legacy processFrame path");
+                        logutil::Level::warn,
+                        "device_agent.process_frame.legacy_path",
+                        std::chrono::seconds(30),
+                        "Legacy processFrame path invoked — this should not happen in normal operation");
 
-                    // 1) Gọi Python service -> lấy detections đã có track_id
+                    // Local tracker used only here; Python service is authoritative.
                     std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
-                    DetectionList detections = m_objectDetector->run(m_cameraName, jpegBytes);
+                    DetectionList detections = m_objectDetector->run(m_cameraId, jpegBytes);
                     const auto trackingResult = m_objectTracker->run(frame, detections);
 
-                    // 2) Dùng trực tiếp detections từ Python để tạo ObjectMetadata
                     const auto &objectMetadataPacket =
                         detectionsToObjectMetadataPacket(trackingResult.detections, frame.timestampUs);
 
-                    // 3) Không còn events từ tracking, nên truyền EventList rỗng
                     const auto &eventMetadataPacketList =
                         eventsToEventMetadataPacketList(trackingResult.events, frame.timestampUs);
 

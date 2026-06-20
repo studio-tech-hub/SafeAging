@@ -1,0 +1,189 @@
+# SafeAging — All-in-one Docker Compose
+#
+# Dev (Windows/WSL):
+#   docker compose up --build
+#
+# AI Box 6490 (ARM64, Ubuntu 20.04, QCS6490):
+#   docker compose build --build-arg TORCH_INDEX_URL=
+#   docker compose up
+#
+# Stop everything:
+#   docker compose down
+#
+# Wipe all data volumes:
+#   docker compose down -v
+
+networks:
+  safeaging-net:
+    driver: bridge
+
+volumes:
+  safeaging-postgres-data:
+  safeaging-minio-data:
+  safeaging-prometheus-data:
+  safeaging-grafana-data:
+  safeaging-runtime:       # SQLite outbox + edge state (persists across restarts)
+
+services:
+
+  # ── Analytics service (Python / FastAPI / YOLO26) ──────────────────────────
+  analytics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+      args:
+        # Override to "" for AI Box ARM64 build:
+        #   docker compose build --build-arg TORCH_INDEX_URL=
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: safeaging-analytics:latest
+    container_name: safeaging-analytics
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Override with Docker-internal service names — do NOT change these
+      - SERVICE_HOST=0.0.0.0
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-safeaging}:${POSTGRES_PASSWORD:-safeaging_dev_password}@postgres:5432/${POSTGRES_DB:-safeaging}
+      - S3_ENDPOINT=http://minio:9000
+      - MODEL_PATH=${MODEL_PATH:-/app/models/yolo26n.onnx}
+      - YOLO_IMGSZ=640
+      - ENABLE_UNDISTORT=false
+      - ENABLE_ROI=true
+      - ENABLE_MULTI_SCALE=false
+      - RATE_LIMIT_MAX_PER_CAMERA=1200
+      - RATE_LIMIT_MAX_PER_IP=2400
+      - CALIBRATION_FILE=/app/models/camera_calibration.json
+      - EDGE_SQLITE_PATH=/app/runtime/edge_state.db
+      # Plugin runs with empty API key until deviceAgentSettingsModel is rebuilt into the DLL
+      - API_KEY_REQUIRED=false
+    ports:
+      - "${SERVICE_PORT:-18000}:18000"
+    volumes:
+      # ./models  → calibration.json (tracked) + yolo26n.pt (downloaded on first run)
+      - ./models:/app/models
+      # Named volume → SQLite outbox, edge state (survives container restart)
+      - safeaging-runtime:/app/runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - safeaging-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s   # Allow time for model download + warmup on first run
+
+  # ── PostgreSQL 16 ───────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: safeaging-postgres
+    restart: unless-stopped
+    # QCS6490 / embedded kernels may lack SysV shm in container IPC namespace
+    ipc: host
+    shm_size: 256mb
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-safeaging}
+      POSTGRES_USER:     ${POSTGRES_USER:-safeaging}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-safeaging_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - safeaging-postgres-data:/var/lib/postgresql/data
+    networks:
+      - safeaging-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── MinIO (S3-compatible object storage) ────────────────────────────────────
+  minio:
+    image: quay.io/minio/minio:latest
+    container_name: safeaging-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-safeaging}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-safeaging_minio_password}
+    ports:
+      - "${MINIO_API_PORT:-19000}:9000"
+      - "${MINIO_CONSOLE_PORT:-19001}:9001"
+    volumes:
+      - safeaging-minio-data:/data
+    networks:
+      - safeaging-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── MinIO bucket init (runs once) ──────────────────────────────────────────
+  minio-init:
+    image: quay.io/minio/mc:latest
+    container_name: safeaging-minio-init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"
+        mc mb --ignore-existing "local/$$MINIO_BUCKET_SNAPSHOTS"
+        mc mb --ignore-existing "local/safeaging-crops"
+        echo "MinIO buckets ready."
+    environment:
+      MINIO_ROOT_USER:        ${MINIO_ROOT_USER:-safeaging}
+      MINIO_ROOT_PASSWORD:    ${MINIO_ROOT_PASSWORD:-safeaging_minio_password}
+      MINIO_BUCKET_SNAPSHOTS: ${MINIO_BUCKET_SNAPSHOTS:-safeaging-snapshots}
+    networks:
+      - safeaging-net
+
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: safeaging-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "${PROMETHEUS_PORT:-19090}:9090"
+    volumes:
+      - ./infra/dev/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - safeaging-prometheus-data:/prometheus
+    networks:
+      - safeaging-net
+    depends_on:
+      - analytics
+
+  # ── Grafana ─────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: safeaging-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/safeaging.json
+    ports:
+      - "${GRAFANA_PORT:-13000}:3000"
+    volumes:
+      - safeaging-grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+      - ./infra/grafana/dashboards:/etc/grafana/dashboards
+    networks:
+      - safeaging-net
+    depends_on:
+      - prometheus

@@ -1,0 +1,7 @@
+{
+    "plugin_version": "@PROJECT_VERSION@",
+    "sdk_version": "@metadataSdkVersion@",
+    "build_type": "@CMAKE_BUILD_TYPE@",
+    "build_timestamp": "@_BUILD_TIMESTAMP@",
+    "system_processor": "@CMAKE_SYSTEM_PROCESSOR@"
+}

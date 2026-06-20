@@ -17,6 +17,7 @@
 #endif
 
 #include "json.hpp"
+#include <atomic>
 #include <unordered_map>
 #include <mutex>
 #include <chrono>
@@ -27,6 +28,8 @@
 #include <thread>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 
 namespace sample_company {
     namespace vms_server_plugins {
@@ -138,27 +141,48 @@ namespace sample_company {
                     return nx::sdk::Uuid(bytes);
                 }
 
-                std::filesystem::path frameDumpRootDir()
+                std::filesystem::path frameDumpRootDir(
+                    const std::filesystem::path& pluginHomeDir,
+                    const std::string& relativeDir)
                 {
-                    static std::filesystem::path root =
-                        std::filesystem::path(R"(D:\Part-time\SafeAgingV4\SafeAging\debug_frames)");
-                    static bool initialized = false;
-                    static std::mutex initMutex;
+                    if (relativeDir.empty())
+                        return pluginHomeDir / DebugDumpConfig::kDefaultDumpDir;
+                    return pluginHomeDir / relativeDir;
+                }
 
-                    std::lock_guard<std::mutex> lk(initMutex);
-                    if (!initialized)
+                struct FrameDumpContext
+                {
+                    std::filesystem::path rootDir;
+                    bool inputDirsCreated = false;
+                    bool outputDirsCreated = false;
+                    std::mutex mutex;
+
+                    void ensureInputDirCreated()
                     {
+                        if (inputDirsCreated)
+                            return;
+                        std::lock_guard<std::mutex> lk(mutex);
+                        if (inputDirsCreated)
+                            return;
                         std::error_code ec;
-                        std::filesystem::create_directories(root / "input", ec);
-                        std::filesystem::create_directories(root / "output", ec);
-                        logutil::log(
-                            logutil::Level::info,
-                            "Frame dump root: " + root.string());
-                        initialized = true;
+                        std::filesystem::create_directories(rootDir / "input", ec);
+                        if (!ec)
+                            inputDirsCreated = true;
                     }
 
-                    return root;
-                }
+                    void ensureOutputDirCreated()
+                    {
+                        if (outputDirsCreated)
+                            return;
+                        std::lock_guard<std::mutex> lk(mutex);
+                        if (outputDirsCreated)
+                            return;
+                        std::error_code ec;
+                        std::filesystem::create_directories(rootDir / "output", ec);
+                        if (!ec)
+                            outputDirsCreated = true;
+                    }
+                };
 
                 uint64_t nextFrameDumpSeq()
                 {
@@ -170,6 +194,7 @@ namespace sample_company {
                 }
 
                 std::filesystem::path frameDumpPath(
+                    const std::filesystem::path& rootDir,
                     const std::string& cameraId,
                     const char* type,
                     uint64_t seq)
@@ -182,10 +207,11 @@ namespace sample_company {
                     fileName += std::to_string(slot);
                     fileName += ".jpg";
 
-                    return frameDumpRootDir() / type / fileName;
+                    return rootDir / type / fileName;
                 }
 
                 void dumpInputFrame(
+                    FrameDumpContext& ctx,
                     const std::string& cameraId,
                     uint64_t seq,
                     const cv::Mat& frameBgr)
@@ -193,9 +219,11 @@ namespace sample_company {
                     if (frameBgr.empty())
                         return;
 
+                    ctx.ensureInputDirCreated();
+
                     try
                     {
-                        cv::imwrite(frameDumpPath(cameraId, "input", seq).string(), frameBgr);
+                        cv::imwrite(frameDumpPath(ctx.rootDir, cameraId, "input", seq).string(), frameBgr);
                     }
                     catch (const std::exception& e)
                     {
@@ -208,6 +236,7 @@ namespace sample_company {
                 }
 
                 void dumpOutputFrame(
+                    FrameDumpContext& ctx,
                     const std::string& cameraId,
                     uint64_t seq,
                     const cv::Mat& frameBgr,
@@ -215,6 +244,8 @@ namespace sample_company {
                 {
                     if (frameBgr.empty())
                         return;
+
+                    ctx.ensureOutputDirCreated();
 
                     try
                     {
@@ -246,7 +277,7 @@ namespace sample_company {
                                 cv::LINE_AA);
                         }
 
-                        cv::imwrite(frameDumpPath(cameraId, "output", seq).string(), rendered);
+                        cv::imwrite(frameDumpPath(ctx.rootDir, cameraId, "output", seq).string(), rendered);
                     }
                     catch (const std::exception& e)
                     {
@@ -362,7 +393,6 @@ namespace sample_company {
                 constexpr int kCircuitFailureThreshold = 5;
                 constexpr std::chrono::seconds kCircuitOpenCooldown{15};
                 constexpr size_t kCircuitMapMaxSize = 256;
-                constexpr std::array<int, 2> kTransientRetryBackoffMs{{150, 400}};
 
                 std::mutex g_circuitMutex;
                 std::unordered_map<std::string, CircuitBreakerEntry> g_circuitByCamera;
@@ -376,6 +406,73 @@ namespace sample_company {
                 bool isTransientHttpStatus(int status)
                 {
                     return status == 408 || status == 429 || (status >= 500 && status <= 599);
+                }
+
+                std::string serviceEndpoint(const AiServiceClientConfig& config)
+                {
+                    return std::string(config.useHttps ? "https://" : "http://") +
+                        config.host + ":" + std::to_string(config.port);
+                }
+
+                std::string responseBodySnippet(const httplib::Response& response)
+                {
+                    if (response.body.empty())
+                        return {};
+
+                    constexpr size_t kMaxBodyChars = 160;
+                    std::string body = response.body.substr(0, kMaxBodyChars);
+                    if (response.body.size() > kMaxBodyChars)
+                        body += "...";
+                    return ", body=\"" + body + "\"";
+                }
+
+                std::string transportErrorDetails(
+                    const httplib::Result& result,
+                    const AiServiceClientConfig& config)
+                {
+                    std::string details =
+                        "transport error=" + httplib::to_string(result.error()) +
+                        ", target=" + serviceEndpoint(config);
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+                    if (config.useHttps)
+                    {
+                        if (result.ssl_error() != 0)
+                            details += ", ssl_error=" + std::to_string(result.ssl_error());
+                        if (result.ssl_openssl_error() != 0)
+                        {
+                            details +=
+                                ", openssl_error=" + std::to_string(result.ssl_openssl_error());
+                        }
+                    }
+#endif
+
+                    return details;
+                }
+
+                template<typename ClientT>
+                void configureServiceClient(
+                    ClientT& client,
+                    const AiServiceClientConfig& config)
+                {
+                    // The plugin may call a local or remote analytics service; auth uses X-API-Key.
+                    client.set_keep_alive(true);
+                    client.set_connection_timeout(
+                        std::chrono::milliseconds(config.connectTimeoutMs));
+                    client.set_read_timeout(std::chrono::milliseconds(config.readTimeoutMs));
+                    client.set_write_timeout(std::chrono::milliseconds(config.writeTimeoutMs));
+                }
+
+                template<typename ClientT>
+                httplib::Result postInferRequest(
+                    ClientT& client,
+                    const httplib::Headers& headers,
+                    const std::string& jsonBody)
+                {
+                    if (headers.empty())
+                        return client.Post("/infer", jsonBody, "application/json");
+
+                    return client.Post("/infer", headers, jsonBody, "application/json");
                 }
 
                 void cleanupCircuitStateIfNeeded(const std::chrono::steady_clock::time_point now)
@@ -519,7 +616,15 @@ namespace sample_company {
             //-------------------------------------------------------------------------------------------------
             // ObjectDetector implementation
 
-            ObjectDetector::ObjectDetector() = default;
+            ObjectDetector::ObjectDetector():
+                ObjectDetector(AiServiceClientConfig{})
+            {
+            }
+
+            ObjectDetector::ObjectDetector(const AiServiceClientConfig& serviceConfig):
+                m_serviceConfig(serviceConfig)
+            {
+            }
 
             void ObjectDetector::ensureInitialized()
             {
@@ -541,6 +646,256 @@ namespace sample_company {
             void ObjectDetector::terminate()
             {
                 m_terminated = true;
+            }
+
+            void ObjectDetector::setServiceConfig(const AiServiceClientConfig& serviceConfig)
+            {
+                std::lock_guard<std::mutex> lk(m_serviceConfigMutex);
+                m_serviceConfig = serviceConfig;
+            }
+
+            AiServiceClientConfig ObjectDetector::serviceConfig() const
+            {
+                std::lock_guard<std::mutex> lk(m_serviceConfigMutex);
+                return m_serviceConfig;
+            }
+
+            void ObjectDetector::setDebugDumpConfig(const DebugDumpConfig& debugConfig)
+            {
+                std::lock_guard<std::mutex> lk(m_debugConfigMutex);
+                m_debugConfig = debugConfig;
+            }
+
+            DebugDumpConfig ObjectDetector::debugDumpConfig() const
+            {
+                std::lock_guard<std::mutex> lk(m_debugConfigMutex);
+                return m_debugConfig;
+            }
+
+            // ============================================================
+            // P P1.1 – Lightweight GET /health probe for the health poll thread.
+            // Never throws; all errors are captured in HealthCheckResult.raw_error.
+            // ============================================================
+            HealthCheckResult ObjectDetector::checkHealth() const
+            {
+                HealthCheckResult result;
+                const AiServiceClientConfig config = serviceConfig();
+
+                // Helper lambda: configure timeouts and fire GET /health.
+                // Mirrors the HTTPS/HTTP branching used in the infer path.
+                const auto doGet = [&](auto& client) -> httplib::Result
+                {
+                    client.set_connection_timeout(
+                        config.connectTimeoutMs / 1000,
+                        (config.connectTimeoutMs % 1000) * 1000000);
+                    client.set_read_timeout(5, 0); // short read timeout for health check
+                    const httplib::Headers headers = config.apiKey.empty()
+                        ? httplib::Headers{}
+                        : httplib::Headers{{"X-API-Key", config.apiKey}};
+                    return client.Get("/health", headers);
+                };
+
+                try
+                {
+                    const std::string scheme = config.useHttps ? "https" : "http";
+                    httplib::Result res{nullptr, httplib::Error::Unknown};
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+                    if (config.useHttps)
+                    {
+                        httplib::SSLClient client(config.host, config.port);
+                        configureServiceClient(client, config);
+                        res = doGet(client);
+                    }
+                    else
+#endif
+                    {
+                        httplib::Client client(config.host, config.port);
+                        res = doGet(client);
+                    }
+
+                    if (!res)
+                    {
+                        result.reachable = false;
+                        result.raw_error = "transport_error=" +
+                            httplib::to_string(res.error()) +
+                            " target=" + scheme + "://" + config.host +
+                            ":" + std::to_string(config.port);
+                        return result;
+                    }
+
+                    if (res->status != 200 && res->status != 503)
+                    {
+                        result.reachable = false;
+                        result.raw_error = "unexpected_status=" +
+                            std::to_string(res->status);
+                        return result;
+                    }
+
+                    result.reachable = true;
+
+                    const auto j = json::parse(res->body);
+                    result.status = j.value("status", "unknown");
+
+                    if (j.contains("reason_codes") && j["reason_codes"].is_array())
+                    {
+                        for (const auto& code : j["reason_codes"])
+                        {
+                            if (code.is_string())
+                                result.reason_codes.push_back(code.get<std::string>());
+                        }
+                    }
+
+                    if (j.contains("dependencies") && j["dependencies"].is_object())
+                    {
+                        for (const auto& [dep, val] : j["dependencies"].items())
+                        {
+                            if (val.is_string())
+                                result.dependencies[dep] = val.get<std::string>();
+                        }
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    result.reachable = false;
+                    result.raw_error = std::string("exception: ") + e.what();
+                }
+
+                return result;
+            }
+
+            // ============================================================
+            // P2.2 – Fetch per-camera config from GET /config/{cameraId}
+            // ============================================================
+            CameraConfigFetch ObjectDetector::fetchCameraConfig(const std::string& cameraId) const
+            {
+                CameraConfigFetch result;
+                const AiServiceClientConfig config = serviceConfig();
+
+                const std::string path = "/config/" + cameraId;
+
+                const auto doGet = [&](auto& client) -> httplib::Result
+                {
+                    client.set_connection_timeout(
+                        config.connectTimeoutMs / 1000,
+                        (config.connectTimeoutMs % 1000) * 1000000);
+                    client.set_read_timeout(5, 0);
+                    const httplib::Headers headers = config.apiKey.empty()
+                        ? httplib::Headers{}
+                        : httplib::Headers{{"X-API-Key", config.apiKey}};
+                    return client.Get(path.c_str(), headers);
+                };
+
+                try
+                {
+                    httplib::Result res{nullptr, httplib::Error::Unknown};
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+                    if (config.useHttps)
+                    {
+                        httplib::SSLClient client(config.host, config.port);
+                        configureServiceClient(client, config);
+                        res = doGet(client);
+                    }
+                    else
+#endif
+                    {
+                        httplib::Client client(config.host, config.port);
+                        res = doGet(client);
+                    }
+
+                    if (!res)
+                    {
+                        result.reachable = false;
+                        result.raw_error = "transport_error=" + httplib::to_string(res.error());
+                        return result;
+                    }
+
+                    if (res->status != 200)
+                    {
+                        result.reachable = false;
+                        result.raw_error = "status=" + std::to_string(res->status);
+                        return result;
+                    }
+
+                    result.reachable = true;
+                    result.raw_json = res->body;
+
+                    const auto j = json::parse(res->body);
+
+                    if (j.contains("confidence_threshold") && !j["confidence_threshold"].is_null())
+                        result.confidence_threshold = j["confidence_threshold"].get<float>();
+
+                    if (j.contains("iou_threshold") && !j["iou_threshold"].is_null())
+                        result.iou_threshold = j["iou_threshold"].get<float>();
+
+                    if (j.contains("frame_period") && !j["frame_period"].is_null())
+                        result.frame_period = j["frame_period"].get<int>();
+                }
+                catch (const std::exception& e)
+                {
+                    result.reachable = false;
+                    result.raw_error = std::string("exception: ") + e.what();
+                }
+
+                return result;
+            }
+
+            // ============================================================
+            // P2.3 – Register camera with service: PUT /admin/camera-configs/{cameraId}
+            // Stores the human-readable display name in the `extra` JSONB field so the
+            // service can show a friendly name in its admin API.  Best-effort; never throws.
+            // ============================================================
+            bool ObjectDetector::registerCamera(
+                const std::string& cameraId,
+                const std::string& displayName) const
+            {
+                const AiServiceClientConfig config = serviceConfig();
+                const std::string path = "/admin/camera-configs/" + cameraId;
+
+                json body;
+                body["extra"] = {{"display_name", displayName}};
+                const std::string bodyStr = body.dump();
+
+                const auto doPut = [&](auto& client) -> httplib::Result
+                {
+                    client.set_connection_timeout(
+                        config.connectTimeoutMs / 1000,
+                        (config.connectTimeoutMs % 1000) * 1000000);
+                    client.set_read_timeout(5, 0);
+                    httplib::Headers headers = {{"Content-Type", "application/json"}};
+                    if (!config.apiKey.empty())
+                        headers.emplace("X-API-Key", config.apiKey);
+                    return client.Put(path.c_str(), headers, bodyStr, "application/json");
+                };
+
+                try
+                {
+                    httplib::Result res{nullptr, httplib::Error::Unknown};
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+                    if (config.useHttps)
+                    {
+                        httplib::SSLClient client(config.host, config.port);
+                        configureServiceClient(client, config);
+                        res = doPut(client);
+                    }
+                    else
+#endif
+                    {
+                        httplib::Client client(config.host, config.port);
+                        res = doPut(client);
+                    }
+
+                    if (!res)
+                        return false;
+
+                    return res->status == 200 || res->status == 201;
+                }
+                catch (const std::exception&)
+                {
+                    return false;
+                }
             }
 
             // ============================================================
@@ -570,7 +925,7 @@ namespace sample_company {
             
             // ============================================================
             // Call the Python analytics service using the current JSON payload contract
-            // Uses short timeout for MVP (fail-fast)
+            // Timeouts and retries are configured at runtime by the plugin settings.
             // ============================================================
             DetectionList ObjectDetector::callPythonService(
                 const std::string& cameraId,
@@ -578,6 +933,9 @@ namespace sample_company {
             {
                 DetectionList result;
                 const std::string normalizedCameraId = normalizeCameraKey(cameraId);
+                const AiServiceClientConfig config = serviceConfig();
+                const DebugDumpConfig debugConfig = debugDumpConfig();
+                const std::string serviceTarget = serviceEndpoint(config);
 
                 try
                 {
@@ -617,102 +975,151 @@ namespace sample_company {
 
                     const int frameW = decodedJpeg.cols;
                     const int frameH = decodedJpeg.rows;
-                    const uint64_t dumpSeq = nextFrameDumpSeq();
-                    dumpInputFrame(normalizedCameraId, dumpSeq, decodedJpeg);
+
+                    // Handle debug frame dumping - only if debug is enabled
+                    uint64_t dumpSeq = 0;
+                    std::unique_ptr<FrameDumpContext> dumpCtx;
+                    if (debugConfig.enabled && (debugConfig.dumpInput || debugConfig.dumpOutput))
+                    {
+                        dumpSeq = nextFrameDumpSeq();
+                        // Apply frame sampling: only dump if (dumpSeq - 1) % everyNFrames == 0
+                        if ((dumpSeq - 1) % std::max(1, debugConfig.everyNFrames) == 0)
+                        {
+                            dumpCtx = std::make_unique<FrameDumpContext>();
+                            dumpCtx->rootDir = debugConfig.rootDir;
+                            if (debugConfig.dumpInput)
+                            {
+                                dumpInputFrame(*dumpCtx, normalizedCameraId, dumpSeq, decodedJpeg);
+                            }
+                        }
+                    }
 
                     json req;
                     req["camera_id"] = normalizedCameraId;
                     req["image"] = b64;
                     const std::string jsonBody = req.dump();
 
-                    thread_local httplib::Client cli("127.0.0.1", 18000);
-                    cli.set_keep_alive(true);
-                    
-                    // Longer timeouts for high-res GPU inference (avoid client cancel -> 500)
-                    cli.set_connection_timeout(2, 0);  // 2s
-                    cli.set_read_timeout(15, 0);       // 15s
-                    cli.set_write_timeout(2, 0);       // 2s
-                    
-                    static int s_reqCount = 0;
-                    if ((++s_reqCount % 120) == 0)
-                    {
-                        logutil::log(
-                            logutil::Level::info,
-                            "FLOW2 infer requests processed=" + std::to_string(s_reqCount));
-                    }
-                    
+                    const httplib::Headers authHeaders = config.apiKey.empty()
+                        ? httplib::Headers{}
+                        : httplib::Headers{{"X-API-Key", config.apiKey}};
+
                     std::string responseBody;
                     bool requestSucceeded = false;
                     std::string lastTransientError;
-                    constexpr int kMaxAttempts = static_cast<int>(kTransientRetryBackoffMs.size()) + 1;
-                    for (int attempt = 1; attempt <= kMaxAttempts; ++attempt)
+                    const int maxAttempts = std::max(1, config.retryCount + 1);
+                    static std::atomic<int> s_reqCount{0};
+                    const int requestCount = ++s_reqCount;
+                    if ((requestCount % 120) == 0)
                     {
-                        auto res = cli.Post("/infer", jsonBody, "application/json");
-                        if (res && res->status == 200)
+                        logutil::log(
+                            logutil::Level::info,
+                            "FLOW2 infer requests processed=" + std::to_string(requestCount));
+                    }
+
+                    auto executeRequest = [&](auto& client)
+                    {
+                        if (!client.is_valid())
                         {
-                            responseBody = res->body;
-                            requestSucceeded = true;
-                            const bool recovered = circuitBreakerOnSuccess(normalizedCameraId);
-                            if (recovered)
+                            throw ObjectDetectionError(
+                                "Failed to create HTTP client for " + serviceTarget);
+                        }
+
+                        configureServiceClient(client, config);
+
+                        for (int attempt = 1; attempt <= maxAttempts; ++attempt)
+                        {
+                            auto res = postInferRequest(client, authHeaders, jsonBody);
+                            if (res && res->status == 200)
                             {
-                                logutil::log(
-                                    logutil::Level::info,
-                                    "Circuit breaker CLOSED (recovered) for camera \"" +
-                                        normalizedCameraId + "\"");
+                                responseBody = res->body;
+                                requestSucceeded = true;
+                                const bool recovered = circuitBreakerOnSuccess(normalizedCameraId);
+                                if (recovered)
+                                {
+                                    logutil::log(
+                                        logutil::Level::info,
+                                        "Circuit breaker CLOSED (recovered) for camera \"" +
+                                            normalizedCameraId + "\" target=" + serviceTarget);
+                                }
+                                break;
                             }
-                            break;
-                        }
 
-                        bool transient = false;
-                        std::string err;
-                        if (!res)
-                        {
-                            transient = true;
-                            err = "no response from /infer endpoint";
-                        }
-                        else if (isTransientHttpStatus(res->status))
-                        {
-                            transient = true;
-                            err = "transient HTTP status=" + std::to_string(res->status);
-                        }
-                        else
-                        {
-                            circuitBreakerOnTransientFailure(normalizedCameraId);
-                            throw ObjectDetectionError("HTTP error " + std::to_string(res->status));
-                        }
+                            std::string err;
+                            if (!res)
+                            {
+                                err = transportErrorDetails(res, config);
+                            }
+                            else if (isTransientHttpStatus(res->status))
+                            {
+                                err = "transient service response target=" + serviceTarget +
+                                    " status=" + std::to_string(res->status) +
+                                    responseBodySnippet(*res);
+                            }
+                            else
+                            {
+                                circuitBreakerOnTransientFailure(normalizedCameraId);
+                                throw ObjectDetectionError(
+                                    "Service response error target=" + serviceTarget +
+                                    " status=" + std::to_string(res->status) +
+                                    responseBodySnippet(*res));
+                            }
 
-                        lastTransientError = err;
-                        if (attempt < kMaxAttempts)
-                        {
-                            logutil::logThrottled(
-                                logutil::Level::warn,
-                                "object_detector.flow2.retry." + normalizedCameraId,
-                                std::chrono::seconds(10),
-                                "Transient infer error for camera \"" + normalizedCameraId +
-                                    "\" attempt " + std::to_string(attempt) + "/" +
-                                    std::to_string(kMaxAttempts) + ": " + err);
+                            lastTransientError = err;
+                            if (attempt < maxAttempts)
+                            {
+                                logutil::logThrottled(
+                                    logutil::Level::warn,
+                                    "object_detector.flow2.retry." + normalizedCameraId,
+                                    std::chrono::seconds(10),
+                                    "Transient infer error for camera \"" + normalizedCameraId +
+                                        "\" attempt " + std::to_string(attempt) + "/" +
+                                        std::to_string(maxAttempts) + ": " + err);
 
-                            const int backoffMs = kTransientRetryBackoffMs[attempt - 1];
-                            std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
-                            continue;
-                        }
+                                if (config.retryBackoffMs > 0)
+                                {
+                                    std::this_thread::sleep_for(
+                                        std::chrono::milliseconds(config.retryBackoffMs));
+                                }
+                                continue;
+                            }
 
-                        const bool opened = circuitBreakerOnTransientFailure(normalizedCameraId);
-                        if (opened)
-                        {
-                            logutil::logThrottled(
-                                logutil::Level::warn,
-                                "object_detector.flow2.circuit_open.transition." + normalizedCameraId,
-                                std::chrono::seconds(10),
-                                "Circuit breaker OPEN for camera \"" + normalizedCameraId +
-                                    "\" after repeated transient infer failures");
+                            const bool opened = circuitBreakerOnTransientFailure(normalizedCameraId);
+                            if (opened)
+                            {
+                                logutil::logThrottled(
+                                    logutil::Level::warn,
+                                    "object_detector.flow2.circuit_open.transition." +
+                                        normalizedCameraId,
+                                    std::chrono::seconds(10),
+                                    "Circuit breaker OPEN for camera \"" + normalizedCameraId +
+                                        "\" after repeated transient infer failures target=" +
+                                        serviceTarget);
+                            }
                         }
+                    };
+
+                    if (config.useHttps)
+                    {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+                        httplib::SSLClient client(config.host, config.port);
+                        executeRequest(client);
+#else
+                        throw ObjectDetectionError(
+                            "HTTPS transport requested for " + serviceTarget +
+                            " but the plugin was built without SSL client support");
+#endif
+                    }
+                    else
+                    {
+                        httplib::Client client(config.host, config.port);
+                        executeRequest(client);
                     }
 
                     if (!requestSucceeded)
                     {
                         throw ObjectDetectionError(
-                            "Transient infer failure after retries: " + lastTransientError);
+                            "Transient infer failure after retries for " + serviceTarget +
+                            ": " + lastTransientError);
                     }
 
                     json j;
@@ -722,11 +1129,16 @@ namespace sample_company {
                     }
                     catch (const std::exception& e)
                     {
-                        throw ObjectDetectionError(std::string("Failed to parse JSON response: ") + e.what());
+                        throw ObjectDetectionError(
+                            std::string("Failed to parse JSON response from ") +
+                            serviceTarget + ": " + e.what());
                     }
 
                     if (!j.is_array())
-                        throw ObjectDetectionError("Response is not a JSON array");
+                    {
+                        throw ObjectDetectionError(
+                            "Response from " + serviceTarget + " is not a JSON array");
+                    }
 
                     std::vector<DebugBbox> debugBoxes;
                     for (const auto& item : j)
@@ -741,10 +1153,41 @@ namespace sample_company {
                             const float w = item.value("w", 0.0f);
                             const float h = item.value("h", 0.0f);
 
-                            const int trackId = item.value("track_id", 0);
-                            const bool fallDetected = item.value("fall_detected", false);
-                            const bool stable = item.value("stable", true);
-                            const bool degraded = item.value("degraded", false);
+        const int trackId = item.value("track_id", 0);
+        const bool fallDetected = item.value("fall_detected", false);
+        const bool stable = item.value("stable", true);
+        const bool degraded = item.value("degraded", false);
+        // Optional fields may be serialised as JSON null (Pydantic Optional[...] = None),
+        // so guard against null/wrong-type which would otherwise throw in nlohmann::value().
+        const auto jsonStr = [&item](const char* key) -> std::string {
+            auto it = item.find(key);
+            if (it != item.end() && it->is_string())
+                return it->get<std::string>();
+            return std::string{};
+        };
+        const auto jsonBool = [&item](const char* key, bool def) -> bool {
+            auto it = item.find(key);
+            if (it != item.end() && it->is_boolean())
+                return it->get<bool>();
+            return def;
+        };
+        const auto jsonInt = [&item](const char* key, int def) -> int {
+            auto it = item.find(key);
+            if (it != item.end() && it->is_number_integer())
+                return it->get<int>();
+            return def;
+        };
+
+        // P2.1 — zone violation fields (optional; default to no violation)
+        const bool zoneViolation = jsonBool("zone_violation", false);
+        const std::string zoneType = jsonStr("zone_type");
+        const std::string zoneId   = jsonStr("zone_id");
+        // Face recognition identity fields (optional)
+        const bool recognized = jsonBool("recognized", false);
+        const std::string personName = jsonStr("person_name");
+        const std::string personGender = jsonStr("person_gender");
+        const std::string personId = jsonStr("person_id");
+        const int personNo = jsonInt("person_no", -1);
 
                             if (w <= 0.0f || h <= 0.0f)
                                 continue;
@@ -773,17 +1216,25 @@ namespace sample_company {
                                     score});
                             }
 
-                            auto detection = std::make_shared<Detection>(Detection{
-                                nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
-                                classLabel,
-                                score,
-                                trackId > 0
-                                    ? uuidFromTrackId(normalizedCameraId, trackId)
-                                    : nx::sdk::Uuid{},
-                                fallDetected,
-                                stable,
-                                degraded
-                            });
+        auto detection = std::make_shared<Detection>(Detection{
+            nx::sdk::analytics::Rect(xNorm, yNorm, wNorm, hNorm),
+            classLabel,
+            score,
+            trackId > 0
+                ? uuidFromTrackId(normalizedCameraId, trackId)
+                : nx::sdk::Uuid{},
+            fallDetected,
+            stable,
+            degraded,
+            zoneViolation,  // P2.1
+            zoneType,       // P2.1
+            zoneId,         // P2.1
+            recognized,     // face recognition
+            personName,
+            personGender,
+            personId,
+            personNo,
+        });
 
                             result.push_back(detection);
                         }
@@ -803,6 +1254,12 @@ namespace sample_company {
                         "object_detector.flow2.detections",
                         std::chrono::seconds(10),
                         "FLOW2 detections=" + std::to_string(result.size()));
+                    
+                    // Dump output frame if debug is enabled
+                    if (dumpCtx && debugConfig.dumpOutput)
+                    {
+                        dumpOutputFrame(*dumpCtx, normalizedCameraId, dumpSeq, decodedJpeg, debugBoxes);
+                    }
                     
                     return result;
                 }

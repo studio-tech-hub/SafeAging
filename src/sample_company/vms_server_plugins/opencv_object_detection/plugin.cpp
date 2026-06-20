@@ -35,11 +35,11 @@ std::string Plugin::manifestString() const
 {
     return /*suppress newline*/ 1 + R"json(
 {
-    "id": "mycompany.yolov8_people_analytics",
-    "name": "YOLOv8 People Analytics",
+    "id": "mycompany.yolo26_people_analytics",
+    "name": "YOLO26 People Analytics",
     "description": "Analytics plugin that forwards frames to the local Python people analytics service.",
     "version": "1.0.0",
-    "vendor": "HumanCounterV8"
+    "vendor": "SafeAging"
 }
 )json";
 }

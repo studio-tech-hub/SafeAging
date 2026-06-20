@@ -23,7 +23,7 @@ torch.load = _patched_torch_load
 from ultralytics import YOLO
 
 print("=" * 60)
-print("YOLOv8 Model Diagnostic Test")
+print("YOLO26 Model Diagnostic Test")
 print("=" * 60)
 
 # Test 1: Check available frame samples
@@ -40,9 +40,9 @@ print(f"  Latest: {samples[-1]}")
 # Test 2: Load model
 print("\n[2] Loading YOLO model...")
 try:
-    model = YOLO("yolov8n.pt")
+    model = YOLO("yolo26n.pt")
     model.to('cpu')
-    print(f"✓ Model loaded: yolov8n.pt")
+    print(f"✓ Model loaded: yolo26n.pt")
     print(f"  Type: {type(model)}")
 except Exception as e:
     print(f"❌ Failed to load model: {e}")
@@ -94,7 +94,7 @@ for conf in thresholds:
 
 # Test 5: Check model info
 print("\n[5] Model Information:")
-print(f"  Model: yolov8n.pt")
+print(f"  Model: yolo26n.pt")
 print(f"  Input size: 640x640 (auto-scales)")
 print(f"  Classes: Person (class 0)")
 
@@ -118,12 +118,12 @@ print(f"Result: {num_final} persons detected")
 if num_final == 0:
     print("\n⚠️  ISSUE DETECTED: Model not detecting people at all!")
     print("    Possible causes:")
-    print("    1. yolov8n (nano) model too weak for your camera")
+    print("    1. yolo26n (nano) model too weak for your camera")
     print("    2. Input format incorrect (BGR vs RGB)")
     print("    3. Camera resolution too high/low")
     print("\n    RECOMMENDATIONS:")
-    print("    - Try yolov8s.pt (small) instead of yolov8n.pt")
-    print("    - Run: python -m ultralytics.yolo detect predict model=yolov8s.pt source=frame_samples/frame_000001.jpg")
+    print("    - Try yolo26s.pt (small) instead of yolo26n.pt")
+    print("    - Run: yolo predict model=yolo26s.pt source=frame_samples/frame_000001.jpg")
 else:
     print(f"\n✓ Model IS detecting people correctly at conf=0.25")
     print(f"  Recommendation: Use CONFIDENCE_THRESHOLD=0.25 in production")
@@ -132,6 +132,6 @@ print("\n" + "=" * 60)
 print("To improve detection:")
 print("=" * 60)
 print("1. Copy frames from frame_samples/ to debug visually")
-print("2. If no detections: Try yolov8s.pt (larger model)")
+print("2. If no detections: Try yolo26s.pt (larger model)")
 print("3. If still bad: Check camera angle/resolution is correct")
 print("=" * 60)

@@ -40,7 +40,7 @@ Quick reference diagrams and decision trees for the elderly care management syst
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  FastAPI Service (service.py)                                               │
 │  ├─ POST /detect                                                             │
-│  │  └─ Run YOLOv8 inference on frame                                        │
+│  │  └─ Run YOLO26 inference on frame                                        │
 │  │     └─ Detect people in frame                                            │
 │  │     └─ Return bounding boxes + confidence                                │
 │  │                                                                           │
@@ -68,7 +68,7 @@ Quick reference diagrams and decision trees for the elderly care management syst
 │     └─ Performance metrics for monitoring                                    │
 │                                                                             │
 │  Components:                                                                 │
-│  ├─ YOLOv8 Model (inference engine)                                         │
+│  ├─ YOLO26 Model (inference engine)                                         │
 │  ├─ Fall Detector (algorithm)                                               │
 │  ├─ Zone Validator (geometry)                                               │
 │  ├─ Face Recognition (Azure integration)                                    │
@@ -127,7 +127,7 @@ NX VMS
   │ HTTP POST /detect
   │
   ▼
-[Service] YOLOv8 Inference
+[Service] YOLO26 Inference
   │
   ├─→ Detect people (bounding boxes)
   ├─→ Filter low confidence detections
@@ -282,7 +282,7 @@ Plugin needs to process a frame:
     │
     └─ YES: Send to Service
         │
-        ├─→ [Service] Run YOLOv8
+        ├─→ [Service] Run YOLO26
         │
         ├─→ Get detections back
         │   │
@@ -406,7 +406,7 @@ Service Inference Timeline (Target: < 50ms):
     │
 2ms ├─ Preprocessing (resize, normalize)
     │
-35ms├─ YOLOv8 Inference
+35ms├─ YOLO26 Inference
     │
 42ms├─ NMS & post-processing
     │

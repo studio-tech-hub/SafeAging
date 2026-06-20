@@ -1,8 +1,8 @@
-# 🏗️ Hệ Thống Quản Lý Con Người - Architecture & Roadmap
+# 🏗️ SafeAging - Architecture & Roadmap
 
-**Date:** January 18, 2026  
-**Status:** Architecture Planning  
-**Project:** Elderly Care Management System (YOLOv8 People Analytics)
+**Date:** May 10, 2026  
+**Status:** Updated Architecture Baseline  
+**Scope:** Windows-first development, production deployment later on AI Box as edge inference node
 
 ---
 
@@ -11,1314 +11,854 @@
 1. [Project Overview](#project-overview)
 2. [Current State Analysis](#current-state-analysis)
 3. [System Architecture](#system-architecture)
-4. [Team Division & Responsibilities](#team-division--responsibilities)
+4. [Ownership & Responsibilities](#ownership--responsibilities)
 5. [Communication Pipeline](#communication-pipeline)
 6. [Data Storage & API Strategy](#data-storage--api-strategy)
 7. [Implementation Roadmap](#implementation-roadmap)
 8. [Development Workflow](#development-workflow)
+9. [Success Metrics](#success-metrics)
+10. [Conclusion](#conclusion)
 
 ---
 
 ## 🎯 Project Overview
 
 ### Requirements
-- **Person Recognition:** Detect and identify individuals via face recognition
-- **People Counting:** Real-time count of people in frame
-- **Face-Based Profile Storage:** Name, age, gender, and personal information
-- **Danger Zones & Forbidden Areas:** Alert notifications when entering restricted zones
-- **Fall Detection:** Immediate email notification on fall events
 
-### System Scope
-- **Video Source:** Network cameras (NX VMS integration)
-- **Processing:** YOLOv8 model-based detection + tracking
-- **Analysis:** Real-time events (counting, fall detection, zone violation)
-- **Notification:** Email alerts for critical events
-- **Data Persistence:** Face embeddings, person profiles, event logs
+- Real-time person detection and tracking from NX-integrated cameras
+- Person-related metadata management
+- Zone / forbidden area monitoring
+- Fall detection and alerting
+- Event persistence for later investigation
+- Snapshot / crop storage for review and recognition workflows
+- Resilience when central infrastructure is temporarily unreachable
+
+### Production scope
+
+The system will run in the following logical shape:
+
+```text
+Camera
+→ Nx Server + Nx Plugin
+→ AI Service (edge, AI Box)
+→ PostgreSQL (central metadata DB)
+→ MinIO / S3-compatible object storage
+
+Nx Archive / NAS
+→ video archive / playback / timeline
+```
+
+### Core architecture principles
+
+1. Nx owns video
+2. PostgreSQL owns metadata
+3. Object storage owns images
+4. Plugin never accesses DB
+5. AI keeps running if DB is down
+6. Events retry asynchronously
+7. Local cache is mandatory
+8. Health states are standardized
 
 ---
 
 ## 📊 Current State Analysis
 
-### ✅ What We Have
-```
-Plugin (C++)
-├── YOLOv8 Integration ✓
-├── Object Detection ✓
-├── Object Tracking ✓
-└── NX VMS Communication ✓
+### ✅ What the current repo already has
 
-Service (Python)
-├── FastAPI REST API ✓
-├── Model Loading ✓
-├── Frame Processing ✓
-├── HTTP Client to Plugin ✓
-└── Basic Inference ✓
+**Plugin (C++)**
+- NX plugin integration
+- Frame capture and preprocessing
+- HTTP client to Python service
+- Queueing and backpressure logic
+- Circuit breaker and retry logic
+- Metadata/event generation to NX
 
-Infrastructure
-├── CMake Build System ✓
-├── Requirements Management ✓
-├── Startup Scripts ✓
-└── Configuration via ENV ✓
-```
+**Service (Python / FastAPI)**
+- `GET /health`
+- `POST /infer`
+- `GET /status`
+- in-memory tracking state
+- fall detection
+- ROI / undistort preprocessing
+- model warmup and readiness state
 
-### ❌ What's Missing
-```
-Core Features
-├── Face Recognition & Embedding
-├── Person Re-identification (ReID)
-├── Fall Detection Model/Algorithm
-├── Zone Management System
-├── Multi-camera Coordination
-└── Alert/Email Service
+**Build / tooling**
+- CMake-based plugin build
+- PowerShell build helper on Windows
+- service startup entrypoint
+- manual test scripts
 
-Data Layer
-├── Database Design
-├── Face Feature Store
-├── Event Log Management
-├── Person Profile Management
-└── Zone Configuration Storage
+### ❌ What is still missing for production
 
-Integration
-├── Third-party Face API (Microsoft, AWS, etc.)
-├── Email Service Integration
-├── Data Export/Analytics APIs
-└── Frontend Dashboard
+**Persistence**
+- PostgreSQL-backed metadata store
+- migration strategy
+- central config storage
 
-DevOps
-├── Docker Containerization
-├── Health Monitoring
-├── Error Recovery
-└── Multi-instance Coordination
-```
+**Edge resilience**
+- durable local outbox
+- durable config cache
+- replay after DB recovery
+
+**Business APIs**
+- persons API
+- zones API
+- events API
+- reset/admin API with production semantics
+
+**Observability**
+- Prometheus metrics endpoint
+- structured JSON logs
+- alert thresholds for backlog and stale config
+
+**Testing**
+- automated unit tests
+- automated integration tests
+- load tests for multi-camera scenarios
+
+**Packaging / release hygiene**
+- normalized manifest / versioning
+- cleaned legacy naming
+- release artifacts suitable for deployment handoff
 
 ---
 
 ## 🏛️ System Architecture
 
-### High-Level Overview
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    NX VMS (Video Manager)                   │
-│                   (Provides Video Streams)                   │
-└───────────────────────┬─────────────────────────────────────┘
-                        │ RTSP/HTTP
-                        ▼
-┌─────────────────────────────────────────────────────────────┐
-│         PLUGIN LAYER (C++) - Process Video                  │
-├─────────────────────────────────────────────────────────────┤
-│ Device Agent (device_agent.cpp)                             │
-│ ├─ Frame Capture & Preprocessing                            │
-│ ├─ Object Detection (calls Service)                         │
-│ ├─ Object Tracking                                          │
-│ └─ Metadata Generation                                      │
-│                                                             │
-│ Object Detector (object_detector.cpp)                       │
-│ ├─ HTTP Client to Service                                   │
-│ ├─ Detection Result Parsing                                 │
-│ └─ Error Handling & Retry Logic                             │
-│                                                             │
-│ Object Tracker (object_tracker.cpp)                         │
-│ ├─ Track Management                                         │
-│ ├─ ID Association                                           │
-│ └─ Flicker Suppression                                      │
-└────────────┬────────────────────────────┬────────────────────┘
-             │ HTTP Port 18000             │ Event Output
-             │ Inference Requests          │ to NX VMS
-             ▼                             │
-┌─────────────────────────────────────────┼───────────────────┐
-│       SERVICE LAYER (Python)             │                   │
-├─────────────────────────────────────────┼───────────────────┤
-│ FastAPI Server (service.py)              │                   │
-│ ├─ GET /health - Status Check            │                   │
-│ ├─ POST /detect - Frame Inference        │                   │
-│ ├─ POST /track - Track Update            │                   │
-│ ├─ GET /metrics - Performance Stats      │                   │
-│ └─ POST /reset - Reset State             │                   │
-│                                          │                   │
-│ YOLOv8 Model                             │                   │
-│ ├─ Person Detection                      │                   │
-│ ├─ Frame Preprocessing                   │                   │
-│ ├─ Inference Engine                      │                   │
-│ └─ Post-processing & NMS                 │                   │
-│                                          │                   │
-│ Analytics Engine (NEW)                   │                   │
-│ ├─ Fall Detection Algorithm               │                   │
-│ ├─ Zone Validation                       │                   │
-│ ├─ Person Counting Logic                 │                   │
-│ └─ Event Generation                      │                   │
-└────────┬──────────────────────────────────┴───────────────────┘
-         │ REST API
-         ├──────────────────────────────────────┐
-         │                                      │
-         ▼                                      ▼
-┌──────────────────────────┐      ┌─────────────────────────┐
-│   DATA LAYER (Database)  │      │  EXTERNAL SERVICES      │
-├──────────────────────────┤      ├─────────────────────────┤
-│ PostgreSQL / MongoDB     │      │ Face Recognition API    │
-│ ├─ Person Profiles       │      │ (Azure/AWS/OpenAI)      │
-│ ├─ Face Embeddings       │      │                         │
-│ ├─ Event Logs            │      │ Email Service           │
-│ ├─ Zone Definitions      │      │ (SendGrid/AWS SES)      │
-│ └─ Tracking Data         │      │                         │
-│                          │      │ Analytics Service       │
-│                          │      │ (ELK/DataDog)           │
-└──────────────────────────┘      └─────────────────────────┘
+### High-level overview
+
+```text
+┌──────────────────────────────┐
+│ NX VMS / Nx Server           │
+│ - camera stream integration  │
+│ - video archive / playback   │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ Nx Plugin (C++)             │
+│ - frame sampling            │
+│ - queue / backpressure      │
+│ - health polling            │
+│ - metadata to NX            │
+└──────────────┬───────────────┘
+               │ REST
+               ▼
+┌──────────────────────────────────────────┐
+│ AI Service (Python / FastAPI)           │
+│ - inference                             │
+│ - tracking / fall / zone logic          │
+│ - local SQLite outbox + config cache    │
+│ - background sync workers               │
+│ - metrics / health / status             │
+└───────┬─────────────────────┬───────────┘
+        │                     │
+        ▼                     ▼
+┌──────────────────┐   ┌────────────────────┐
+│ PostgreSQL 16+   │   │ MinIO / S3 storage │
+│ central metadata │   │ snapshots / crops  │
+└──────────────────┘   └────────────────────┘
 ```
 
-### Component Breakdown
+### Execution environments
 
-#### Plugin Layer (C++)
-```
-Responsibilities:
-- Capture frames from NX VMS
-- Call Service API for inference
-- Manage object tracking
-- Generate NX metadata events
-- Handle plugin lifecycle
+#### Development environment
 
-Interfaces:
-- ← NX VMS Frame Stream
-- → Service HTTP (Port 18000)
-- → NX VMS Event Metadata
-```
+- Primary development machine: **Windows laptop**
+- Goal:
+  - run service locally
+  - run plugin build locally
+  - simulate central infra via Docker
 
-#### Service Layer (Python)
-```
-Responsibilities:
-- Load & run YOLOv8 model
-- Process frames (preprocessing, inference)
-- Run analytics algorithms
-- Coordinate with databases
-- Manage service health
+#### Production environment
 
-Interfaces:
-- ← Plugin HTTP Requests (Port 18000)
-- ← Database Connections
-- → External APIs (Face, Email, Analytics)
-```
+- AI Box runs:
+  - AI Service
+  - optional Nx plugin runtime side if needed in deployment topology
+- Central server / NAS runs:
+  - PostgreSQL
+  - MinIO
+  - Prometheus / Grafana
+  - Nx archive if deployed centrally
 
-#### Data Layer
-```
-Responsibilities:
-- Persist person profiles
-- Store face embeddings
-- Log all events
-- Manage zone definitions
-- Track person history
+### Why edge inference + central metadata
 
-Interfaces:
-- ← Service writes
-- → Service reads
-```
+This split is chosen because it:
+
+- reduces central GPU dependency
+- keeps inference close to the camera processing path
+- allows central backup and reporting for metadata
+- avoids storing business-critical state only on the edge
+- scales better across multiple AI boxes later
 
 ---
 
-## 👥 Team Division & Responsibilities
+## 👤 Ownership & Responsibilities
 
-### Team Structure
-```
-┌─────────────────────────────────────────┐
-│    Project Manager / Architect (You)    │
-│  - System Design                        │
-│  - Integration Coordination              │
-│  - Deployment & DevOps                   │
-└──────────┬──────────────────────┬────────┘
-           │                      │
-           ▼                      ▼
-    ┌─────────────┐        ┌──────────────┐
-    │  TEAM A     │        │   TEAM B     │
-    │  Service    │        │   Plugin     │
-    │  Engineer   │        │   Engineer   │
-    └─────────────┘        └──────────────┘
-```
+This project is now planned for **one engineer**, not two separate teams.
 
-### TEAM A: Service Engineer
-**Focus:** Backend Logic, Data Processing, External Integrations
+### Single-owner responsibilities
 
-#### Phase 1: Foundation (Week 1-2)
-- [ ] Extend `service.py` with analytics engine
-  - [ ] Fall detection algorithm
-  - [ ] Person counting logic
-  - [ ] Zone validation checks
-  - [ ] Event generation system
-- [ ] Design & implement database schema
-  - [ ] Person profiles table
-  - [ ] Face embeddings table
-  - [ ] Event logs table
-  - [ ] Zone definitions table
-- [ ] Create database abstraction layer
-  - [ ] Connection pooling
-  - [ ] CRUD operations
-  - [ ] Transaction handling
-- [ ] Add new service endpoints
-  - [ ] POST /analytics/fall-detection
-  - [ ] POST /analytics/zone-check
-  - [ ] GET /person/{id}
-  - [ ] POST /person (create/update)
-  - [ ] GET /events
+The same owner is responsible for:
 
-#### Phase 2: Integration (Week 3-4)
-- [ ] Face recognition service integration
-  - [ ] Azure Face API client
-  - [ ] Embedding extraction
-  - [ ] Face matching algorithm
-  - [ ] Person re-identification
-- [ ] Email notification service
-  - [ ] SendGrid/AWS SES integration
-  - [ ] Template system
-  - [ ] Delivery tracking
-- [ ] Analytics & monitoring
-  - [ ] Event aggregation
-  - [ ] Performance metrics
-  - [ ] Error tracking
-- [ ] Testing & validation
-  - [ ] Unit tests for analytics
-  - [ ] Integration tests with DB
-  - [ ] Load testing
-  - [ ] Error scenario testing
+- plugin reliability
+- service backend
+- schema design
+- observability
+- testing
+- release packaging
+- deployment readiness
 
-#### Phase 3: Optimization (Week 5+)
-- [ ] Performance tuning
-  - [ ] Query optimization
-  - [ ] Caching strategy
-  - [ ] Batch processing
-- [ ] Advanced features
-  - [ ] Multi-camera coordination
-  - [ ] Person trajectory tracking
-  - [ ] Heat map generation
-  - [ ] Behavior analysis
+### Workstreams
 
-#### Deliverables (TEAM A)
-```
-Service Files:
-├── service.py (extended)
-│   ├── Analytics Engine
-│   ├── Fall Detection
-│   ├── Zone Management
-│   └── Event System
-├── analytics/
-│   ├── fall_detector.py
-│   ├── zone_validator.py
-│   ├── person_counter.py
-│   └── event_generator.py
-├── database/
-│   ├── db_client.py
-│   ├── models.py
-│   ├── migrations/
-│   └── queries.py
-├── integrations/
-│   ├── face_recognition.py
-│   ├── email_service.py
-│   ├── analytics_service.py
-│   └── config.py
-└── tests/
-    ├── test_analytics.py
-    ├── test_database.py
-    ├── test_integrations.py
-    └── test_service.py
+#### 1. Plugin workstream
 
-Configuration:
-├── docker-compose.yml
-├── .env.example
-├── requirements.txt (updated)
-└── API_DOCUMENTATION.md
-```
+- service communication
+- health polling
+- NX diagnostic events
+- queue/backpressure behavior
+- packaging/build hygiene
 
----
+#### 2. Service workstream
 
-### TEAM B: Plugin Engineer
-**Focus:** NX VMS Integration, Video Processing, Reliability
+- inference pipeline
+- business logic
+- metadata persistence
+- local outbox/cache
+- retry workers
+- metrics/logging
 
-#### Phase 1: Foundation (Week 1-2)
-- [ ] Refactor object_detector.cpp
-  - [ ] Add health monitoring endpoints
-  - [ ] Implement retry logic with exponential backoff
-  - [ ] Add detailed logging
-  - [ ] Connection pooling
-  - [ ] Timeout configurations
-- [ ] Enhance device_agent.cpp
-  - [ ] Metadata enrichment
-  - [ ] Event filtering
-  - [ ] State management
-  - [ ] Error recovery
-- [ ] Create configuration system
-  - [ ] Plugin settings (detection_interval, confidence, etc.)
-  - [ ] Feature toggles
-  - [ ] Dynamic reloading
-- [ ] Add comprehensive logging
-  - [ ] Structured logging
-  - [ ] Performance profiling
-  - [ ] Diagnostic endpoints
+#### 3. Infrastructure workstream
 
-#### Phase 2: Feature Enhancement (Week 3-4)
-- [ ] Implement fall detection trigger
-  - [ ] Detect fall patterns from bounding box changes
-  - [ ] Cross-reference with service fall detection
-  - [ ] Generate high-priority events
-  - [ ] Track fall confirmation
-- [ ] Zone management integration
-  - [ ] Load zone definitions from service
-  - [ ] Validate object positions against zones
-  - [ ] Generate zone violation events
-  - [ ] Cache zone data locally
-- [ ] Person profile enrichment
-  - [ ] Attach person IDs to detections
-  - [ ] Query service for known person info
-  - [ ] Include metadata in NX events
-  - [ ] Handle new/unknown persons
-- [ ] Real-time event generation
-  - [ ] Create NX event objects
-  - [ ] Set event metadata
-  - [ ] Handle event lifecycle
-  - [ ] Error handling
-
-#### Phase 3: Stability & Performance (Week 5+)
-- [ ] Multi-camera support
-  - [ ] Camera identification
-  - [ ] Per-camera configuration
-  - [ ] Load balancing
-  - [ ] Service discovery
-- [ ] Performance optimization
-  - [ ] Frame buffering
-  - [ ] Adaptive frame skipping
-  - [ ] Memory management
-  - [ ] CPU profiling
-- [ ] Resilience patterns
-  - [ ] Circuit breaker pattern
-  - [ ] Graceful degradation
-  - [ ] Auto-recovery
-  - [ ] Health checks
-
-#### Deliverables (TEAM B)
-```
-Plugin Files (C++):
-├── src/sample_company/vms_server_plugins/opencv_object_detection/
-│   ├── device_agent.cpp (enhanced)
-│   ├── device_agent.h
-│   ├── object_detector.cpp (enhanced)
-│   ├── object_detector.h
-│   ├── object_tracker.cpp (enhanced)
-│   ├── object_tracker.h
-│   ├── analytics_processor.cpp (new)
-│   ├── analytics_processor.h (new)
-│   ├── zone_validator.cpp (new)
-│   ├── zone_validator.h (new)
-│   ├── http_client.cpp (new)
-│   ├── http_client.h (new)
-│   └── config_manager.cpp (new)
-│       config_manager.h (new)
-├── CMakeLists.txt (updated)
-└── tests/
-    ├── test_device_agent.cpp
-    ├── test_object_detector.cpp
-    ├── test_analytics_processor.cpp
-    └── test_http_client.cpp
-
-Configuration & Build:
-├── build.bat (updated)
-├── build.sh (updated)
-├── CMakeSettings.json (updated)
-└── PLUGIN_DEVELOPMENT.md
-```
+- PostgreSQL
+- MinIO
+- Prometheus / Grafana
+- Windows local Docker stack
+- deployment handoff toward AI Box
 
 ---
 
 ## 🔄 Communication Pipeline
 
-### API Contract (Plugin ↔ Service)
+### Phase P1 decision
 
-#### 1. **Inference Request**
-```http
-POST /detect HTTP/1.1
-Host: localhost:18000
-Content-Type: application/json
+**Plugin ↔ AI Service remains REST/HTTP.**
 
-{
-  "frame_id": "camera_1_2026_01_18_120000_001",
-  "camera_id": "camera_1",
-  "timestamp": 1705574400000,
-  "frame_data": "base64_encoded_image",
-  "frame_height": 1080,
-  "frame_width": 1920,
-  "metadata": {
-    "location": "hallway_floor_2",
-    "frame_quality": "high"
-  }
-}
+Rationale:
 
-Response 200 OK:
-{
-  "detections": [
-    {
-      "track_id": 1,
-      "class": "person",
-      "confidence": 0.92,
-      "bbox": {
-        "x1": 100, "y1": 200, "x2": 300, "y2": 600
-      },
-      "center": { "x": 200, "y": 400 },
-      "velocity": { "dx": 5.2, "dy": -1.1 },
-      "appearance": {
-        "color_dominant": [100, 150, 200],
-        "embedding": [...]
-      }
-    }
-  ],
-  "frame_count": 12850,
-  "inference_time_ms": 35.5
-}
+- current repo already speaks REST
+- avoids scope explosion from gRPC migration
+- allows health, persistence, testing, and observability to be finished first
+
+### API contract: Plugin ↔ Service
+
+#### Primary endpoints
+
+```text
+GET  /health
+GET  /status
+GET  /metrics
+POST /infer
 ```
 
-#### 2. **Analytics Query (Fall Detection)**
-```http
-POST /analytics/fall-detection HTTP/1.1
-Host: localhost:18000
-Content-Type: application/json
+#### Current inference transport
 
-{
-  "track_id": 1,
-  "person_id": "person_123",
-  "bboxes": [
-    { "x1": 100, "y1": 100, "x2": 300, "y2": 600 },
-    { "x1": 102, "y1": 150, "x2": 310, "y2": 550 },
-    { "x1": 105, "y1": 200, "x2": 305, "y2": 500 }
-  ],
-  "timestamps": [1000, 1033, 1066],
-  "frame_rate": 30
-}
+For Phase P1, keep compatibility with the current plugin:
 
-Response 200 OK:
-{
-  "is_falling": true,
-  "confidence": 0.87,
-  "frame_index": 2,
-  "fall_type": "sudden_drop",
-  "recommendation": "ALERT"
-}
+- content type: `application/json`
+- fields:
+  - `camera_id`
+  - `image` as base64
+
+This is not the long-term ideal transport, but it preserves compatibility while production-hardening the rest of the system.
+
+#### Deferred transport improvement
+
+Future optimization can move to:
+
+- `multipart/form-data`
+
+without changing:
+
+- detection response schema
+- track semantics
+- health semantics
+
+### API contract: Business / Admin side
+
+The service should expose production APIs for:
+
+```text
+GET    /persons
+GET    /persons/{person_id}
+POST   /persons
+PUT    /persons/{person_id}
+
+GET    /zones
+POST   /zones
+PUT    /zones/{zone_id}
+
+GET    /events
+GET    /events/{event_id}
+
+POST   /reset/camera/{camera_id}
+POST   /reset/all
 ```
 
-#### 3. **Zone Validation**
-```http
-POST /analytics/zone-check HTTP/1.1
-Host: localhost:18000
-Content-Type: application/json
+### Health model
 
+#### Top-level statuses
+
+- `healthy`
+- `degraded`
+- `not_ready`
+
+#### Condition / reason codes
+
+- `db_unreachable`
+- `service_unreachable`
+- `config_stale`
+- `outbox_backlog_high`
+
+#### Response example
+
+```json
 {
-  "camera_id": "camera_1",
-  "person_id": "person_123",
-  "track_id": 1,
-  "position": { "x": 200, "y": 400 },
-  "timestamp": 1705574400000
-}
-
-Response 200 OK:
-{
-  "zones": [
-    {
-      "zone_id": "zone_restricted_1",
-      "zone_name": "Medical Storage",
-      "violation": true,
-      "severity": "high",
-      "action": "SEND_ALERT"
-    }
-  ]
-}
-```
-
-#### 4. **Person Query/Update**
-```http
-GET /person/person_123 HTTP/1.1
-Host: localhost:18000
-
-Response 200 OK:
-{
-  "id": "person_123",
-  "name": "Nguyễn Văn A",
-  "age": 75,
-  "gender": "M",
-  "face_embedding": [...],
-  "metadata": {
-    "room": "301",
-    "emergency_contact": "0909123456"
+  "status": "degraded",
+  "ready": true,
+  "reason_codes": ["db_unreachable", "outbox_backlog_high"],
+  "dependencies": {
+    "postgres": "down",
+    "object_storage": "up",
+    "config_cache": "fresh"
   },
-  "created_at": "2025-12-01T10:30:00Z",
-  "updated_at": "2026-01-18T12:00:00Z"
+  "service_uptime_seconds": 1240.5
 }
 ```
 
-#### 5. **Health & Status**
-```http
-GET /health HTTP/1.1
-Host: localhost:18000
+### Plugin behavior against health states
 
-Response 200 OK:
-{
-  "status": "healthy",
-  "model_loaded": true,
-  "database": "connected",
-  "gpu_memory_mb": 2048,
-  "avg_inference_ms": 32.5,
-  "uptime_seconds": 86400
-}
+#### `healthy`
+
+- normal infer calls
+- normal diagnostics
+
+#### `degraded`
+
+- continue inference when possible
+- emit clear NX diagnostic warning
+- include reason codes in diagnostic payload
+
+#### `not_ready`
+
+- plugin should not assume the service is broken
+- poll again with shorter interval
+- avoid flooding service during warmup/startup
+
+### Error handling and retry strategy
+
+#### Rule 1: inference must not depend on central DB availability
+
+If central PostgreSQL is down:
+
+- inference still runs
+- health becomes `degraded`
+- event persistence moves to local outbox
+
+#### Rule 2: outbox pattern is mandatory
+
+Service flow:
+
+1. inference creates event candidate
+2. event is written to local SQLite outbox
+3. request finishes without waiting for PostgreSQL
+4. background worker syncs to PostgreSQL and MinIO later
+
+#### Rule 3: retry uses exponential backoff
+
+Suggested sequence:
+
+```text
+1s → 2s → 5s → 10s → 30s → 60s → 300s
 ```
 
-### Data Flow Diagram
-```
-Plugin (C++)                    Service (Python)             Database
-    │                              │                            │
-    ├─ Capture Frame ─────────────>│                            │
-    │                              ├─ Preprocess Frame          │
-    │                              ├─ Run YOLOv8 Inference      │
-    │                              ├─ Post-processing           │
-    │ <─ Detection Results ────────┤                            │
-    │                              │                            │
-    ├─ Analyze Movement ───────────>│ Run Fall Detection         │
-    │                              ├─ Query Person Profile ────>│
-    │ <─ Fall Alert ───────────────┤                   Profile <┤
-    │                              │                            │
-    ├─ Check Zones ───────────────>│ Validate Zone <──────────┤
-    │                              │                  Zone Def  │
-    │ <─ Zone Violation ───────────┤                            │
-    │                              │                            │
-    ├─ Generate NX Event ─ Done    ├─ Log Event ──────────────>│
-    │                              ├─ Send Email              │
-    │                              ├─ Update Person History ──>│
-    │                              │                            │
-```
+#### Rule 4: idempotency is mandatory
 
-### Error Handling & Retry Strategy
+Every event must have a unique `event_id`:
 
-```python
-# Plugin Side (object_detector.cpp)
-1. Request → Service
-2. Timeout (2.5s) → Retry with backoff
-3. 5xx Error → Exponential backoff: 100ms, 200ms, 400ms, ...
-4. Connection Failed → Circuit breaker + fallback
-5. After 3 retries → Log error, skip frame, continue
+- prefer `UUIDv7` or `ULID`
+- PostgreSQL enforces `UNIQUE(event_id)`
+- object storage key naming also derives from `event_id`
 
-# Service Side (service.py)
-1. Database error → Log, return 503 Service Unavailable
-2. Model inference error → Return partial results or cache
-3. External API timeout → Graceful degradation
-4. Out of memory → Clear cache, restart model
-```
+This ensures safe retries without duplicated records.
 
 ---
 
 ## 💾 Data Storage & API Strategy
 
-### Database Schema
+### Data ownership model
 
-#### PostgreSQL (Recommended for structured data)
+#### Nx / NAS owns video
+
+- raw video
+- playback
+- archive
+- timeline
+
+#### PostgreSQL owns metadata
+
+- persons
+- person embeddings
+- zones
+- events
+- alerts
+- camera configs
+
+#### Object storage owns images
+
+- snapshots
+- crops
+- person reference images
+
+#### SQLite on edge owns temporary durable state
+
+- pending outbox jobs
+- cached config data
+- sync checkpoints
+
+### Central PostgreSQL schema
+
+#### Required tables for Phase P1
+
 ```sql
--- People/Person Profiles
-CREATE TABLE persons (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL,
-    age INT,
-    gender CHAR(1),
-    embedding BYTEA,  -- Face embedding vector
-    face_image BYTEA,  -- Reference face image
-    room_number VARCHAR(50),
-    emergency_contact VARCHAR(20),
-    status ENUM('active', 'inactive', 'visiting'),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    metadata JSONB,
-    INDEX idx_name (name),
-    INDEX idx_status (status)
-);
-
--- Face Embeddings (optimized for search)
-CREATE TABLE face_embeddings (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    person_id UUID REFERENCES persons(id),
-    embedding VECTOR(512),  -- Using pgvector for similarity search
-    confidence FLOAT,
-    capture_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    camera_id VARCHAR(50),
-    INDEX idx_person (person_id)
-);
-
--- Events Log
-CREATE TABLE events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_type ENUM('detection', 'fall', 'zone_violation', 'counting'),
-    person_id UUID REFERENCES persons(id),
-    track_id INT,
-    camera_id VARCHAR(50),
-    severity ENUM('low', 'medium', 'high', 'critical'),
-    description TEXT,
-    metadata JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    processed BOOLEAN DEFAULT FALSE,
-    INDEX idx_person (person_id),
-    INDEX idx_camera (camera_id),
-    INDEX idx_created (created_at),
-    INDEX idx_severity (severity)
-);
-
--- Zones (restricted areas)
-CREATE TABLE zones (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    camera_id VARCHAR(50) NOT NULL,
-    zone_name VARCHAR(100) NOT NULL,
-    zone_type ENUM('forbidden', 'danger', 'normal'),
-    polygon POLYGON,  -- Coordinates of zone boundary
-    is_active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    metadata JSONB,
-    INDEX idx_camera (camera_id)
-);
-
--- Tracking Data (recent/temporary)
-CREATE TABLE tracking_data (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    person_id UUID REFERENCES persons(id),
-    track_id INT,
-    camera_id VARCHAR(50),
-    position POINT,
-    timestamp TIMESTAMP,
-    velocity POINT,
-    bbox RECT,
-    INDEX idx_person (person_id),
-    INDEX idx_camera (camera_id),
-    INDEX idx_timestamp (timestamp)
-);
-
--- Alerts/Notifications Sent
-CREATE TABLE alerts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_id UUID REFERENCES events(id),
-    person_id UUID REFERENCES persons(id),
-    alert_type ENUM('email', 'sms', 'push'),
-    recipient VARCHAR(255),
-    status ENUM('pending', 'sent', 'failed'),
-    sent_at TIMESTAMP,
-    error_message TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_person (person_id),
-    INDEX idx_status (status)
-);
+persons
+person_embeddings
+zones
+events
+alerts
+camera_configs
 ```
 
-#### MongoDB (Alternative for flexible events)
-```javascript
-// persons collection
-{
-  _id: ObjectId(),
-  name: "Nguyễn Văn A",
-  age: 75,
-  gender: "M",
-  room: "301",
-  face_embedding: [0.1, 0.2, ...], // 512-dim vector
-  face_image: Binary(),
-  status: "active",
-  emergency_contact: "0909123456",
-  created_at: ISODate(),
-  updated_at: ISODate(),
-  metadata: {}
-}
+#### Suggested roles
 
-// events collection
-{
-  _id: ObjectId(),
-  event_type: "fall",
-  person_id: ObjectId(),
-  camera_id: "camera_1",
-  timestamp: ISODate(),
-  severity: "critical",
-  description: "Fall detected at hallway floor 2",
-  metadata: {
-    track_id: 1,
-    bbox: { x1: 100, y1: 200, x2: 300, y2: 600 },
-    confidence: 0.87
-  }
-}
+**persons**
+- identity/profile metadata
+- name, age, gender, notes, room, status
+
+**person_embeddings**
+- face embedding or person reference vectors
+- linked to person records
+
+**zones**
+- zone geometry and zone type
+- per-camera scoping
+
+**events**
+- canonical event log
+- fall, zone violation, detection lifecycle, etc.
+
+**alerts**
+- delivery state of email / notification side effects
+
+**camera_configs**
+- per-camera thresholds and runtime rules
+
+### Edge SQLite schema
+
+#### Required local tables
+
+```sql
+outbox_jobs
+cached_camera_configs
+cached_zones
+cached_watchlists
+cached_person_embeddings
+sync_state
 ```
 
-### Third-Party Services & APIs
+#### Purpose
 
-#### 1. **Face Recognition**
-```
-Option A: Microsoft Azure Face API
-├─ Pros: Accurate, GDPR-compliant, integrates with Azure infrastructure
-├─ Cons: $1-10 per 1000 requests
-├─ Use: Person identification, age/gender estimation
-└─ Endpoint: https://[region].face.cognitive.microsoft.com/
+**outbox_jobs**
+- event persistence jobs
+- alert jobs
+- image upload jobs
 
-Option B: AWS Rekognition
-├─ Pros: Good accuracy, integrated with AWS, supports video analysis
-├─ Cons: $0.0001 per image for face detection
-├─ Use: Person detection, face matching
-└─ Endpoint: AWS SDK only
+**cached_* tables**
+- allow continued operation when central DB is unavailable
 
-Option C: Google Cloud Vision
-├─ Pros: Excellent accuracy, good for batch processing
-├─ Cons: Similar pricing to Azure
-├─ Use: General computer vision tasks
-└─ Endpoint: https://vision.googleapis.com/
+**sync_state**
+- version and checkpoint tracking
 
-RECOMMENDATION: Azure Face API
-- Better for elderly care (better age/gender accuracy)
-- GDPR compliance important for medical data
-- Can detect face mask, glasses, hair (useful for tracking)
+### Object storage layout
+
+Recommended object key layout:
+
+```text
+snapshots/{camera_id}/{yyyy}/{mm}/{dd}/{event_id}.jpg
+crops/{camera_id}/{yyyy}/{mm}/{dd}/{event_id}_{track_id}.jpg
+persons/{person_id}/reference/{image_id}.jpg
 ```
 
-**Integration Code Pattern:**
-```python
-# azure_face_service.py
-from azure.cognitiveservices.vision.face import FaceClient
+### API semantics
 
-class AzureFaceService:
-    def __init__(self, endpoint: str, api_key: str):
-        self.client = FaceClient(endpoint, CognitiveServicesCredentials(api_key))
-    
-    def get_face_id(self, image_data: bytes) -> str:
-        """Detect face and get unique face_id"""
-        result = self.client.face.detect_in_stream(
-            image_stream=image_data,
-            return_face_id=True,
-            return_face_attributes=['age', 'gender']
-        )
-        return result[0]['faceId']
-    
-    def verify_faces(self, face_id_1: str, face_id_2: str) -> float:
-        """Compare two faces, return confidence score (0-1)"""
-        result = self.client.face.verify_face_to_face(face_id_1, face_id_2)
-        return result.confidence
-    
-    def find_similar(self, face_id: str, face_list_id: str) -> List[dict]:
-        """Find similar faces in a group"""
-        results = self.client.face.find_similar(
-            face_id, large_face_list_id=face_list_id
-        )
-        return results
-```
+#### `/infer`
 
-#### 2. **Email Notification Service**
-```
-Option A: SendGrid
-├─ Pros: Reliable, good templates, good API
-├─ Cons: $19.95/month minimum
-├─ Features: HTML templates, scheduling, bounce handling
-└─ Rate: up to 100 emails/second
+- optimized for plugin consumption
+- no heavy side effects inline
+- should remain as lean as possible
 
-Option B: AWS SES (Simple Email Service)
-├─ Pros: Cheap ($0.10 per 1000 emails), AWS integration
-├─ Cons: Lower rate limits initially
-├─ Features: Bulk sending, custom headers
-└─ Rate: 14 emails/second initially
+#### business/admin APIs
 
-Option C: Mailgun
-├─ Pros: Good balance, free tier available
-├─ Cons: Some limitations on free tier
-├─ Features: Email validation, webhooks
-└─ Rate: 600 requests/minute
-
-RECOMMENDATION: AWS SES (cost-effective) or SendGrid (ease-of-use)
-```
-
-**Integration Code Pattern:**
-```python
-# email_service.py
-import sendgrid
-from sendgrid.helpers.mail import Mail, Email, Content
-
-class EmailAlertService:
-    def __init__(self, api_key: str):
-        self.sg = sendgrid.SendGridAPIClient(api_key)
-    
-    def send_fall_alert(
-        self,
-        recipient: str,
-        person_name: str,
-        camera: str,
-        timestamp: str
-    ):
-        """Send fall detection alert"""
-        message = Mail(
-            from_email='alerts@elderly-care.com',
-            to_emails=recipient,
-            subject='⚠️ Fall Detection Alert',
-            html_content=f"""
-            <h2>Fall Detected!</h2>
-            <p><strong>Person:</strong> {person_name}</p>
-            <p><strong>Location:</strong> {camera}</p>
-            <p><strong>Time:</strong> {timestamp}</p>
-            <p><strong>Action Required:</strong> Check immediately</p>
-            """
-        )
-        response = self.sg.send(message)
-        return response.status_code == 202
-```
-
-#### 3. **Data Analytics & Monitoring**
-```
-Option A: ELK Stack (Elasticsearch, Logstash, Kibana)
-├─ Pros: Open source, powerful analytics, beautiful dashboards
-├─ Cons: Requires infrastructure management
-├─ Use: Event analytics, trend analysis, real-time dashboards
-└─ Cost: Free (self-hosted)
-
-Option B: DataDog
-├─ Pros: Cloud-based, excellent dashboards, APM monitoring
-├─ Cons: Expensive ($15+/host/month)
-├─ Use: System monitoring, performance analysis, alerting
-└─ Cost: Pay-as-you-go
-
-Option C: Grafana + Prometheus
-├─ Pros: Popular, open source, good for metrics
-├─ Cons: Different focus (metrics vs logs)
-├─ Use: System metrics, performance monitoring
-└─ Cost: Free (self-hosted)
-
-RECOMMENDATION: Grafana + Prometheus for metrics + ELK for events
-```
-
-#### 4. **SMS/Push Notifications (Optional)**
-```
-Option A: Twilio
-├─ Pros: Reliable, supports SMS and push
-├─ Cons: More expensive
-├─ Use: Critical alerts via SMS
-└─ Rate: $0.0075 per SMS in Vietnam
-
-Option B: Firebase Cloud Messaging (FCM)
-├─ Pros: Free for basic usage, good integration
-├─ Cons: Requires mobile app
-├─ Use: Push notifications to staff app
-└─ Cost: Free
-
-RECOMMENDATION: Twilio for SMS, FCM for mobile push
-```
-
-### Data Flow to External Services
-```
-Service (Python)
-    │
-    ├─ Event Generated
-    │   │
-    │   ├─ Save to DB ──────────> PostgreSQL
-    │   │
-    │   ├─ Extract Face ─────────> Azure Face API
-    │   │                         (Get person ID)
-    │   │
-    │   ├─ Check Zone ────────────> PostgreSQL
-    │   │                         (Validate)
-    │   │
-    │   ├─ Generate Alert
-    │   │   │
-    │   │   ├─ Email ────────────> SendGrid/AWS SES
-    │   │   │
-    │   │   ├─ SMS (Critical) ────> Twilio
-    │   │   │
-    │   │   └─ Push (App) ────────> Firebase FCM
-    │   │
-    │   └─ Log Metrics ──────────> ELK Stack / Datadog
-    │
-    └─ Every 5min: Analytics
-        └─ Generate Reports ─────> Elasticsearch
-```
+- backed by PostgreSQL
+- may read through local cache when appropriate
+- should be versionable later if contract grows
 
 ---
 
 ## 🗂️ Implementation Roadmap
 
-### Timeline Overview
-```
-Week 1-2: Foundation Setup
-├─ TEAM A: Database design & analytics engine core
-├─ TEAM B: Plugin refactoring & health monitoring
-└─ Both: Testing infrastructure, CI/CD setup
+### Timeline overview
 
-Week 3-4: Integration
-├─ TEAM A: Face API integration, email service
-├─ TEAM B: Fall detection & zone management in plugin
-└─ Both: Cross-team testing & API refinement
+This roadmap is designed for **one person** working sequentially.
 
-Week 5-6: Enhancement
-├─ TEAM A: Advanced analytics, performance optimization
-├─ TEAM B: Multi-camera support, stability improvements
-└─ Both: Load testing, stress testing, production hardening
-
-Week 7-8: Deployment & Iteration
-├─ TEAM A: Dashboard/reporting, monitoring
-├─ TEAM B: Docker containerization, deployment automation
-└─ Both: Production deployment, monitoring, iterative improvements
+```text
+Phase 0: Local development baseline on Windows
+Phase 1: Central PostgreSQL persistence
+Phase 2: Edge SQLite outbox + cache
+Phase 3: Business APIs + background workers
+Phase 4: Observability + health hardening
+Phase 5: Plugin reliability + automated tests
+Phase 6: Packaging / release cleanup + AI Box readiness
 ```
 
-### Phase 1: Foundation (Week 1-2)
+### Phase 0: Windows local baseline
 
-**TEAM A Milestones:**
-- [ ] Database schema finalized
-- [ ] Database abstraction layer (ORM/client)
-- [ ] Basic CRUD endpoints
-- [ ] Fall detection algorithm (MVP)
-- [ ] Unit tests for analytics
+Goals:
 
-**TEAM B Milestones:**
-- [ ] Refactored object_detector with error handling
-- [ ] Health monitoring endpoints
-- [ ] Configuration system implemented
-- [ ] Comprehensive logging added
-- [ ] Unit tests for detector
+- keep development fast on Windows
+- simulate production dependencies locally
 
-**Integration Points:**
-- [ ] Define API contract
-- [ ] Test basic /detect endpoint
-- [ ] Error codes standardization
+Tasks:
 
-### Phase 2: Integration (Week 3-4)
+- create `docker-compose.dev.yml`
+- run:
+  - PostgreSQL
+  - MinIO
+  - Prometheus
+- normalize `.env`
+- define service-to-central connection strings
 
-**TEAM A Milestones:**
-- [ ] Azure Face API integrated
-- [ ] Email service configured
-- [ ] Person identification working
-- [ ] Zone validation logic
-- [ ] Integration tests passing
+### Phase 1: PostgreSQL persistence
 
-**TEAM B Milestones:**
-- [ ] Fall detection in plugin complete
-- [ ] Zone check integration
-- [ ] Person profile enrichment
-- [ ] Event metadata generation
-- [ ] Integration tests passing
+Maps to:
 
-**Integration Points:**
-- [ ] End-to-end fall detection test
-- [ ] Zone violation alert test
-- [ ] Plugin ↔ Service communication verified
+- `Service P1.1`
+- partially `Service P1.2`
 
-### Phase 3: Enhancement (Week 5-6)
+Tasks:
 
-**TEAM A Milestones:**
-- [ ] Multi-camera coordination
-- [ ] Performance optimization
-- [ ] Caching strategy implemented
-- [ ] Analytics dashboard started
-- [ ] Load testing completed
+- define schema
+- choose ORM / DAL strategy
+- add migrations
+- persist:
+  - persons
+  - zones
+  - events
+  - alerts
+  - camera configs
 
-**TEAM B Milestones:**
-- [ ] Resilience patterns implemented
-- [ ] Performance profiling done
-- [ ] Memory optimization complete
-- [ ] Docker image created
-- [ ] Deployment automation setup
+Definition of done:
 
-**Integration Points:**
-- [ ] Performance benchmarks met
-- [ ] Stress testing passed
-- [ ] Production readiness checklist
+- service can read/write central metadata
+- no plugin changes required for initial persistence path
 
-### Phase 4: Deployment (Week 7-8)
+### Phase 2: Edge SQLite outbox + cache
 
-**TEAM A Milestones:**
-- [ ] Analytics dashboard complete
-- [ ] Monitoring/alerting setup
-- [ ] Database backups configured
-- [ ] Documentation complete
-- [ ] Handoff to ops team
+Maps to:
 
-**TEAM B Milestones:**
-- [ ] Plugin production-ready
-- [ ] Deployment guide complete
-- [ ] Monitoring integration done
-- [ ] Logging aggregation setup
-- [ ] Incident response procedures
+- `Service P1.3`
+- `Service P1.5`
 
-**Integration Points:**
-- [ ] Production deployment complete
-- [ ] Monitoring dashboards live
-- [ ] Alerting system operational
-- [ ] Team handoff successful
+Tasks:
+
+- create local `edge_state.db`
+- enable WAL mode
+- implement durable outbox
+- implement local config cache
+- implement sync state tracking
+- add idempotent `event_id` handling
+
+Definition of done:
+
+- DB outage does not stop inference
+- pending jobs survive service restart
+
+### Phase 3: Business APIs and background workers
+
+Maps to:
+
+- `Service P1.2`
+- `Service P1.3`
+
+Tasks:
+
+- add person APIs
+- add zone APIs
+- add event APIs
+- add production reset/admin APIs
+- add worker for:
+  - event persistence
+  - alert delivery
+  - image upload
+
+Definition of done:
+
+- `/infer` path stays lightweight
+- side effects happen asynchronously
+
+### Phase 4: Observability and health hardening
+
+Maps to:
+
+- `Service P1.5`
+- `Plugin P1.1`
+
+Tasks:
+
+- add `GET /metrics`
+- expose Prometheus metrics
+- add structured JSON logs
+- standardize health contract
+- include reason codes and dependency states
+- define warning thresholds for:
+  - stale config
+  - outbox backlog
+
+Definition of done:
+
+- operators can detect degraded states early
+- plugin can act on health consistently
+
+### Phase 5: Plugin reliability and automated tests
+
+Maps to:
+
+- `Plugin P1.1`
+- `Plugin P1.3`
+- `Plugin P1.4`
+- `Service P1.4`
+
+Tasks:
+
+- plugin health polling
+- NX diagnostic events with clear degraded semantics
+- queue metric thresholds
+- integration tests for:
+  - queue/backpressure
+  - circuit breaker
+  - reconnect behavior
+  - metadata / event consistency
+- unit tests for:
+  - tracking
+  - fall detection
+  - ROI
+  - undistort
+- load tests for multiple cameras
+
+Definition of done:
+
+- resilience logic is proven by tests, not only by logs
+
+### Phase 6: Packaging, release cleanup, and AI Box readiness
+
+Maps to:
+
+- `Plugin P1.2`
+
+Tasks:
+
+- clean manifest/version duplication
+- remove legacy naming where possible
+- standardize build scripts
+- define release artifact contents
+- document Linux/AI Box deployment prerequisites
+
+Definition of done:
+
+- release artifacts are predictable
+- deployment handoff is clean
 
 ---
 
 ## 🚀 Development Workflow
 
-### Git Workflow
+### Solo workflow
 
-```
-Main Repo Structure:
-├── main (stable, production)
-├── develop (integration, staging)
-├── feature/team-a/* (service features)
-├── feature/team-b/* (plugin features)
-└── hotfix/* (critical fixes)
+This project no longer uses a two-team structure.
 
-Branching Strategy:
-1. Create feature branch from develop
-   git checkout -b feature/team-a/fall-detection develop
+Recommended workflow:
 
-2. Regular commits with meaningful messages
-   git commit -m "feat(fall-detection): Add pose estimation algorithm"
+1. architecture decision
+2. minimal implementation
+3. local test
+4. observability
+5. hardening
+6. packaging
 
-3. Push and create Pull Request
-   git push origin feature/team-a/fall-detection
+### Branching strategy
 
-4. Code Review (other team + project lead)
-   - Automated tests must pass
-   - Code review approval required
-   - Integration verified
+Recommended:
 
-5. Merge to develop
-   - Squash commits for clarity
-   - Delete feature branch
+- `main` for stable baseline
+- short-lived feature branches:
+  - `feature/service-persistence`
+  - `feature/plugin-health`
+  - `feature/outbox-worker`
 
-6. After team coordination, merge develop → main
-```
+### Definition of done
 
-### Code Review Checklist
+A task is only complete when:
 
-**For TEAM A (Service) PRs:**
-```
-□ Unit tests added/passing
-□ Integration tests added/passing
-□ Database migrations provided
-□ API documentation updated
-□ Error handling implemented
-□ Logging added at appropriate levels
-□ No security issues (SQL injection, auth, etc.)
-□ Performance considerations addressed
-□ Backward compatible or migration provided
-```
+- code compiles / runs
+- config is documented
+- tests exist where applicable
+- logs / metrics are visible
+- failure mode is understood
 
-**For TEAM B (Plugin) PRs:**
-```
-□ Unit tests added/passing
-□ Memory leak checks done
-□ Crash scenarios handled
-□ HTTP client retry logic tested
-□ Timeout handling verified
-□ Error messages are diagnostic
-□ Plugin stability maintained
-□ No blocking operations
-□ Resource cleanup verified
-```
+### Testing strategy
 
-### Daily Communication
+#### Unit tests
 
-**Daily Standup (15 min)**
-```
-Format: Sync Meeting (Video/Slack)
-Time: 09:30 AM
-Attendees: Both teams + Project Lead
+- tracking logic
+- fall detection heuristics
+- ROI handling
+- undistort path
+- outbox state transitions
 
-Each Person:
-1. What did I accomplish yesterday?
-2. What am I working on today?
-3. Any blockers?
+#### Integration tests
 
-TEAM A Focus: API stability, DB performance
-TEAM B Focus: Plugin reliability, HTTP communication
+- service API with PostgreSQL
+- service API with MinIO
+- DB outage and recovery behavior
+- plugin ↔ service retry behavior
+
+#### Load tests
+
+- multiple cameras
+- service degradation under backlog
+- reconnect after dependency outage
+
+### Version management
+
+Use semantic versioning:
+
+```text
+MAJOR.MINOR.PATCH
 ```
 
-**Weekly Sync (1 hour)**
-```
-1. Review completed work (20 min)
-   - Demo new features
-   - Show test results
-   - Integration status
+Guidelines:
 
-2. Identify blockers (15 min)
-   - API contract issues
-   - Performance bottlenecks
-   - Testing coverage gaps
+- increment patch for bugfix/hardening
+- increment minor for backward-compatible features
+- increment major only for contract-breaking changes
 
-3. Plan next week (25 min)
-   - Adjust priorities
-   - Dependency management
-   - Resource allocation
-```
+### Release artifacts
 
-### Testing Strategy
+#### Plugin release artifact
 
-**TEAM A Testing**
-```python
-# unit_tests/ - Test individual functions
-tests/
-├── test_fall_detector.py
-├── test_zone_validator.py
-├── test_person_counter.py
-├── test_database.py
-└── test_external_apis.py
+- plugin binary
+- manifest
+- version metadata
+- deployment notes
 
-# integration_tests/ - Test Service endpoints
-tests/
-├── test_detect_endpoint.py
-├── test_fall_detection_flow.py
-├── test_zone_check_flow.py
-├── test_person_management.py
-└── test_email_alerts.py
+#### Service release artifact
 
-# load_tests/ - Performance testing
-tests/
-└── test_load_service.py
-    └── Simulate 10+ cameras @ 30fps
-```
+- Python package / deployment directory
+- env template
+- migration bundle
+- docker compose or deployment instructions
 
-**TEAM B Testing**
-```cpp
-// unit_tests/ - Test components
-tests/
-├── test_object_detector.cpp
-├── test_http_client.cpp
-├── test_zone_validator.cpp
-└── test_config_manager.cpp
+### Deferred items
 
-// integration_tests/ - Test plugin lifecycle
-tests/
-├── test_plugin_startup.cpp
-├── test_frame_processing.cpp
-├── test_service_communication.cpp
-└── test_event_generation.cpp
+Not in Phase P1:
 
-// stress_tests/ - Long-running tests
-tests/
-├── test_memory_leak.cpp
-├── test_high_frame_rate.cpp
-└── test_error_recovery.cpp
-```
-
-### Version Management
-
-```
-Semantic Versioning: MAJOR.MINOR.PATCH
-
-Service Version: service_version.txt
-Plugin Version: plugin_version.txt
-
-Example Release:
-v0.1.0 (Initial MVP)
-├─ Person detection
-├─ Basic counting
-└─ Fall detection alert
-
-v0.2.0 (Face Recognition)
-├─ Azure Face API integration
-├─ Person profile management
-└─ Face matching
-
-v1.0.0 (Production Ready)
-├─ Zone management
-├─ Multi-camera support
-├─ Full analytics dashboard
-└─ SLA requirements met
-```
+- gRPC transport
+- Redis-based edge runtime
+- advanced dashboard/reporting layer
+- full multi-node orchestration
 
 ---
 
 ## 📊 Success Metrics
 
-### Performance Targets
+### Performance targets
 
-**Service (Python)**
-```
-Inference Time: < 50ms per frame
-  - YOLOv8n: ~35ms
-  - Preprocessing: ~10ms
-  - Post-processing: ~5ms
+- plugin-side frame handling remains real-time oriented
+- inference endpoint remains responsive under normal load
+- queue backlog stays bounded under expected camera rate
 
-API Response Time: < 100ms @ 30fps
-  - P95: < 80ms
-  - P99: < 150ms
+### Reliability targets
 
-Database Queries: < 50ms
-  - Simple lookups: < 10ms
-  - Complex queries: < 50ms
+- inference continues when PostgreSQL is temporarily unavailable
+- events are replayed after dependency recovery
+- no duplicate event records under retry
+- plugin produces actionable NX diagnostics
 
-Memory Usage: < 4GB
-  - Model: ~2.5GB
-  - Cache: ~1GB
-  - Headroom: ~0.5GB
-```
+### Observability targets
 
-**Plugin (C++)**
-```
-HTTP Request Latency: < 2.5s timeout
-  - Healthy: 100-500ms
-  - Degraded: 500-2000ms
+Minimum required metrics:
 
-Plugin Processing: < 50ms per frame
-  - Event generation: < 10ms
-  - NX communication: < 30ms
+- `infer_requests_total`
+- `infer_latency_ms`
+- `db_up`
+- `object_storage_up`
+- `outbox_pending_total`
+- `outbox_oldest_age_seconds`
+- `config_last_sync_age_seconds`
+- `events_synced_total`
+- `events_sync_failed_total`
 
-Memory Usage: < 500MB per camera
-  - Tracking state: ~200MB
-  - Buffer: ~200MB
-  - Misc: ~100MB
+### Suggested warning thresholds
 
-CPU Usage: < 30% per camera @ 30fps
-```
+#### config stale
 
-### Reliability Targets
+- warning if config cannot be refreshed for more than **5 minutes**
 
-```
-Service Uptime: > 99.5% (43.2 minutes/month downtime)
-Plugin Stability: > 99% (no crash/restart)
-Detection Accuracy: > 95% for people detection
-False Positive Rate: < 5% for events
-Alert Delivery: > 99% within 5 seconds
-```
+#### outbox backlog high
 
-### User Experience Targets
+- warning if pending jobs exceed **100**
+- or oldest pending job age exceeds **60 seconds**
 
-```
-Fall Detection Response: < 5 seconds from event to alert
-Zone Violation Alert: < 2 seconds from entry to notification
-Person Recognition: > 90% accuracy for known persons
-Dashboard Load Time: < 2 seconds
-Report Generation: < 30 seconds for monthly reports
-```
-
----
-
-## 📚 Documentation Plan
-
-**TEAM A to Create:**
-- [ ] API Documentation (OpenAPI/Swagger)
-- [ ] Database Schema Guide
-- [ ] Analytics Algorithm Documentation
-- [ ] Integration Guide (Face API, Email, etc.)
-- [ ] Troubleshooting Guide
-- [ ] Performance Tuning Guide
-
-**TEAM B to Create:**
-- [ ] Plugin Development Guide
-- [ ] Build Instructions (Windows, Linux)
-- [ ] Configuration Reference
-- [ ] NX VMS Integration Guide
-- [ ] Troubleshooting Guide
-- [ ] Performance Profiling Guide
-
-**Shared Documentation:**
-- [ ] System Architecture Overview (this document)
-- [ ] API Contract & Examples
-- [ ] Deployment Guide
-- [ ] Operational Handbook
-- [ ] Release Notes
-- [ ] Contributing Guidelines
+These should remain configurable, not hardcoded forever.
 
 ---
 
 ## 🎯 Conclusion
 
-This architecture provides:
+This updated architecture intentionally separates:
 
-✅ **Clear separation of concerns** - Service team handles logic, Plugin team handles stability
-✅ **Well-defined interfaces** - HTTP API contract is the single source of truth
-✅ **Scalability** - Can add more cameras, services, or processing nodes
-✅ **Reliability** - Error handling, retry logic, and graceful degradation
-✅ **Professional workflow** - Git flow, code review, testing, and documentation
-✅ **Data security** - Database design supports GDPR, audit logs, access control
-✅ **Monitoring** - Built-in health checks, metrics, and alerting
+- **video responsibilities** into Nx / NAS
+- **metadata responsibilities** into PostgreSQL
+- **image storage responsibilities** into MinIO
+- **runtime resilience responsibilities** into the edge AI service with SQLite outbox/cache
 
-The two-team structure enables parallel development while the HTTP API contract ensures seamless integration. Regular syncs and clear communication channels will keep both teams aligned toward the project goals.
+It is designed to:
+
+- work on Windows during development
+- migrate cleanly to AI Box deployment later
+- avoid coupling the plugin to the database
+- keep inference alive during central outages
+- provide a clear path for the current P1 tasks
+
+The immediate priority is not protocol redesign or distributed complexity. The immediate priority is:
+
+1. persistence
+2. outbox/cache resilience
+3. observability
+4. plugin health semantics
+5. automated tests
+6. release hygiene
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** January 18, 2026  
-**Status:** Ready for Implementation  
+**Document Version:** 2.0

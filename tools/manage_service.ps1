@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# Script to test and manage YOLOv8 People Analytics Service
+# Script to test and manage YOLO26 People Analytics Service
 
 param(
     [string]$Action = "status",
@@ -78,7 +78,7 @@ function Reset-All {
 }
 
 function Show-Help {
-    Write-Host "YOLOv8 People Analytics Service Manager" -ForegroundColor Cyan
+    Write-Host "YOLO26 People Analytics Service Manager" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage: ./manage_service.ps1 -Action <action> [-CameraId <id>]" -ForegroundColor Yellow
     Write-Host ""

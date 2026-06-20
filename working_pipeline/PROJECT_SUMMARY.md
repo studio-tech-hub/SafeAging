@@ -8,7 +8,7 @@
 
 ## 📋 Executive Summary
 
-You've requested a comprehensive architecture for transforming your existing YOLOv8 VMS plugin into a full-featured elderly care management system. This document summarizes the provided architecture and next steps.
+You've requested a comprehensive architecture for transforming your existing YOLO26 VMS plugin into a full-featured elderly care management system. This document summarizes the provided architecture and next steps.
 
 ### What We've Delivered
 

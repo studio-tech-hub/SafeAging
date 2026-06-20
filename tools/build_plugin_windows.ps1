@@ -7,7 +7,7 @@ This script reproduces the known-good manual build flow:
 1) set CONAN_VCVARS_AUTO=0
 2) call <metadataSdkDir>\call_vcvars64.bat
 3) call VS vcvars64.bat --vcvars_ver=14.29.30133
-4) cmake -S config -B build\yolov8_people_analytics_plugin ...
+4) cmake -S config -B build\yolo26_people_analytics_plugin ...
 5) cmake --build ...
 
 It does not use CMake presets.
@@ -28,6 +28,10 @@ Optional path to cmake.exe. If omitted, cmake must be available in PATH.
 
 .PARAMETER BuildType
 CMake build type. Default: Release
+
+.PARAMETER Package
+If set, runs cmake --install and creates a release zip under dist\windows-x64\.
+Artifact name: yolo26_people_analytics_plugin-<version>-windows-x64.zip
 #>
 [CmdletBinding()]
 param(
@@ -45,7 +49,10 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidateSet("Release", "Debug", "RelWithDebInfo", "MinSizeRel")]
-    [string]$BuildType = "Release"
+    [string]$BuildType = "Release",
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Package
 )
 
 Set-StrictMode -Version Latest
@@ -72,8 +79,9 @@ if ([string]::IsNullOrWhiteSpace($NxMetadataSdkDir))
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$srcDir = Join-Path $repoRoot "config"
-$buildDir = Join-Path $repoRoot "build\yolov8_people_analytics_plugin"
+$srcDir   = Join-Path $repoRoot "config"
+$buildDir = Join-Path $repoRoot "build\yolo26_people_analytics_plugin"
+$distDir  = Join-Path $repoRoot "dist\windows-x64"
 
 $resolvedSdkDir = (Resolve-Path $NxMetadataSdkDir -ErrorAction Stop).Path
 $resolvedVsVcvars = (Resolve-Path $VsVcvarsPath -ErrorAction Stop).Path
@@ -93,6 +101,7 @@ Write-Host "VS vcvars:        $resolvedVsVcvars"
 Write-Host "CMake:            $resolvedCmake"
 Write-Host "MSVC version:     $VcvarsVersion"
 Write-Host "Build type:       $BuildType"
+Write-Host "Package:          $($Package.IsPresent)"
 
 # Keep everything in one cmd.exe session so vcvars env is preserved.
 $cmdParts = @(
@@ -112,14 +121,52 @@ if ($LASTEXITCODE -ne 0)
     throw "Build failed (exit code $LASTEXITCODE)."
 }
 
-$dll = Get-ChildItem -Path $buildDir -Recurse -Filter "yolov8_people_analytics_plugin.dll" -File -ErrorAction SilentlyContinue |
+$dll = Get-ChildItem -Path $buildDir -Recurse -Filter "yolo26_people_analytics_plugin.dll" -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -First 1
 
 if (-not $dll)
 {
-    throw "Build finished but yolov8_people_analytics_plugin.dll was not found under $buildDir."
+    throw "Build finished but yolo26_people_analytics_plugin.dll was not found under $buildDir."
 }
 
 Write-Host "DLL ready: $($dll.FullName)"
-Write-Host "Quick command: .\tools\build_plugin_windows.ps1 -NxMetadataSdkDir `"<path-to-nx-metadata-sdk>\metadata_sdk`" [-CmakePath `"<path-to-cmake.exe>`"]"
+
+# ── Optional packaging ─────────────────────────────────────────────────────────
+if ($Package)
+{
+    Write-Host ""
+    Write-Host "Packaging release artifact..."
+
+    # Install into dist\windows-x64\  (flat layout defined by CMakeLists install rules)
+    $null = New-Item -ItemType Directory -Force -Path $distDir
+    & $resolvedCmake --install $buildDir --prefix $distDir
+    if ($LASTEXITCODE -ne 0) { throw "cmake --install failed (exit $LASTEXITCODE)." }
+
+    # Read version from the generated version_info.json
+    $versionInfoPath = Join-Path $buildDir "version_info.json"
+    $pluginVersion = "0.0.0"
+    if (Test-Path $versionInfoPath)
+    {
+        $versionInfo = Get-Content $versionInfoPath -Raw | ConvertFrom-Json
+        $pluginVersion = $versionInfo.plugin_version
+    }
+
+    # Create zip: dist\yolo26_people_analytics_plugin-<version>-windows-x64.zip
+    $zipName = "yolo26_people_analytics_plugin-${pluginVersion}-windows-x64.zip"
+    $zipPath = Join-Path $repoRoot "dist\$zipName"
+
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    Compress-Archive -Path (Join-Path $distDir "*") -DestinationPath $zipPath
+
+    Write-Host ""
+    Write-Host "========================================================"
+    Write-Host " Artifact: $zipPath"
+    Write-Host " Contents:"
+    (Get-ChildItem $distDir -File) | ForEach-Object { Write-Host "   $($_.Name)" }
+    Write-Host "========================================================"
+}
+
+Write-Host ""
+Write-Host "Quick build:   .\tools\build_plugin_windows.ps1 -NxMetadataSdkDir `"<sdk>\metadata_sdk`""
+Write-Host "Build+package: .\tools\build_plugin_windows.ps1 -NxMetadataSdkDir `"<sdk>\metadata_sdk`" -Package"

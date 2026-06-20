@@ -5,11 +5,8 @@ from pathlib import Path
 import torch
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-)
+# Minimal bootstrap — formatter is replaced by configure_logging() below
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -109,9 +106,9 @@ class AppConfig:
 
         self.service_port = _env_int("SERVICE_PORT", 18000)
         self.service_host = os.getenv("SERVICE_HOST", "127.0.0.1")
-        self.model_path = os.getenv("MODEL_PATH", "yolov8n.pt")
+        self.model_path = os.getenv("MODEL_PATH", "yolo26n.pt")
         self.confidence_threshold = _clamp(
-            _env_float("CONFIDENCE_THRESHOLD", 0.35), 0.0, 1.0, "CONFIDENCE_THRESHOLD"
+            _env_float("CONFIDENCE_THRESHOLD", 0.75), 0.0, 1.0, "CONFIDENCE_THRESHOLD"
         )
         self.iou_threshold = _clamp(_env_float("IOU_THRESHOLD", 0.45), 0.0, 1.0, "IOU_THRESHOLD")
         self.min_detection_area = max(1, _env_int("MIN_DETECTION_AREA", 20))
@@ -175,7 +172,7 @@ class AppConfig:
         self.enable_frame_enhancement = _env_bool("ENABLE_FRAME_ENHANCEMENT", False)
         self.clahe_clip_limit = max(0.1, _env_float("CLAHE_CLIP_LIMIT", 2.0))
         self.clahe_tile_size = max(2, _env_int("CLAHE_TILE_SIZE", 16))
-        self.save_debug_samples = _env_bool("SAVE_DEBUG_SAMPLES", True)
+        self.save_debug_samples = _env_bool("SAVE_DEBUG_SAMPLES", False)
 
         self.enable_roi = _env_bool("ENABLE_ROI", True)
         self.roi_type = os.getenv("ROI_TYPE", "rect").strip().lower()
@@ -195,12 +192,12 @@ class AppConfig:
             logger.warning("ROI_Y_MIN must be < ROI_Y_MAX, fallback to [0.3, 1.0]")
             self.roi_y_min, self.roi_y_max = 0.3, 1.0
 
-        self.enable_undistort = _env_bool("ENABLE_UNDISTORT", True)
+        self.enable_undistort = _env_bool("ENABLE_UNDISTORT", False)
         self.camera_matrix_json = os.getenv("CAMERA_MATRIX_JSON", "")
         self.distortion_coeffs_json = os.getenv("DISTORTION_COEFFS_JSON", "")
         self.calibration_file = os.getenv("CALIBRATION_FILE", "camera_calibration.json")
 
-        self.yolo_imgsz = max(64, _env_int("YOLO_IMGSZ", 1280))
+        self.yolo_imgsz = max(64, _env_int("YOLO_IMGSZ", 640))
 
         self.device = os.getenv("DEVICE", "cuda:0" if cuda_available else "cpu")
         self.use_half = _env_bool("USE_HALF", False)
@@ -225,11 +222,83 @@ class AppConfig:
             self.tls_key_file = ""
         self.rate_limit_enabled = _env_bool("RATE_LIMIT_ENABLED", True)
         self.rate_limit_window_seconds = max(1, _env_int("RATE_LIMIT_WINDOW_SECONDS", 60))
-        self.rate_limit_max_per_ip = max(1, _env_int("RATE_LIMIT_MAX_PER_IP", 600))
-        self.rate_limit_max_per_camera = max(1, _env_int("RATE_LIMIT_MAX_PER_CAMERA", 300))
+        self.rate_limit_max_per_ip = max(1, _env_int("RATE_LIMIT_MAX_PER_IP", 2400))
+        self.rate_limit_max_per_camera = max(1, _env_int("RATE_LIMIT_MAX_PER_CAMERA", 1200))
         self.rate_limit_skip_loopback = _env_bool("RATE_LIMIT_SKIP_LOOPBACK", True)
+        self.metrics_window_size = max(10, _env_int("METRICS_WINDOW_SIZE", 100))
+        self.metrics_log_interval = max(1, _env_int("METRICS_LOG_INTERVAL", 20))
         cors_raw = os.getenv("CORS_ALLOW_ORIGINS", "")
         self.cors_allow_origins = [v.strip() for v in cors_raw.split(",") if v.strip()]
+
+        # ── Observability (S P1.5) ────────────────────────────────────────────
+        raw_log_format = os.getenv("LOG_FORMAT", "text").strip().lower()
+        self.log_format = raw_log_format if raw_log_format in {"text", "json"} else "text"
+
+        # ── External services (consumed by health probes + S P1.1/P1.3) ──────
+        self.database_url = os.getenv("DATABASE_URL", "").strip()
+        self.s3_endpoint = os.getenv("S3_ENDPOINT", "").strip()
+        self.s3_access_key = os.getenv("S3_ACCESS_KEY", "").strip()
+        self.s3_secret_key = os.getenv("S3_SECRET_KEY", "").strip()
+        self.s3_bucket_snapshots = os.getenv("S3_BUCKET_SNAPSHOTS", "safeaging-snapshots").strip()
+        self.s3_region = os.getenv("S3_REGION", "us-east-1").strip()
+
+        # ── S P1.3 – Alert / email config ────────────────────────────────────
+        self.smtp_host = os.getenv("SMTP_HOST", "").strip()
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
+        self.smtp_user = os.getenv("SMTP_USER", "").strip()
+        self.smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+        self.smtp_from = os.getenv("SMTP_FROM", "alerts@safeaging.local").strip()
+        self.alert_email_to = os.getenv("ALERT_EMAIL_TO", "").strip()
+        self.alert_fall_enabled = os.getenv("ALERT_FALL_ENABLED", "true").lower() == "true"
+        # S P2.3 – alert engine config
+        self.alert_zone_violation_enabled = os.getenv("ALERT_ZONE_VIOLATION_ENABLED", "true").lower() == "true"
+        self.alert_dedupe_sec = float(os.getenv("ALERT_DEDUPE_SEC", "60"))
+        self.alert_max_retries = int(os.getenv("ALERT_MAX_RETRIES", "3"))
+        self.alert_rate_limit_max = int(os.getenv("ALERT_RATE_LIMIT_MAX", "10"))
+        self.alert_rate_limit_window_sec = float(os.getenv("ALERT_RATE_LIMIT_WINDOW_SEC", "600"))
+
+        # S P2.4 – retention policy
+        self.retention_days = int(os.getenv("RETENTION_DAYS", "30"))
+        self.retention_check_hours = float(os.getenv("RETENTION_CHECK_HOURS", "6"))
+
+        # ── Edge durable outbox (survives restart/crash) ──────────────────────
+        self.outbox_db_path = os.getenv("OUTBOX_DB_PATH", "edge_outbox.db").strip()
+        self.outbox_max_attempts = max(1, _env_int("OUTBOX_MAX_ATTEMPTS", 8))
+        self.edge_sqlite_path = os.getenv(
+            "EDGE_SQLITE_PATH", "/app/runtime/edge_state.db"
+        ).strip()
+
+        # S P2.1 – ReID / person re-identification
+        self.reid_match_threshold = float(os.getenv("REID_MATCH_THRESHOLD", "0.65"))
+        self.reid_auto_link_enabled = os.getenv("REID_AUTO_LINK_ENABLED", "true").lower() == "true"
+
+        # ── Face recognition (real-time identity on the bounding box) ──────────
+        self.enable_face_recognition = _env_bool("ENABLE_FACE_RECOGNITION", True)
+        # Cosine similarity threshold for ArcFace normed embeddings (0..1).
+        self.face_match_threshold = _clamp(
+            _env_float("FACE_MATCH_THRESHOLD", 0.45), 0.0, 1.0, "FACE_MATCH_THRESHOLD"
+        )
+        # Run face recognition for a given track at most once every N frames
+        # (between attempts the cached identity is reused for a stable label).
+        self.face_recog_interval_frames = max(1, _env_int("FACE_RECOG_INTERVAL_FRAMES", 12))
+        # Minimum face bbox side (pixels) to attempt recognition.
+        self.face_min_pixels = max(8, _env_int("FACE_MIN_PIXELS", 28))
+        # insightface detector input size (square).
+        self.face_det_size = max(160, _env_int("FACE_DET_SIZE", 640))
+        # insightface model pack name (buffalo_l = SCRFD + ArcFace r50, GPU-friendly).
+        self.face_model_pack = os.getenv("FACE_MODEL_PACK", "buffalo_l").strip()
+        # Gallery (enrolled face embeddings) cache refresh interval.
+        self.face_gallery_refresh_sec = max(5.0, _env_float("FACE_GALLERY_REFRESH_SEC", 30.0))
+
+        # Face enrollment from multiple images or sampled video frames.
+        self.enroll_face_min_images = max(1, _env_int("ENROLL_FACE_MIN_IMAGES", 5))
+        self.enroll_face_max_images = max(
+            self.enroll_face_min_images,
+            _env_int("ENROLL_FACE_MAX_IMAGES", 30),
+        )
+        self.enroll_video_sample_fps = _clamp(
+            _env_float("ENROLL_VIDEO_SAMPLE_FPS", 4.0), 3.0, 5.0, "ENROLL_VIDEO_SAMPLE_FPS"
+        )
 
 
 _load_local_env()
@@ -299,7 +368,56 @@ RATE_LIMIT_WINDOW_SECONDS = CONFIG.rate_limit_window_seconds
 RATE_LIMIT_MAX_PER_IP = CONFIG.rate_limit_max_per_ip
 RATE_LIMIT_MAX_PER_CAMERA = CONFIG.rate_limit_max_per_camera
 RATE_LIMIT_SKIP_LOOPBACK = CONFIG.rate_limit_skip_loopback
+METRICS_WINDOW_SIZE = CONFIG.metrics_window_size
+METRICS_LOG_INTERVAL = CONFIG.metrics_log_interval
 CORS_ALLOW_ORIGINS = CONFIG.cors_allow_origins
+
+# Observability
+LOG_FORMAT = CONFIG.log_format
+
+# External services
+DATABASE_URL = CONFIG.database_url
+S3_ENDPOINT = CONFIG.s3_endpoint
+S3_ACCESS_KEY = CONFIG.s3_access_key
+S3_SECRET_KEY = CONFIG.s3_secret_key
+S3_BUCKET_SNAPSHOTS = CONFIG.s3_bucket_snapshots
+S3_REGION = CONFIG.s3_region
+
+# Alert / email (S P1.3)
+SMTP_HOST = CONFIG.smtp_host
+SMTP_PORT = CONFIG.smtp_port
+SMTP_USER = CONFIG.smtp_user
+SMTP_PASSWORD = CONFIG.smtp_password
+SMTP_FROM = CONFIG.smtp_from
+ALERT_EMAIL_TO = CONFIG.alert_email_to
+ALERT_FALL_ENABLED = CONFIG.alert_fall_enabled
+# S P2.3
+ALERT_ZONE_VIOLATION_ENABLED = CONFIG.alert_zone_violation_enabled
+ALERT_DEDUPE_SEC = CONFIG.alert_dedupe_sec
+ALERT_MAX_RETRIES = CONFIG.alert_max_retries
+ALERT_RATE_LIMIT_MAX = CONFIG.alert_rate_limit_max
+ALERT_RATE_LIMIT_WINDOW_SEC = CONFIG.alert_rate_limit_window_sec
+# S P2.4
+RETENTION_DAYS = CONFIG.retention_days
+RETENTION_CHECK_HOURS = CONFIG.retention_check_hours
+# Edge durable outbox
+OUTBOX_DB_PATH = CONFIG.outbox_db_path
+OUTBOX_MAX_ATTEMPTS = CONFIG.outbox_max_attempts
+EDGE_SQLITE_PATH = CONFIG.edge_sqlite_path
+# S P2.1
+REID_MATCH_THRESHOLD = CONFIG.reid_match_threshold
+REID_AUTO_LINK_ENABLED = CONFIG.reid_auto_link_enabled
+# Face recognition
+ENABLE_FACE_RECOGNITION = CONFIG.enable_face_recognition
+FACE_MATCH_THRESHOLD = CONFIG.face_match_threshold
+FACE_RECOG_INTERVAL_FRAMES = CONFIG.face_recog_interval_frames
+FACE_MIN_PIXELS = CONFIG.face_min_pixels
+FACE_DET_SIZE = CONFIG.face_det_size
+FACE_MODEL_PACK = CONFIG.face_model_pack
+FACE_GALLERY_REFRESH_SEC = CONFIG.face_gallery_refresh_sec
+ENROLL_FACE_MIN_IMAGES = CONFIG.enroll_face_min_images
+ENROLL_FACE_MAX_IMAGES = CONFIG.enroll_face_max_images
+ENROLL_VIDEO_SAMPLE_FPS = CONFIG.enroll_video_sample_fps
 
 
 if DEVICE.startswith("cuda"):
@@ -313,9 +431,14 @@ if DEVICE.startswith("cuda"):
         pass
 
 
+# Apply log format now that CONFIG is fully initialised
+from .logging_setup import configure_logging  # noqa: E402 (late import to avoid circular deps)
+configure_logging(LOG_FORMAT)
+
+
 def log_config_summary() -> None:
     logger.info("=" * 60)
-    logger.info("YOLOv8 People Analytics Service")
+    logger.info("YOLO26 People Analytics Service")
     logger.info("=" * 60)
     logger.info(f"Port: {SERVICE_PORT}")
     logger.info(f"Host: {SERVICE_HOST}")
@@ -350,4 +473,12 @@ def log_config_summary() -> None:
         logger.info(f"  Angle Change Threshold: {FALL_ANGLE_CHANGE_THRESHOLD}°")
         logger.info(f"  Aspect Ratio Threshold: {FALL_ASPECT_RATIO_THRESHOLD}")
         logger.info(f"  Confidence Threshold: {FALL_CONFIDENCE_THRESHOLD}")
+    logger.info(f"Metrics: window={METRICS_WINDOW_SIZE} log_interval={METRICS_LOG_INTERVAL}")
+    logger.info("=" * 60)
+    logger.info(f"Log format: {LOG_FORMAT}")
+    logger.info(f"DB configured: {'postgres' if DATABASE_URL else 'edge-sqlite' if EDGE_SQLITE_PATH else 'no'}")
+    if not DATABASE_URL and EDGE_SQLITE_PATH:
+        logger.info(f"Edge SQLite path: {EDGE_SQLITE_PATH}")
+    logger.info(f"Object storage configured: {'yes' if S3_ENDPOINT else 'no'}")
+    logger.info(f"Email alerts: {'yes' if SMTP_HOST and ALERT_EMAIL_TO else 'no'}")
     logger.info("=" * 60)

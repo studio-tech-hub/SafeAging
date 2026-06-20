@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,24 +17,100 @@ namespace sample_company {
 namespace vms_server_plugins {
 namespace opencv_object_detection {
 
+struct AiServiceClientConfig
+{
+    static constexpr const char* kDefaultHost = "127.0.0.1";
+    static constexpr int kDefaultPort = 18000;
+    static constexpr bool kDefaultUseHttps = false;
+    static constexpr int kDefaultConnectTimeoutMs = 2000;
+    static constexpr int kDefaultReadTimeoutMs = 15000;
+    static constexpr int kDefaultWriteTimeoutMs = 2000;
+    static constexpr int kDefaultRetryCount = 3;
+    static constexpr int kDefaultRetryBackoffMs = 250;
+
+    // Transport settings for the local/remote analytics service. Auth uses X-API-Key.
+    std::string host = kDefaultHost;
+    int port = kDefaultPort;
+    std::string apiKey;
+    bool useHttps = kDefaultUseHttps;
+    int connectTimeoutMs = kDefaultConnectTimeoutMs;
+    int readTimeoutMs = kDefaultReadTimeoutMs;
+    int writeTimeoutMs = kDefaultWriteTimeoutMs;
+    int retryCount = kDefaultRetryCount;
+    int retryBackoffMs = kDefaultRetryBackoffMs;
+};
+
+struct DebugDumpConfig
+{
+    static constexpr const char* kDefaultDumpDir = "debug_frames";
+    static constexpr int kDefaultEveryNFrames = 1;
+
+    bool enabled = false;
+    std::string rootDir = kDefaultDumpDir;
+    bool dumpInput = false;
+    bool dumpOutput = false;
+    int everyNFrames = kDefaultEveryNFrames;
+};
+
+// Result of a GET /health probe — used by the plugin health poll thread.
+struct HealthCheckResult
+{
+    bool reachable = false;
+    std::string status = "unknown"; //< "healthy" | "degraded" | "not_ready" | "unknown"
+    std::vector<std::string> reason_codes;
+    std::map<std::string, std::string> dependencies;
+    std::string raw_error; //< Non-empty when reachable=false or parse failed
+};
+
+// Result of a GET /config/{camera_id} probe — used by the P2.2 config poll thread.
+struct CameraConfigFetch
+{
+    bool reachable = false;
+    std::string raw_error;
+    // Nullable per-camera overrides; -1 means "not provided / use service default".
+    float confidence_threshold = -1.0f;
+    float iou_threshold        = -1.0f;
+    int   frame_period         = -1;
+    std::string raw_json;
+};
+
 class ObjectDetector
 {
 public:
     ObjectDetector();
+    explicit ObjectDetector(const AiServiceClientConfig& serviceConfig);
 
     void ensureInitialized();
     bool isTerminated() const;
     void terminate();
+    void setServiceConfig(const AiServiceClientConfig& serviceConfig);
+    void setDebugDumpConfig(const DebugDumpConfig& debugConfig);
 
-    // Call the local Python analytics service using a camera id and encoded frame payload.
+    // Call the configured local/remote analytics service with camera id and encoded frame payload.
     DetectionList run(const std::string& cameraId, const std::vector<uint8_t>& jpegBytes);
 
+    // Probe GET /health — lightweight, never throws. Used by health poll thread.
+    HealthCheckResult checkHealth() const;
+
+    // Probe GET /config/{cameraId} — lightweight, never throws. Used by P2.2 config poll thread.
+    CameraConfigFetch fetchCameraConfig(const std::string& cameraId) const;
+
+    // P2.3 — Register/update camera metadata in the service via PUT /admin/camera-configs.
+    // Returns true on HTTP 200/201, false on any failure. Never throws.
+    bool registerCamera(const std::string& cameraId, const std::string& displayName) const;
+
 private:
+    AiServiceClientConfig serviceConfig() const;
+    DebugDumpConfig debugDumpConfig() const;
     DetectionList callPythonService(
         const std::string& cameraId,
         const std::vector<uint8_t>& jpegBytes);
 
 private:
+    mutable std::mutex m_serviceConfigMutex;
+    AiServiceClientConfig m_serviceConfig;
+    mutable std::mutex m_debugConfigMutex;
+    DebugDumpConfig m_debugConfig;
     bool m_terminated = false;
 };
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document collection provides a complete blueprint for developing the **Elderly Care Management System** - a professional-grade people management platform for nursing homes using YOLOv8 computer vision, face recognition, and intelligent alerting.
+This document collection provides a complete blueprint for developing the **Elderly Care Management System** - a professional-grade people management platform for nursing homes using YOLO26 computer vision, face recognition, and intelligent alerting.
 
 **Total Documentation:** 5 comprehensive guides  
 **Total Word Count:** 20,000+  

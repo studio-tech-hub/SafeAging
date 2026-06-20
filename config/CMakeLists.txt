@@ -1,9 +1,32 @@
 ## Copyright 2018-present Network Optix, Inc. Licensed under MPL 2.0: www.mozilla.org/MPL/2.0/
 
 cmake_minimum_required(VERSION 3.15)
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
-project(yolov8_people_analytics_plugin)
+
+# ── Single source of truth for version ───────────────────────────────────────
+# manifest.json "version" must match this. Build scripts derive the artifact
+# name from here. Bump all three in one place.
+project(yolo26_people_analytics_plugin VERSION 1.0.0 LANGUAGES CXX)
 set(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/..")
+
+# Static MSVC runtime: keeps the plugin .dll self-contained on Windows
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+
+# ── Generated artifacts ───────────────────────────────────────────────────────
+# plugin_version.h  → included by C++ sources that need compile-time version
+# version_info.json → bundled in the release artifact zip/tar
+string(TIMESTAMP _BUILD_TIMESTAMP UTC)
+configure_file(
+    "${CMAKE_CURRENT_LIST_DIR}/plugin_version.h.in"
+    "${CMAKE_BINARY_DIR}/include/plugin_version.h"
+    @ONLY
+)
+configure_file(
+    "${CMAKE_CURRENT_LIST_DIR}/version_info.json.in"
+    "${CMAKE_BINARY_DIR}/version_info.json"
+    @ONLY
+)
 
 set(metadataSdkVersion "6.0.6.41837")
 set(metadataSdkDir "" CACHE PATH
@@ -76,6 +99,27 @@ if(WIN32)
         "compiler.runtime=MT"
         "compiler.toolset=v142"
     )
+elseif(UNIX)
+    # Auto-detect GCC or Clang version for Conan 1.x settings
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        string(REGEX MATCH "^([0-9]+)" _ignored "${CMAKE_CXX_COMPILER_VERSION}")
+        set(CONAN_SETTINGS
+            "compiler=gcc"
+            "compiler.version=${CMAKE_MATCH_1}"
+            "compiler.libcxx=libstdc++11"
+        )
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        string(REGEX MATCH "^([0-9]+)" _ignored "${CMAKE_CXX_COMPILER_VERSION}")
+        set(CONAN_SETTINGS
+            "compiler=clang"
+            "compiler.version=${CMAKE_MATCH_1}"
+            "compiler.libcxx=libstdc++11"
+        )
+    endif()
+    # Qualcomm QCS5430 AI Box runs AArch64 — request the ARM64 Conan package
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+        list(APPEND CONAN_SETTINGS "arch=armv8")
+    endif()
 endif()
 
 set(OPENCV_OPTIONS
@@ -175,17 +219,22 @@ set(OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR
 file(GLOB_RECURSE OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/*)
 
-add_library(yolov8_people_analytics_plugin SHARED
+add_library(yolo26_people_analytics_plugin SHARED
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC})
-set_source_files_properties(
-    ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/object_tracker.cpp
-    PROPERTIES COMPILE_FLAGS "/Od"
-)
-target_include_directories(yolov8_people_analytics_plugin PRIVATE 
+# /Od (MSVC) disables optimizations on the tracker to ease debugging; GCC/Clang
+# use -O0 automatically in Debug builds so no equivalent flag is needed there.
+if(MSVC)
+    set_source_files_properties(
+        ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/object_tracker.cpp
+        PROPERTIES COMPILE_FLAGS "/Od"
+    )
+endif()
+target_include_directories(yolo26_people_analytics_plugin PRIVATE
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}
     ${PROJECT_ROOT}/3rd_party
+    ${CMAKE_BINARY_DIR}/include   # plugin_version.h (generated)
 )
-target_link_libraries(yolov8_people_analytics_plugin
+target_link_libraries(yolo26_people_analytics_plugin
     nx_kit
     nx_sdk
     opencv::core opencv::flann opencv::imgproc opencv::imgcodecs opencv::ml 
@@ -193,11 +242,28 @@ target_link_libraries(yolov8_people_analytics_plugin
 )
 
 if (WIN32)
-    target_link_libraries(yolov8_people_analytics_plugin
+    target_link_libraries(yolo26_people_analytics_plugin
         ws2_32
     )
 endif()
 
-target_compile_definitions(yolov8_people_analytics_plugin
+target_compile_definitions(yolo26_people_analytics_plugin
     PRIVATE NX_PLUGIN_API=${API_EXPORT_MACRO}
+)
+
+# ── Release artifact packaging ────────────────────────────────────────────────
+# Run:  cmake --install <buildDir> --prefix <destDir>
+# Produces a flat directory ready for deployment or zipping:
+#   <destDir>/yolo26_people_analytics_plugin.dll   (Windows)
+#   <destDir>/yolo26_people_analytics_plugin.so    (Linux)
+#   <destDir>/manifest.json
+#   <destDir>/version_info.json
+install(TARGETS yolo26_people_analytics_plugin
+    LIBRARY DESTINATION .    # .so on Linux
+    RUNTIME DESTINATION .    # .dll on Windows
+)
+install(FILES
+    "${CMAKE_CURRENT_LIST_DIR}/manifest.json"
+    "${CMAKE_BINARY_DIR}/version_info.json"
+    DESTINATION .
 )

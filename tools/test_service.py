@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for YOLOv8 Analytics Service
+Test script for YOLO26 Analytics Service
 
 Usage:
     python test_service.py --help
@@ -205,7 +205,7 @@ def test_all():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Test YOLOv8 Analytics Service",
+        description="Test YOLO26 Analytics Service",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

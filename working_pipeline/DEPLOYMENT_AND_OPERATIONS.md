@@ -179,7 +179,7 @@ services:
     environment:
       SERVICE_PORT: 18000
       SERVICE_HOST: 0.0.0.0
-      MODEL_PATH: yolov8n.pt
+      MODEL_PATH: yolo26n.pt
       CONFIDENCE_THRESHOLD: 0.45
       DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-elderly_care}
       REDIS_URL: redis://redis:6379/0
@@ -224,7 +224,7 @@ services:
     environment:
       SERVICE_PORT: 18001
       SERVICE_HOST: 0.0.0.0
-      MODEL_PATH: yolov8n.pt
+      MODEL_PATH: yolo26n.pt
       CONFIDENCE_THRESHOLD: 0.45
       DATABASE_URL: postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@postgres:5432/${DB_NAME:-elderly_care}
       REDIS_URL: redis://redis:6379/0
@@ -404,7 +404,7 @@ LOG_LEVEL=INFO
 LOG_FILE=/app/logs/service.log
 
 # Model
-MODEL_PATH=yolov8n.pt
+MODEL_PATH=yolo26n.pt
 CONFIDENCE_THRESHOLD=0.45
 IOU_THRESHOLD=0.45
 MIN_DETECTION_AREA=20
@@ -458,7 +458,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     
     # Model
-    model_path: str = "yolov8n.pt"
+    model_path: str = "yolo26n.pt"
     confidence_threshold: float = 0.45
     iou_threshold: float = 0.45
     min_detection_area: int = 20
@@ -720,7 +720,7 @@ python debug_frame_quality.py
 
 # Check model
 python -c "from ultralytics import YOLO; \
-  model = YOLO('yolov8n.pt'); \
+  model = YOLO('yolo26n.pt'); \
   print(model.info())"
 ```
 

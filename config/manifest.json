@@ -1,9 +1,9 @@
 {
-    "id": "mycompany.yolov8_people_analytics",
-    "name": "YOLOv8 People Analytics",
+    "id": "mycompany.yolo26_people_analytics",
+    "name": "YOLO26 People Analytics",
     "description": "Analytics plugin that forwards frames to the local Python people analytics service.",
     "version": "1.0.0",
-    "vendor": "HumanCounterV8",
+    "vendor": "SafeAging",
     "engineSettingsModel": {
         "type": "Settings",
         "items": []
@@ -12,38 +12,161 @@
         "type": "Settings",
         "items": [
             {
-                "type": "Switch",
+                "type": "CheckBox",
                 "name": "enabled",
                 "caption": "Enable Detection",
                 "defaultValue": true
             },
             {
-                "type": "Number",
+                "type": "SpinBox",
                 "name": "detection_frame_period",
                 "caption": "Detection Frame Period",
-                "defaultValue": 1,
-                "description": "Run detection every Nth frame."
+                "defaultValue": 2,
+                "description": "Run detection every Nth frame (2 = every other frame)."
             },
             {
-                "type": "Number",
+                "type": "SpinBox",
                 "name": "target_enqueue_fps",
                 "caption": "Target Enqueue FPS",
-                "defaultValue": 10,
-                "description": "Max frame enqueue rate to AI worker."
+                "defaultValue": 3,
+                "description": "Max frame enqueue rate to AI worker. Use 2-3 on CPU/dev; 5-8 on AI Box after tuning."
             },
             {
-                "type": "Number",
+                "type": "SpinBox",
                 "name": "frame_queue_max_size",
                 "caption": "Frame Queue Max Size",
-                "defaultValue": 2,
-                "description": "Max buffered frames before dropping oldest."
+                "defaultValue": 1,
+                "description": "Max buffered frames before dropping oldest (1 = prefer freshest frame)."
             },
             {
-                "type": "Number",
+                "type": "SpinBox",
                 "name": "metrics_log_period_sec",
                 "caption": "Metrics Period (sec)",
                 "defaultValue": 10,
                 "description": "Periodic pipeline metrics interval."
+            },
+            {
+                "type": "TextField",
+                "name": "service_host",
+                "caption": "Service Host",
+                "defaultValue": "127.0.0.1",
+                "description": "Host name or IP address of the Python analytics service."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_port",
+                "caption": "Service Port",
+                "defaultValue": 18000,
+                "description": "TCP port of the Python analytics service."
+            },
+            {
+                "type": "PasswordField",
+                "name": "service_api_key",
+                "caption": "Service API Key",
+                "defaultValue": "",
+                "description": "Optional X-API-Key header value sent to the analytics service."
+            },
+            {
+                "type": "CheckBox",
+                "name": "service_use_https",
+                "caption": "Use HTTPS",
+                "defaultValue": false,
+                "description": "Enable HTTPS when connecting to the analytics service."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_connect_timeout_ms",
+                "caption": "Connect Timeout (ms)",
+                "defaultValue": 2000,
+                "description": "Socket connect timeout for analytics service requests."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_read_timeout_ms",
+                "caption": "Read Timeout (ms)",
+                "defaultValue": 15000,
+                "description": "Response read timeout for analytics service requests."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_write_timeout_ms",
+                "caption": "Write Timeout (ms)",
+                "defaultValue": 2000,
+                "description": "Request body write timeout for analytics service requests."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_retry_count",
+                "caption": "Retry Count",
+                "defaultValue": 3,
+                "description": "Number of retry attempts after the initial request."
+            },
+            {
+                "type": "SpinBox",
+                "name": "service_retry_backoff_ms",
+                "caption": "Retry Backoff (ms)",
+                "defaultValue": 250,
+                "description": "Delay between analytics service retry attempts."
+            },
+            {
+                "type": "CheckBox",
+                "name": "debug_dump_enabled",
+                "caption": "Debug Frame Dump Enabled",
+                "defaultValue": false,
+                "description": "Enable frame dumping to disk for debugging (default off)."
+            },
+            {
+                "type": "TextField",
+                "name": "debug_dump_dir",
+                "caption": "Debug Dump Directory",
+                "defaultValue": "debug_frames",
+                "description": "Relative path for debug frame dump directory."
+            },
+            {
+                "type": "CheckBox",
+                "name": "debug_dump_input",
+                "caption": "Debug Dump Input Frames",
+                "defaultValue": false,
+                "description": "Dump input frames (when debug enabled)."
+            },
+            {
+                "type": "CheckBox",
+                "name": "debug_dump_output",
+                "caption": "Debug Dump Output Frames",
+                "defaultValue": false,
+                "description": "Dump output frames with bounding boxes (when debug enabled)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "debug_dump_every_n_frames",
+                "caption": "Debug Dump Every N Frames",
+                "defaultValue": 1,
+                "description": "Sample rate for frame dumping (1 = every frame, 10 = every 10th frame)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "queue_depth_warn_pct",
+                "caption": "Queue Depth Warning (%)",
+                "defaultValue": 80,
+                "minValue": 0,
+                "maxValue": 100,
+                "description": "Emit a warning diagnostic when queue depth exceeds this percentage of its maximum capacity (0 = disabled)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "drop_rate_warn_per_sec",
+                "caption": "Drop Rate Warning (frames/sec)",
+                "defaultValue": 5,
+                "minValue": 0,
+                "description": "Emit a warning diagnostic when the frame drop rate exceeds this threshold (0 = disabled)."
+            },
+            {
+                "type": "SpinBox",
+                "name": "health_poll_interval_sec",
+                "caption": "Health Poll Interval (sec)",
+                "defaultValue": 30,
+                "minValue": 5,
+                "description": "How often the plugin polls GET /health and emits diagnostic events on status changes."
             }
         ]
     },
@@ -52,31 +175,36 @@
     ],
     "supportedObjectTypes": [
         {
-            "id": "mycompany.yolov8_people_analytics.person",
-            "name": "Person"
+            "id": "mycompany.yolo26_people_analytics.person",
+            "name": "HUMAN DETECTED"
         },
         {
-            "id": "mycompany.yolov8_people_analytics.cat",
+            "id": "mycompany.yolo26_people_analytics.cat",
             "name": "Cat"
         },
         {
-            "id": "mycompany.yolov8_people_analytics.dog",
+            "id": "mycompany.yolo26_people_analytics.dog",
             "name": "Dog"
         }
     ],
     "supportedEventTypes": [
         {
-            "id": "mycompany.yolov8_people_analytics.detection",
+            "id": "mycompany.yolo26_people_analytics.detection",
             "name": "Object detected"
         },
         {
-            "id": "mycompany.yolov8_people_analytics.prolongedDetection",
+            "id": "mycompany.yolo26_people_analytics.prolongedDetection",
             "name": "Object detected (prolonged)",
             "flags": "stateDependent"
         },
         {
-            "id": "mycompany.yolov8_people_analytics.fallDetected",
+            "id": "mycompany.yolo26_people_analytics.fallDetected",
             "name": "Fall detected",
+            "flags": "stateDependent"
+        },
+        {
+            "id": "mycompany.yolo26_people_analytics.zoneViolation",
+            "name": "Zone violation",
             "flags": "stateDependent"
         }
     ]

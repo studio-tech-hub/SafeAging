@@ -27,9 +27,19 @@ struct Detection
     const std::string classLabel;
     const float confidence;
     const nx::sdk::Uuid trackId;
-    const bool fallDetected;  // Fall detection flag from the Python service
-    const bool stable;        // Service-confirmed track that plugin may use for lifecycle events
-    const bool degraded;      // Fallback/raw detection; render only, no lifecycle events
+    const bool fallDetected;    //< Fall detection flag from the Python service
+    const bool stable;          //< Service-confirmed track; may use for lifecycle events
+    const bool degraded;        //< Fallback/raw detection; render only, no lifecycle events
+    // P2.1 — zone violation data from zone_engine
+    const bool zoneViolation = false;       //< Person entered a forbidden/entry/exit zone
+    const std::string zoneType{};           //< "forbidden" | "entry" | "exit" | ""
+    const std::string zoneId{};             //< UUID string of the violated zone, or ""
+    // Face recognition identity from the service (rendered on the bounding box).
+    const bool recognized = false;          //< True if matched to a known person
+    const std::string personName{};         //< "Ông A" / "Bà B" / "Unknown"
+    const std::string personGender{};       //< "Nam" | "Nữ" | ""
+    const std::string personId{};           //< Person UUID string, or ""
+    const int personNo = -1;                //< Stable per-camera person index; -1 = none
 };
 
 using DetectionList = std::vector<std::shared_ptr<Detection>>;

@@ -98,35 +98,51 @@ private:
         int64_t timestampUs);
 
 private:
-    const std::string kPersonObjectType = "nx.base.Person";
-    const std::string kCatObjectType = "nx.base.Cat";
-    const std::string kDogObjectType = "nx.base.Dog";
+    const std::string kPersonObjectType = "mycompany.yolo26_people_analytics.person";
+    const std::string kCatObjectType = "mycompany.yolo26_people_analytics.cat";
+    const std::string kDogObjectType = "mycompany.yolo26_people_analytics.dog";
 
-    const std::string kDetectionEventType = "sample.opencv_object_detection.detection";
+    const std::string kDetectionEventType = "mycompany.yolo26_people_analytics.detection";
     const std::string kDetectionEventCaptionSuffix = " detected";
     const std::string kDetectionEventDescriptionSuffix = " detected";
 
     const std::string kProlongedDetectionEventType =
-        "sample.opencv_object_detection.prolongedDetection";
+        "mycompany.yolo26_people_analytics.prolongedDetection";
 
-    const std::string kFallDetectedEventType = "mycompany.yolov8_people_analytics.fallDetected";
+    const std::string kFallDetectedEventType = "mycompany.yolo26_people_analytics.fallDetected";
+    const std::string kZoneViolationEventType = "mycompany.yolo26_people_analytics.zoneViolation"; // P2.1
 
     static constexpr int kQueueWarningThrottleSec = 30;
     static constexpr int kMetricsDiagThrottleSec = 30;
     static constexpr int kAiServiceErrorDiagThrottleSec = 30;
+    static constexpr int kThresholdWarnThrottleSec = 60;
 
-    static constexpr int kDefaultDetectionFramePeriod = 1;
-    static constexpr int kDefaultTargetEnqueueFps = 10;
-    static constexpr size_t kDefaultFrameQueueMaxSize = 2;
+    static constexpr int kDefaultDetectionFramePeriod = 2;
+    static constexpr int kDefaultTargetEnqueueFps = 3;
+    static constexpr size_t kDefaultFrameQueueMaxSize = 1;
     static constexpr int kDefaultMetricsLogPeriodSec = 10;
-    static constexpr int kAcquireBoostEnqueueFps = 10;
+
+    // P P1.4 – configurable threshold defaults
+    static constexpr int kDefaultQueueDepthWarnPct = 80;
+    static constexpr int kDefaultDropRateWarnPerSec = 5;
+
+    // P P1.1 – health poll thread defaults
+    static constexpr int kDefaultHealthPollIntervalSec = 30;
+    static constexpr int kHealthPollInitialDelaySec = 15;
+    // When no tracks are rendered yet, allow a modest boost (not 10 fps — overloads CPU infer).
+    static constexpr int kAcquireBoostEnqueueFps = 4;
+
+    // P2.2 – per-camera config poll defaults
+    static constexpr int kDefaultConfigPollIntervalSec = 300; // 5 minutes
+    static constexpr int kConfigPollInitialDelaySec = 10;
 
 private:
     bool m_terminated = false;
     bool m_terminatedPrevious = false;
 
     std::filesystem::path m_pluginHomeDir;
-    std::string m_cameraName;
+    std::string m_cameraName; //< Human-readable display name (may change on rename)
+    std::string m_cameraId;   //< Stable identity key sent to the service (Nx UUID)
 
     const std::unique_ptr<ObjectDetector> m_objectDetector;
     std::unique_ptr<ObjectTracker> m_objectTracker;
@@ -145,6 +161,21 @@ private:
     std::thread m_workerThread;
     bool m_workerShouldStop = false;
 
+    // P P1.1 – health poll thread
+    std::thread m_healthPollThread;
+    std::atomic<bool> m_healthPollShouldStop{false};
+    std::mutex m_healthPollMutex;
+    std::condition_variable m_healthPollCV;
+    void healthPollThreadRun();
+
+    // P2.2 – per-camera config poll thread
+    std::thread m_configPollThread;
+    std::atomic<bool> m_configPollShouldStop{false};
+    std::mutex m_configPollMutex;
+    std::condition_variable m_configPollCV;
+    std::atomic<int> m_configPollIntervalSec{kDefaultConfigPollIntervalSec};
+    void configPollThreadRun();
+
     std::mutex m_metadataQueueMutex;
     nx::sdk::Ptr<nx::sdk::analytics::ObjectMetadataPacket> m_latestObjectMetadataPacket;
     std::deque<nx::sdk::Ptr<nx::sdk::analytics::IMetadataPacket>> m_metadataQueue;
@@ -156,6 +187,7 @@ private:
 
     std::mutex m_lifecycleStateMutex;
     std::set<nx::sdk::Uuid> m_activeFallDetectedTrackIds;
+    std::set<nx::sdk::Uuid> m_activeZoneViolationTrackIds; // P2.1
     bool m_personDetectionActive = false;
 
     std::atomic<uint64_t> m_inFrameCount{0};
@@ -186,6 +218,20 @@ private:
     std::atomic<int> m_lastEffectiveEnqueueFps{kDefaultTargetEnqueueFps};
     std::atomic<bool> m_detectionEnabled{true};
     std::atomic<bool> m_detectionDisableCleanupPending{false};
+
+    // P P1.4 – configurable warning thresholds
+    std::atomic<int> m_queueDepthWarnPct{kDefaultQueueDepthWarnPct};
+    std::atomic<int> m_dropRateWarnPerSec{kDefaultDropRateWarnPerSec};
+
+    // P P1.1 – health poll interval (seconds)
+    std::atomic<int> m_healthPollIntervalSec{kDefaultHealthPollIntervalSec};
+    std::chrono::steady_clock::time_point m_lastQueueDepthThresholdWarnTime =
+        std::chrono::steady_clock::time_point::min();
+    std::chrono::steady_clock::time_point m_lastDropRateThresholdWarnTime =
+        std::chrono::steady_clock::time_point::min();
+
+    std::mutex m_debugConfigMutex;
+    DebugDumpConfig m_debugConfig;
 };
 
 } // namespace opencv_object_detection

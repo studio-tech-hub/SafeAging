@@ -87,7 +87,13 @@ inline std::string configuredLogFilePath()
             return std::string(env);
 
 #ifdef _WIN32
-        return std::string(R"(D:\SafeAging\logs\plugin.log)");
+        // Use %TEMP% so the path works on any Windows machine, not just dev.
+        const char* tmpDir = std::getenv("TEMP");
+        if (!tmpDir || !*tmpDir)
+            tmpDir = std::getenv("TMP");
+        if (tmpDir && *tmpDir)
+            return std::string(tmpDir) + "\\safeaging_plugin.log";
+        return std::string("C:\\Temp\\safeaging_plugin.log");
 #else
         return std::string("/tmp/safeaging_plugin.log");
 #endif

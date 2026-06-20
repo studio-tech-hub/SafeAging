@@ -1,20 +1,50 @@
-# YOLOv8 People Analytics Service Requirements
-# Python 3.8+ required
+# SafeAging Analytics Service — Python dependencies
+# Python 3.11+ required
+#
+# NOTE: torch/torchvision are installed separately in the Dockerfile
+# with the correct index URL for the target platform (CPU-only).
 
-# Web Framework
+# ── Web framework ─────────────────────────────────────────────────────────────
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
+python-multipart>=0.0.9
 
-# Computer Vision & Deep Learning
-opencv-python==4.8.1.78
+# ── Computer vision / AI ──────────────────────────────────────────────────────
+# opencv-python-headless: no Qt/GUI — safe in Docker and WSL
+opencv-python-headless==4.8.1.78
 numpy==1.24.3
-torch>=2.0.0  # Core dependency for YOLOv8
-ultralytics==8.0.207
-Pillow>=9.0.0  # Image processing
+# torch and torchvision are installed by Dockerfile before this file
+torch>=2.0.0
+# ultralytics>=8.4.0 required for YOLO26 (yolo26n.pt default model)
+ultralytics>=8.4.0
+Pillow>=9.0.0
 
-# HTTP Requests
+# ── Face recognition (real-time identity) ────────────────────────────────────
+# insightface provides SCRFD (detector) + ArcFace (recogniser) model packs.
+# onnxruntime: required for yolo26n.onnx inference (AI Box ARM64 / edge CPU).
+insightface==0.7.3
+onnxruntime>=1.16.0
+
+# ── HTTP ──────────────────────────────────────────────────────────────────────
 requests>=2.28.0
+httpx>=0.27.0
 
-# Performance monitoring
+# ── Database (PostgreSQL) — Service P1.1 ─────────────────────────────────────
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+asyncpg>=0.29.0          # async driver for FastAPI endpoints
+psycopg2-binary>=2.9.9   # sync driver for Alembic migrations
+
+# ── Observability — Service P1.5 ─────────────────────────────────────────────
+prometheus-client>=0.20.0
+
+# ── Object storage (MinIO/S3) — Service P1.3 ─────────────────────────────────
+boto3>=1.34.0
+
+# ── System monitoring ─────────────────────────────────────────────────────────
 psutil>=5.9.6
+
+# ── Testing — Service P1.4 ────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

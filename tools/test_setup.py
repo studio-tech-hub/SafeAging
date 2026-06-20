@@ -13,7 +13,7 @@ from pathlib import Path
 def test_config():
     """Test if configuration is valid"""
     print("=" * 60)
-    print("YOLOv8 Wide-Angle Optimization - Configuration Test")
+    print("YOLO26 Wide-Angle Optimization - Configuration Test")
     print("=" * 60)
     print()
     
@@ -28,17 +28,17 @@ def test_config():
         print("   ✅ service.py found")
         tests_passed += 1
     else:
-        print("   ❌ service.py NOT found - run from yolov8_people_analytics_plugin folder")
+        print("   ❌ service.py NOT found - run from yolo26_people_analytics_plugin folder")
     print()
     
     # Test 2: Check if YOLO model exists
     print("2️⃣  Checking YOLO model...")
     tests_total += 1
-    if os.path.exists("yolov8n.pt"):
-        print("   ✅ yolov8n.pt found")
+    if os.path.exists("yolo26n.pt"):
+        print("   ✅ yolo26n.pt found")
         tests_passed += 1
     else:
-        print("   ⚠️  yolov8n.pt not found (will download on first run)")
+        print("   ⚠️  yolo26n.pt not found (will download on first run)")
     print()
     
     # Test 3: Check camera calibration
@@ -224,7 +224,7 @@ def main():
     print()
     print("╔" + "=" * 58 + "╗")
     print("║" + " " * 58 + "║")
-    print("║" + "  YOLOv8 Wide-Angle Optimization Setup Checker".center(58) + "║")
+    print("║" + "  YOLO26 Wide-Angle Optimization Setup Checker".center(58) + "║")
     print("║" + " " * 58 + "║")
     print("╚" + "=" * 58 + "╝")
     print()

@@ -14,7 +14,9 @@ def load_model():
         return model
 
     try:
-        logger.info(f"Loading YOLO model from: {MODEL_PATH}")
+        suffix = MODEL_PATH.rsplit(".", 1)[-1].lower() if "." in MODEL_PATH else "pt"
+        backend = "onnxruntime" if suffix == "onnx" else "pytorch"
+        logger.info(f"Loading YOLO model from: {MODEL_PATH} (backend={backend})")
 
         original_torch_load = torch.load
 
