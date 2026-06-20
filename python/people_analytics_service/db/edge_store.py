@@ -259,6 +259,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(persons)")}
     if "date_of_birth" not in cols:
         conn.execute("ALTER TABLE persons ADD COLUMN date_of_birth TEXT")
+        conn.commit()
 
 
 def is_initialized() -> bool:
@@ -277,6 +278,7 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    _migrate_schema(conn)
     return conn
 
 
@@ -298,11 +300,13 @@ def _date_to_str(value: date | str | None) -> str | None:
 
 
 def _row_person(row: sqlite3.Row) -> PersonRecord:
+    keys = row.keys()
+    dob_raw = row["date_of_birth"] if "date_of_birth" in keys else None
     return PersonRecord(
         id=_parse_uuid(row["id"]),  # type: ignore[arg-type]
         name=row["name"],
         age=row["age"],
-        date_of_birth=_parse_date(row["date_of_birth"]),
+        date_of_birth=_parse_date(dob_raw),
         gender=row["gender"],
         notes=row["notes"],
         room=row["room"],

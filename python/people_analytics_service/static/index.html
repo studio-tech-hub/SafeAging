@@ -72,7 +72,7 @@
   <div class="field"><label>Gender</label>
     <select id="enrollGender"><option value="">—</option><option value="Male">Male</option><option value="Female">Female</option></select></div>
   <div class="row" style="gap:10px">
-    <div class="field" style="flex:1"><label>Date of birth</label><input id="enrollDob" type="date"></div>
+    <div class="field" style="flex:1"><label>Date of birth <span class="muted" style="font-weight:400">(MM/DD/YYYY)</span></label><input id="enrollDob" type="date" title="MM/DD/YYYY"></div>
     <div class="field" style="flex:1"><label>Room</label><input id="enrollRoom" placeholder="Room"></div>
   </div>
   <div class="row" style="justify-content:flex-end;margin-top:8px">
@@ -85,14 +85,16 @@
 
 <script>
 const API = location.origin;
-const TABS = [
+const ALL_TABS = [
   ["dashboard","Overview"],
   ["live","Live & Enroll"],
   ["persons","People"],
   ["events","Events"],
   ["zones","Zones"],
 ];
-let current = "dashboard";
+const HIDDEN_TABS = new Set(["dashboard","live","events"]);
+const TABS = ALL_TABS.filter(([id]) => !HIDDEN_TABS.has(id));
+let current = "persons";
 
 function saveKey(){ localStorage.setItem("safeaging_key", document.getElementById("apiKey").value.trim()); toast("API key saved"); render(); }
 function key(){ return localStorage.getItem("safeaging_key")||""; }
@@ -104,9 +106,9 @@ function dobValue(elId){
 }
 function formatDob(iso){
   if(!iso) return "";
-  const d=new Date(String(iso).slice(0,10)+"T00:00:00");
-  if(Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString("en-US");
+  const p=String(iso).slice(0,10).split("-");
+  if(p.length!==3) return iso;
+  return `${p[1].padStart(2,"0")}/${p[2].padStart(2,"0")}/${p[0]}`;
 }
 function calcAgeFromIso(iso){
   if(!iso) return "";
@@ -232,12 +234,12 @@ async function renderPersons(){
   let html='<div class="card"><h3>Add person (photos or video)</h3><div class="row">'+
     '<input id="pName" placeholder="Full name">'+
     '<select id="pGender"><option value="">Gender</option><option value="Male">Male</option><option value="Female">Female</option></select>'+
-    '<input id="pDob" type="date" title="Date of birth">'+
+    '<input id="pDob" type="date" title="MM/DD/YYYY" aria-label="Date of birth MM/DD/YYYY">'+
     '<input id="pRoom" placeholder="Room">'+
     '<input id="pFile" type="file" accept="image/*,video/*" multiple>'+
     '<button id="pSubmit" onclick="addPersonWithFace()">Create + enroll face</button></div>'+
     '<p class="muted">Photos: pick <b>5–30</b> clear face images. Video: one clip — frames sampled ~4 fps (max 30), need ≥5 frames with a face. '+
-    'Pick a <b>date of birth</b> — age is calculated automatically. Face processing may take 1–3 minutes — <b>click once only</b>.</p></div>';
+    'Pick a <b>date of birth</b> (MM/DD/YYYY) — age is calculated automatically. Face processing may take 1–3 minutes — <b>click once only</b>.</p></div>';
   html+='<div class="card"><h3>People ('+ps.length+')</h3><table><tr><th>Name</th><th>Gender</th><th>Date of birth</th><th>Age</th><th>Room</th><th>Status</th><th></th></tr>';
   ps.forEach(p=>{ const age=p.age??calcAgeFromIso(p.date_of_birth);
     html+=`<tr><td>${p.name}</td><td>${p.gender||""}</td><td>${formatDob(p.date_of_birth)}</td><td>${age??""}</td><td>${p.room||""}</td>
