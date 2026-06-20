@@ -15,6 +15,22 @@
   input, select, button, textarea { font:inherit; }
   input, select, textarea { background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
   input[type="date"] { color-scheme:dark; min-width:10.5rem; }
+  .date-field { position:relative; display:inline-block; min-width:10.5rem; vertical-align:middle; }
+  .date-field input[type="date"] {
+    width:100%; min-width:10.5rem; position:relative; z-index:1;
+    background:var(--panel2);
+  }
+  .date-field input[type="date"]:not(.has-value) { color:transparent; }
+  .date-field input[type="date"]:focus,
+  .date-field input[type="date"].has-value { color:var(--txt); }
+  .date-field input[type="date"]:not(.has-value)::-webkit-datetime-edit { opacity:0; }
+  .date-field input[type="date"]::-webkit-calendar-picker-indicator { cursor:pointer; z-index:2; position:relative; }
+  .date-field .date-format-hint {
+    position:absolute; left:10px; top:50%; transform:translateY(-50%);
+    color:var(--muted); pointer-events:none; z-index:0; letter-spacing:0.02em;
+  }
+  .date-field input[type="date"]:focus ~ .date-format-hint,
+  .date-field input[type="date"].has-value ~ .date-format-hint { display:none; }
   button { background:var(--accent); color:#062a3a; border:0; border-radius:8px; padding:8px 14px; cursor:pointer; font-weight:600; }
   button.secondary { background:var(--panel2); color:var(--txt); border:1px solid var(--line); }
   button:hover { filter:brightness(1.05); }
@@ -72,7 +88,8 @@
   <div class="field"><label>Gender</label>
     <select id="enrollGender"><option value="">—</option><option value="Male">Male</option><option value="Female">Female</option></select></div>
   <div class="row" style="gap:10px">
-    <div class="field" style="flex:1"><label>Date of birth <span class="muted" style="font-weight:400">(MM/DD/YYYY)</span></label><input id="enrollDob" type="date" title="MM/DD/YYYY"></div>
+    <div class="field" style="flex:1"><label>Date of birth</label>
+      <span class="date-field"><input id="enrollDob" type="date"><span class="date-format-hint">MM/DD/YYYY</span></span></div>
     <div class="field" style="flex:1"><label>Room</label><input id="enrollRoom" placeholder="Room"></div>
   </div>
   <div class="row" style="justify-content:flex-end;margin-top:8px">
@@ -119,6 +136,20 @@ function calcAgeFromIso(iso){
   const m=today.getMonth()+1, day=today.getDate();
   if(m<p[1]||(m===p[1]&&day<p[2])) age--;
   return age>=0?age:"";
+}
+function dateFieldHtml(id){
+  return `<span class="date-field"><input id="${id}" type="date"><span class="date-format-hint">MM/DD/YYYY</span></span>`;
+}
+function wireDateInput(input){
+  if(!input || input.dataset.wired) return;
+  input.dataset.wired="1";
+  const sync=()=>input.classList.toggle("has-value", !!input.value);
+  input.addEventListener("input", sync);
+  input.addEventListener("change", sync);
+  sync();
+}
+function wireDateInputs(root=document){
+  root.querySelectorAll('input[type="date"]').forEach(wireDateInput);
 }
 
 async function api(path, opts={}){
@@ -209,7 +240,9 @@ function openEnroll(cam,track,hasCrop){
   document.getElementById("enrollName").value="";
   document.getElementById("enrollGender").value="";
   document.getElementById("enrollDob").value="";
+  document.getElementById("enrollDob").classList.remove("has-value");
   document.getElementById("enrollRoom").value="";
+  wireDateInput(document.getElementById("enrollDob"));
   document.getElementById("enrollDlg").showModal();
 }
 async function submitEnroll(){
@@ -234,7 +267,7 @@ async function renderPersons(){
   let html='<div class="card"><h3>Add person (photos or video)</h3><div class="row">'+
     '<input id="pName" placeholder="Full name">'+
     '<select id="pGender"><option value="">Gender</option><option value="Male">Male</option><option value="Female">Female</option></select>'+
-    '<input id="pDob" type="date" title="MM/DD/YYYY" aria-label="Date of birth MM/DD/YYYY">'+
+    dateFieldHtml("pDob")+
     '<input id="pRoom" placeholder="Room">'+
     '<input id="pFile" type="file" accept="image/*,video/*" multiple>'+
     '<button id="pSubmit" onclick="addPersonWithFace()">Create + enroll face</button></div>'+
@@ -246,6 +279,7 @@ async function renderPersons(){
     <td>${p.status}</td><td><button class="secondary" onclick="delPerson('${p.id}')">Remove</button></td></tr>`; });
   html+='</table></div>';
   el.innerHTML=html;
+  wireDateInputs(el);
 }
 async function addPersonWithFace(){
   if(_addingPerson){ toast("Processing, please wait…"); return; }
@@ -282,6 +316,7 @@ async function addPersonWithFace(){
     toast(`Added ${p.name}: ${batch.embeddings_created} face template(s) (${batch.frames_with_face}/${batch.frames_processed} frames)`);
     document.getElementById("pName").value="";
     document.getElementById("pDob").value="";
+    document.getElementById("pDob").classList.remove("has-value");
     document.getElementById("pFile").value="";
     render();
   }catch(e){ toast("Error: "+e.message); }
@@ -357,6 +392,7 @@ async function delZone(id){ if(!confirm("Disable this zone?"))return;
   try{ await api(`/admin/zones/${id}`,{method:"DELETE"}); toast("Zone disabled"); render(); }catch(e){ toast(e.message); } }
 
 render();
+wireDateInput(document.getElementById("enrollDob"));
 setInterval(()=>{ if(current==="live") renderLive().catch(()=>{}); }, 4000);
 </script>
 </body>
