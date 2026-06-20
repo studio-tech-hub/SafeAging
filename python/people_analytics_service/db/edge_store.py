@@ -256,6 +256,10 @@ def init_edge_store(path: str) -> None:
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='persons'"
+    ).fetchone() is None:
+        return
     cols = {row[1] for row in conn.execute("PRAGMA table_info(persons)")}
     if "date_of_birth" not in cols:
         conn.execute("ALTER TABLE persons ADD COLUMN date_of_birth TEXT")

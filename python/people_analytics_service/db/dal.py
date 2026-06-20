@@ -25,10 +25,10 @@ from .models import Alert, CameraConfig, Event, Person, PersonEmbedding, Zone
 from .session import is_edge_mode
 
 
-async def _edge_call(name: str, *args, **kwargs):
+async def _edge_call(func_name: str, *args, **kwargs):
     from . import edge_dal
 
-    return await getattr(edge_dal, name)(*args, **kwargs)
+    return await getattr(edge_dal, func_name)(*args, **kwargs)
 
 
 # ── Person ────────────────────────────────────────────────────────────────────
