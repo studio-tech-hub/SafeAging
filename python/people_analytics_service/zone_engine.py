@@ -171,6 +171,7 @@ def check_zones(detections: list, zones: list, camera_id: str) -> list[ZoneViola
         prev_inside: frozenset = cam_state.get(track_id, frozenset())
         currently_inside: set[str] = set()
         det_violations: list[ZoneViolation] = []
+        display_zone_name: str | None = None
 
         for zone in zones:
             geometry = zone.geometry or {}
@@ -183,6 +184,8 @@ def check_zones(detections: list, zones: list, camera_id: str) -> list[ZoneViola
 
             if inside:
                 currently_inside.add(zone_id_str)
+                if display_zone_name is None:
+                    display_zone_name = zone.name
 
             if zone.zone_type == "forbidden":
                 # Fire once on first entry; re-fire if they leave and return.
@@ -197,6 +200,9 @@ def check_zones(detections: list, zones: list, camera_id: str) -> list[ZoneViola
             # roi: no violation
 
         new_state[track_id] = frozenset(currently_inside)
+
+        if display_zone_name:
+            det.zone_name = display_zone_name
 
         if det_violations:
             primary = det_violations[0]

@@ -162,6 +162,7 @@ class Detection(BaseModel):
     # P2.2 — Zone engine fields
     zone_id: Optional[str] = None
     zone_type: Optional[str] = None
+    zone_name: Optional[str] = None
     zone_violation: bool = False
     # Face recognition / identity fields — consumed by the NX plugin to render
     # "(Ông A, Nam, No.1)" on the bounding box. Null/Unknown when not recognised.

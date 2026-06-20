@@ -34,6 +34,7 @@ struct Detection
     const bool zoneViolation = false;       //< Person entered a forbidden/entry/exit zone
     const std::string zoneType{};           //< "forbidden" | "entry" | "exit" | ""
     const std::string zoneId{};             //< UUID string of the violated zone, or ""
+    const std::string zoneName{};           //< Human-readable zone name from admin UI, or ""
     // Face recognition identity from the service (rendered on the bounding box).
     const bool recognized = false;          //< True if matched to a known person
     const std::string personName{};         //< "Ông A" / "Bà B" / "Unknown"

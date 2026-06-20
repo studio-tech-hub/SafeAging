@@ -1884,91 +1884,36 @@ namespace sample_company
         if (detection->classLabel == "person")
         {
             objectMetadata->setTypeId(kPersonObjectType);
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::number,
-                "Count Detect",
-                std::to_string(m_currentPersons)));
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::number,
-                "Fall Detect",
-                detection->fallDetected ? "1" : "0"));
 
-            // P2.1 — zone violation attributes
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::string,
-                "Zone Violation",
-                detection->zoneViolation ? "true" : "false"));
-            if (detection->zoneViolation && !detection->zoneType.empty())
+            const auto displayOrUnknown = [](const std::string& value) -> std::string
             {
-                objectMetadata->addAttribute(makePtr<Attribute>(
-                    IAttribute::Type::string,
-                    "Zone Type",
-                    detection->zoneType));
-            }
+                return value.empty() ? std::string("Unknown") : value;
+            };
 
-            // P2.1 — severity: critical if fall + zone violation, high if either, normal otherwise
-            const std::string severity =
-                (detection->fallDetected && detection->zoneViolation) ? "critical" :
-                (detection->fallDetected || detection->zoneViolation) ? "high" : "normal";
+            const std::string displayName = displayOrUnknown(detection->personName);
+            const std::string displayGender = displayOrUnknown(detection->personGender);
+            const std::string displayAge =
+                detection->personAge >= 0
+                    ? std::to_string(detection->personAge)
+                    : std::string("Unknown");
+            const std::string displayZoneName = displayOrUnknown(detection->zoneName);
+
             objectMetadata->addAttribute(makePtr<Attribute>(
                 IAttribute::Type::string,
-                "Severity",
-                severity));
-
-            // Face recognition identity — rendered as "(Ông A, Nam, No. 1)".
-            const std::string displayName =
-                !detection->personName.empty() ? detection->personName : std::string("Unknown");
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::string,
-                "Person Name",
+                "Person name",
                 displayName));
-            if (detection->recognized)
-            {
-                if (!detection->personGender.empty())
-                {
-                    objectMetadata->addAttribute(makePtr<Attribute>(
-                        IAttribute::Type::string,
-                        "Gender",
-                        detection->personGender));
-                }
-                if (detection->personNo >= 0)
-                {
-                    objectMetadata->addAttribute(makePtr<Attribute>(
-                        IAttribute::Type::number,
-                        "Person No.",
-                        std::to_string(detection->personNo)));
-                }
-                if (detection->personAge >= 0)
-                {
-                    objectMetadata->addAttribute(makePtr<Attribute>(
-                        IAttribute::Type::number,
-                        "Age",
-                        std::to_string(detection->personAge)));
-                }
-                if (!detection->personId.empty())
-                {
-                    objectMetadata->addAttribute(makePtr<Attribute>(
-                        IAttribute::Type::string,
-                        "Person Id",
-                        detection->personId));
-                }
-            }
-
-            // Single combined caption: "Ông A, Nam, 22 tuổi, No. 1" or "Unknown".
-            std::string identity = displayName;
-            if (detection->recognized)
-            {
-                if (!detection->personGender.empty())
-                    identity += ", " + detection->personGender;
-                if (detection->personAge >= 0)
-                    identity += ", " + std::to_string(detection->personAge) + " tuổi";
-                if (detection->personNo >= 0)
-                    identity += ", No. " + std::to_string(detection->personNo);
-            }
             objectMetadata->addAttribute(makePtr<Attribute>(
                 IAttribute::Type::string,
-                "Identity",
-                identity));
+                "Gender",
+                displayGender));
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Age",
+                displayAge));
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Zone Name",
+                displayZoneName));
         }
                     else if (detection->classLabel == "cat")
                     {

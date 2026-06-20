@@ -1182,6 +1182,7 @@ namespace sample_company {
         const bool zoneViolation = jsonBool("zone_violation", false);
         const std::string zoneType = jsonStr("zone_type");
         const std::string zoneId   = jsonStr("zone_id");
+        const std::string zoneName = jsonStr("zone_name");
         // Face recognition identity fields (optional)
         const bool recognized = jsonBool("recognized", false);
         const std::string personName = jsonStr("person_name");
@@ -1230,6 +1231,7 @@ namespace sample_company {
             zoneViolation,  // P2.1
             zoneType,       // P2.1
             zoneId,         // P2.1
+            zoneName,       // P2.1
             recognized,     // face recognition
             personName,
             personGender,
