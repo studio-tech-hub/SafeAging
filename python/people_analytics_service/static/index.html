@@ -70,7 +70,7 @@
   <div class="field"><label>Họ tên</label><input id="enrollName" placeholder="Ông A"></div>
   <div class="field"><label>Giới tính</label>
     <select id="enrollGender"><option value="">--</option><option>Nam</option><option>Nữ</option></select></div>
-  <div class="row" style="gap:10px"><div class="field" style="flex:1"><label>Ngày sinh</label><input id="enrollDob" type="text" placeholder="26/9/2003"></div>
+  <div class="row" style="gap:10px"><div class="field" style="flex:1"><label>Ngày sinh</label><input id="enrollDob" type="text" placeholder="Ngày sinh"></div>
     <div class="field" style="flex:1"><label>Phòng</label><input id="enrollRoom"></div></div>
   <div class="row" style="justify-content:flex-end;margin-top:8px">
     <button class="secondary" onclick="enrollDlg.close()">Hủy</button>
@@ -241,7 +241,7 @@ async function renderPersons(){
   let html='<div class="card"><h3>Thêm người (ảnh hoặc video)</h3><div class="row">'+
     '<input id="pName" placeholder="Họ tên">'+
     '<select id="pGender"><option value="">Giới tính</option><option>Nam</option><option>Nữ</option></select>'+
-    '<input id="pDob" placeholder="Ngày sinh (26/9/2003)" title="Ngày sinh DD/MM/YYYY">'+
+    '<input id="pDob" placeholder="Ngày sinh">'+
     '<input id="pRoom" placeholder="Phòng">'+
     '<input id="pFile" type="file" accept="image/*,video/*" multiple>'+
     '<button id="pSubmit" onclick="addPersonWithFace()">Tạo + Ghi danh mặt</button></div>'+
