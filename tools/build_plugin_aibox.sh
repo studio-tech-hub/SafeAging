@@ -62,7 +62,7 @@ for tool in cmake ninja conan; do
 done
 
 echo "[build] Native ARM64 plugin..."
-"$REPO_ROOT/tools/build_plugin_linux.sh" \
+bash "$REPO_ROOT/tools/build_plugin_linux.sh" \
     --sdk-dir "$SDK_DIR" \
     --arch arm64 \
     --package
