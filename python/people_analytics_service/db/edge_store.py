@@ -485,6 +485,23 @@ def update_person(person_id: uuid.UUID, **kwargs: Any) -> PersonRecord | None:
     return get_person(person_id)
 
 
+def delete_person(person_id: uuid.UUID) -> bool:
+    """Permanently delete a person and all face/body embeddings."""
+    pid = _uuid_str(person_id)
+    with _lock:
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT id FROM persons WHERE id = ?", (pid,)).fetchone()
+            if row is None:
+                return False
+            conn.execute("UPDATE events SET person_id = NULL WHERE person_id = ?", (pid,))
+            conn.execute("DELETE FROM persons WHERE id = ?", (pid,))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
 # ── PersonEmbedding ───────────────────────────────────────────────────────────
 
 def create_person_embedding(**kwargs: Any) -> PersonEmbeddingRecord:

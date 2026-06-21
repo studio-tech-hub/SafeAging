@@ -212,19 +212,12 @@ class TestAdminPersons:
         assert r.status_code == 200
         assert r.json()["notes"] == "updated"
 
-        # DELETE (soft) — 200 or 204 both acceptable
+        # DELETE (hard) — 204
         r = requests.delete(_svc(f"{self.BASE}/{pid}"), timeout=5)
         assert r.status_code in {200, 204}
 
-        # After delete → 404 or marked inactive/status=inactive
         r2 = requests.get(_svc(f"{self.BASE}/{pid}"), timeout=5)
-        if r2.status_code == 200:
-            body = r2.json()
-            # Accept either is_active=False or status="inactive"
-            inactive = (body.get("is_active") is False) or (body.get("status") == "inactive")
-            assert inactive, f"Expected person to be inactive after DELETE, got: {body}"
-        else:
-            assert r2.status_code == 404
+        assert r2.status_code == 404
 
     def test_get_nonexistent_person_404(self):
         fake_id = str(uuid.uuid4())

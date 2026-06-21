@@ -326,8 +326,8 @@ async function addPersonWithFace(){
   }
 }
 async function delPerson(id){
-  if(!confirm("Remove this person from the list? (soft-delete — record kept in database)"))return;
-  try{ await api(`/admin/persons/${id}`,{method:"DELETE"}); toast("Removed"); render(); }
+  if(!confirm("Permanently delete this person and all enrolled face photos? This cannot be undone."))return;
+  try{ await api(`/admin/persons/${id}`,{method:"DELETE"}); toast("Deleted"); render(); }
   catch(e){ toast("Error: "+e.message); }
 }
 function fileToB64(file){ return new Promise((res,rej)=>{ const r=new FileReader();

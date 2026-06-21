@@ -81,6 +81,24 @@ async def update_person(
     return result.scalar_one_or_none()
 
 
+async def delete_person(
+    session: AsyncSession,
+    person_id: uuid.UUID,
+) -> bool:
+    """Permanently delete a person and their embeddings. Returns False if not found."""
+    if is_edge_mode():
+        return await _edge_call("delete_person", person_id)
+    person = await session.get(Person, person_id)
+    if person is None:
+        return False
+    await session.execute(
+        update(Event).where(Event.person_id == person_id).values(person_id=None)
+    )
+    await session.delete(person)
+    await session.flush()
+    return True
+
+
 # ── PersonEmbedding ───────────────────────────────────────────────────────────
 
 async def create_person_embedding(

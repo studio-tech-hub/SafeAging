@@ -56,6 +56,22 @@ async def test_face_gallery(edge_db):
 
 
 @pytest.mark.asyncio
+async def test_delete_person_hard(edge_db):
+    person = await edge_dal.create_person(name="Carol", status="active")
+    await edge_dal.create_person_embedding(
+        person_id=person.id,
+        embedding=b"\x01" * 512,
+        embedding_type="face",
+        source="test",
+    )
+
+    assert await edge_dal.delete_person(person.id) is True
+    assert await edge_dal.get_person(person.id) is None
+    assert await edge_dal.list_face_gallery() == []
+    assert await edge_dal.delete_person(person.id) is False
+
+
+@pytest.mark.asyncio
 async def test_upsert_event_idempotent(edge_db):
     from datetime import datetime, timezone
 

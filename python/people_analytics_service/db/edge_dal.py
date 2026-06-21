@@ -30,6 +30,10 @@ async def update_person(person_id: uuid.UUID, **kwargs: Any):
     return await _run(store.update_person, person_id, **kwargs)
 
 
+async def delete_person(person_id: uuid.UUID) -> bool:
+    return await _run(store.delete_person, person_id)
+
+
 async def create_person_embedding(**kwargs: Any):
     return await _run(store.create_person_embedding, **kwargs)
 

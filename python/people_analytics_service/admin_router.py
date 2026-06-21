@@ -27,6 +27,7 @@ from .config import logger
 from .person_age import effective_age, parse_date_of_birth
 from .zone_engine import invalidate_zone_cache
 from .config_engine import invalidate_config_cache
+from . import face_engine
 
 
 # ── Auth dependency ────────────────────────────────────────────────────────────
@@ -376,15 +377,16 @@ async def update_person(person_id: uuid.UUID, body: PersonUpdate):
     return out
 
 
-@router.delete("/persons/{person_id}", status_code=204, summary="Soft-delete person (status→inactive)")
+@router.delete("/persons/{person_id}", status_code=204, summary="Permanently delete person and face embeddings")
 async def delete_person(person_id: uuid.UUID):
     _require_db()
     async with get_session() as session:
-        person = await dal.update_person(session, person_id, status="inactive")
-        if person is None:
+        deleted = await dal.delete_person(session, person_id)
+        if not deleted:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
         await session.commit()
-    logger.info(f"[admin] Soft-deleted person id={person_id}")
+    face_engine.invalidate_gallery()
+    logger.info(f"[admin] Deleted person id={person_id} (hard delete)")
 
 
 @router.get(

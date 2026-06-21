@@ -414,8 +414,10 @@ def _apply_face_identity(
     H, W = frame.shape[:2]
 
     for det in detections:
-        if not det.stable or det.degraded or det.cls != "person":
+        if det.cls != "person":
             continue
+        # Identity labels are render-only; run on any output bbox (including
+        # tentative/degraded) so tuning detection does not drop face recognition.
 
         tid = det.track_id
         cached = identity.get(tid)
@@ -1086,6 +1088,7 @@ def infer(req: InferRequest, request: Request):
 
                     track_id = next_id
                     next_id += 1
+                    initial_hits = 1
                     track_by_id[track_id] = {
                         "id": track_id,
                         "bbox": det_box,
@@ -1094,8 +1097,8 @@ def infer(req: InferRequest, request: Request):
                         "created_at": now,
                         "appearance": det_appearance,
                         "score": score,
-                        "status": "tentative",
-                        "hits": 1,
+                        "status": "confirmed" if initial_hits >= TRACK_MIN_HITS else "tentative",
+                        "hits": initial_hits,
                         "misses": 0,
                         "vx": 0.0,
                         "vy": 0.0,

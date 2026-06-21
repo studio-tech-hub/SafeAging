@@ -14,15 +14,23 @@ services:
         condition: service_started
     environment:
       - DATABASE_URL=
-      # ── 4-camera throughput profile (QCS6490) ───────────────────────────────
-      # 4 plugins POST /infer concurrently → use multiple workers (1 YOLO each).
-      # Raise UVICORN_WORKERS if RAM allows (~1.5 GB per worker with face on).
-      - UVICORN_WORKERS=${UVICORN_WORKERS:-4}
+      # ── AI Box stable profile (QCS6490) ─────────────────────────────────────
+      # Must stay at 1 worker: camera track state lives in-process (not shared).
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-1}
       - MODEL_PATH=${MODEL_PATH:-/app/models/yolo26n.onnx}
-      - YOLO_IMGSZ=${YOLO_IMGSZ:-416}
+      - YOLO_IMGSZ=640
       - ENABLE_FACE_RECOGNITION=${ENABLE_FACE_RECOGNITION:-true}
-      - FACE_RECOG_INTERVAL_FRAMES=${FACE_RECOG_INTERVAL_FRAMES:-24}
-      - FACE_DET_SIZE=${FACE_DET_SIZE:-320}
-      - FACE_MODEL_PACK=${FACE_MODEL_PACK:-buffalo_s}
+      # buffalo_l matches default enrollment; do not switch to buffalo_s on edge.
+      - FACE_MODEL_PACK=buffalo_l
+      - FACE_RECOG_INTERVAL_FRAMES=${FACE_RECOG_INTERVAL_FRAMES:-6}
+      - FACE_DET_SIZE=${FACE_DET_SIZE:-640}
+      - FACE_MATCH_THRESHOLD=${FACE_MATCH_THRESHOLD:-0.40}
+      - OUTPUT_TENTATIVE_TRACKS=true
       - OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
       - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}
+    volumes:
+      # Persist insightface model pack across container recreates (buffalo_l ~280MB).
+      - safeaging-insightface:/root/.insightface
+
+volumes:
+  safeaging-insightface:

@@ -102,8 +102,19 @@ def available() -> bool:
 
 
 def warmup() -> bool:
-    """Force model load at startup. Returns True if ready."""
-    return available()
+    """Force model load at startup and preload the face gallery."""
+    if not available():
+        return False
+    try:
+        rows = _load_gallery_rows_sync()
+        if rows:
+            count = _apply_gallery_rows(rows)
+            logger.info("[face] Gallery preloaded: %d embedding(s)", count)
+        else:
+            logger.info("[face] Gallery empty at startup (enroll faces via admin UI)")
+    except Exception as exc:
+        logger.warning("[face] Gallery preload failed: %s", exc)
+    return True
 
 
 # ── embedding extraction ───────────────────────────────────────────────────────
