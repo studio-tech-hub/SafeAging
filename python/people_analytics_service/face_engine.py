@@ -182,31 +182,57 @@ def _schedule_gallery_refresh() -> None:
     t.start()
 
 
-def _bg_load_gallery() -> None:
-    global _gallery, _gallery_loaded_at, _gallery_refresh_in_progress
-    try:
-        from .async_bridge import run_async
+def _parse_gallery_rows(rows: list[dict]) -> list[tuple]:
+    parsed: list[tuple] = []
+    from .person_age import effective_age
 
-        rows = run_async(_async_load_gallery())
-        parsed: list[tuple] = []
-        from .person_age import effective_age
-
-        for r in rows:
-            try:
-                vec = bytes_to_embedding(r["embedding"])
-                if vec.shape[0] != FACE_EMBEDDING_DIM:
-                    continue
-                age = effective_age(
-                    date_of_birth=r.get("date_of_birth"),
-                    stored_age=r.get("age"),
-                )
-                parsed.append((str(r["person_id"]), r["name"], r.get("gender"), age, vec))
-            except Exception:
+    for r in rows:
+        try:
+            vec = bytes_to_embedding(r["embedding"])
+            if vec.shape[0] != FACE_EMBEDDING_DIM:
                 continue
-        with _gallery_lock:
-            _gallery = parsed
-            _gallery_loaded_at = time.monotonic()
-        logger.debug("[face] Gallery loaded: %d face embedding(s)", len(parsed))
+            age = effective_age(
+                date_of_birth=r.get("date_of_birth"),
+                stored_age=r.get("age"),
+            )
+            parsed.append((str(r["person_id"]), r["name"], r.get("gender"), age, vec))
+        except Exception:
+            continue
+    return parsed
+
+
+def _load_gallery_rows_sync() -> list[dict]:
+    """Load enrolled face rows without touching async_bridge (edge SQLite path)."""
+    from .db.session import is_edge_mode
+
+    if is_edge_mode():
+        from .db import edge_store
+
+        return edge_store.list_face_gallery()
+
+    from .async_bridge import run_async
+
+    return run_async(_async_load_gallery())
+
+
+def _apply_gallery_rows(rows: list[dict]) -> int:
+    global _gallery, _gallery_loaded_at
+    parsed = _parse_gallery_rows(rows)
+    with _gallery_lock:
+        _gallery = parsed
+        _gallery_loaded_at = time.monotonic()
+    if parsed:
+        logger.info("[face] Gallery loaded: %d face embedding(s)", len(parsed))
+    else:
+        logger.warning("[face] Gallery loaded but no usable face embeddings (rows=%d)", len(rows))
+    return len(parsed)
+
+
+def _bg_load_gallery() -> None:
+    global _gallery_refresh_in_progress
+    try:
+        rows = _load_gallery_rows_sync()
+        _apply_gallery_rows(rows)
     except Exception as exc:
         logger.warning("[face] Gallery load failed: %s", exc)
     finally:
@@ -246,6 +272,20 @@ def match_embedding(query: np.ndarray, threshold: Optional[float] = None) -> Opt
 
     with _gallery_lock:
         gallery = list(_gallery)
+
+    if not gallery and query is not None:
+        # Edge box: background refresh may not have finished yet — load once inline.
+        try:
+            from .db.session import is_edge_mode
+
+            if is_edge_mode():
+                rows = _load_gallery_rows_sync()
+                if rows:
+                    _apply_gallery_rows(rows)
+                    with _gallery_lock:
+                        gallery = list(_gallery)
+        except Exception as exc:
+            logger.debug("[face] Inline gallery load skipped: %s", exc)
 
     if not gallery or query is None:
         return None
