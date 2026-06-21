@@ -14,3 +14,15 @@ services:
         condition: service_started
     environment:
       - DATABASE_URL=
+      # ── 4-camera throughput profile (QCS6490) ───────────────────────────────
+      # 4 plugins POST /infer concurrently → use multiple workers (1 YOLO each).
+      # Raise UVICORN_WORKERS if RAM allows (~1.5 GB per worker with face on).
+      - UVICORN_WORKERS=${UVICORN_WORKERS:-4}
+      - MODEL_PATH=${MODEL_PATH:-/app/models/yolo26n.onnx}
+      - YOLO_IMGSZ=${YOLO_IMGSZ:-416}
+      - ENABLE_FACE_RECOGNITION=${ENABLE_FACE_RECOGNITION:-true}
+      - FACE_RECOG_INTERVAL_FRAMES=${FACE_RECOG_INTERVAL_FRAMES:-24}
+      - FACE_DET_SIZE=${FACE_DET_SIZE:-320}
+      - FACE_MODEL_PACK=${FACE_MODEL_PACK:-buffalo_s}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}

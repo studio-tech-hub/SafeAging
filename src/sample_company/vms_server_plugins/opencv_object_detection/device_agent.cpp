@@ -921,7 +921,7 @@ namespace sample_company
                     try
                     {
                         Frame frame(videoFrame, m_frameIndex);
-                        std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
+                        std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 640);
 
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
@@ -2023,7 +2023,7 @@ namespace sample_company
                         "Legacy processFrame path invoked — this should not happen in normal operation");
 
                     // Local tracker used only here; Python service is authoritative.
-                    std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 1280);
+                    std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 640);
                     DetectionList detections = m_objectDetector->run(m_cameraId, jpegBytes);
                     const auto trackingResult = m_objectTracker->run(frame, detections);
 

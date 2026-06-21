@@ -12,14 +12,25 @@ from people_analytics_service.api import app
 from people_analytics_service.config import SERVICE_HOST, SERVICE_PORT, TLS_CERT_FILE, TLS_KEY_FILE, logger
 
 
+def _uvicorn_workers() -> int:
+    raw = __import__("os").getenv("UVICORN_WORKERS", "1").strip()
+    try:
+        workers = max(1, min(8, int(raw)))
+    except ValueError:
+        workers = 1
+    return workers
+
+
 if __name__ == "__main__":
-    logger.info(f"Starting service on {SERVICE_HOST}:{SERVICE_PORT}")
+    workers = _uvicorn_workers()
+    logger.info(f"Starting service on {SERVICE_HOST}:{SERVICE_PORT} (workers={workers})")
     uvicorn_kwargs: Dict[str, Any] = {
         "app": app,
         "host": SERVICE_HOST,
         "port": SERVICE_PORT,
         "log_level": "info",
         "access_log": True,
+        "workers": workers,
     }
     if TLS_CERT_FILE and TLS_KEY_FILE:
         uvicorn_kwargs["ssl_certfile"] = TLS_CERT_FILE
