@@ -1885,35 +1885,40 @@ namespace sample_company
         {
             objectMetadata->setTypeId(kPersonObjectType);
 
-            const auto displayOrUnknown = [](const std::string& value) -> std::string
+            // Identity fields: only publish after a successful match so Nx does not
+            // aggregate "Unknown" with the resolved name across the object lifetime.
+            if (detection->recognized)
             {
-                return value.empty() ? std::string("Unknown") : value;
-            };
+                if (!detection->personName.empty())
+                {
+                    objectMetadata->addAttribute(makePtr<Attribute>(
+                        IAttribute::Type::string,
+                        "Person name",
+                        detection->personName));
+                }
+                if (!detection->personGender.empty())
+                {
+                    objectMetadata->addAttribute(makePtr<Attribute>(
+                        IAttribute::Type::string,
+                        "Gender",
+                        detection->personGender));
+                }
+                if (detection->personAge >= 0)
+                {
+                    objectMetadata->addAttribute(makePtr<Attribute>(
+                        IAttribute::Type::string,
+                        "Age",
+                        std::to_string(detection->personAge)));
+                }
+            }
 
-            const std::string displayName = displayOrUnknown(detection->personName);
-            const std::string displayGender = displayOrUnknown(detection->personGender);
-            const std::string displayAge =
-                detection->personAge >= 0
-                    ? std::to_string(detection->personAge)
-                    : std::string("Unknown");
-            const std::string displayZoneName = displayOrUnknown(detection->zoneName);
-
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::string,
-                "Person name",
-                displayName));
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::string,
-                "Gender",
-                displayGender));
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::string,
-                "Age",
-                displayAge));
-            objectMetadata->addAttribute(makePtr<Attribute>(
-                IAttribute::Type::string,
-                "Zone Name",
-                displayZoneName));
+            if (!detection->zoneName.empty())
+            {
+                objectMetadata->addAttribute(makePtr<Attribute>(
+                    IAttribute::Type::string,
+                    "Zone Name",
+                    detection->zoneName));
+            }
         }
                     else if (detection->classLabel == "cat")
                     {

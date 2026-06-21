@@ -477,7 +477,11 @@ def _apply_face_identity(
             det.person_no = cached.get("no")
         else:
             det.recognized = False
-            det.person_name = "Unknown"
+            det.person_id = None
+            det.person_name = None
+            det.person_gender = None
+            det.person_age = None
+            det.person_no = None
 
 
 def _get_client_ip(request: Request) -> str:
