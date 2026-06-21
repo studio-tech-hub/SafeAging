@@ -14,6 +14,27 @@ namespace sample_company {
     namespace vms_server_plugins {
         namespace opencv_object_detection {
 
+            /** Returns false for empty/placeholder frames (skip quietly, no Nx diagnostic spam). */
+            inline bool isVideoFrameDecodable(
+                const nx::sdk::analytics::IUncompressedVideoFrame* frame)
+            {
+                if (!frame || frame->width() <= 0 || frame->height() <= 0)
+                    return false;
+
+                using PixelFormat = nx::sdk::analytics::IUncompressedVideoFrame::PixelFormat;
+                const PixelFormat pf = frame->pixelFormat();
+
+                if (pf == PixelFormat::yuv420)
+                {
+                    if (frame->data(0) && frame->lineSize(0) > 0)
+                        return true;
+                    // NV12-style: Y may be absent but rarely; require at least plane 0 or 1.
+                    return frame->data(1) != nullptr && frame->lineSize(1) > 0;
+                }
+
+                return frame->data(0) != nullptr && frame->lineSize(0) > 0;
+            }
+
             /**
              * Stores frame data and cv::Mat. Note, there is no copying of image data in the constructor.
              */
@@ -40,6 +61,8 @@ namespace sample_company {
 
                     if (pf == PixelFormat::bgr)
                     {
+                        if (!frame->data(0) || frame->lineSize(0) <= 0)
+                            throw std::runtime_error("BGR conversion failed: missing frame data");
                         cv::Mat temp(h, w, CV_8UC3, (void*)frame->data(0), (size_t)frame->lineSize(0));
                         cvMat = temp.clone();  // Clone to ensure data is owned by this Mat
                     }
@@ -156,6 +179,22 @@ namespace sample_company {
                                         vData + row * vStride,
                                         static_cast<size_t>(uvW));
                                 }
+                            }
+                            else if (uData && uStride > 0 && !vData)
+                            {
+                                // NV12: plane0=Y, plane1=interleaved UV (common on ARM decoders).
+                                cv::Mat yMat(
+                                    h, w, CV_8UC1,
+                                    const_cast<uint8_t*>(yData),
+                                    static_cast<size_t>(yStride));
+                                cv::Mat uvMat(
+                                    uvH, uvW, CV_8UC2,
+                                    const_cast<uint8_t*>(uData),
+                                    static_cast<size_t>(uStride));
+                                cv::cvtColorTwoPlane(yMat, uvMat, cvMat, cv::COLOR_YUV2BGR_NV12);
+                                if (cvMat.empty())
+                                    throw std::runtime_error("cvtColor(NV12) produced empty Mat");
+                                return;
                             }
                             else
                             {

@@ -567,6 +567,22 @@ namespace sample_company
         {
             "objectTypeId": ")json" +
                        kDogObjectType + R"json("
+        },
+        {
+            "eventTypeId": ")json" +
+                       kDetectionEventType + R"json("
+        },
+        {
+            "eventTypeId": ")json" +
+                       kProlongedDetectionEventType + R"json("
+        },
+        {
+            "eventTypeId": ")json" +
+                       kFallDetectedEventType + R"json("
+        },
+        {
+            "eventTypeId": ")json" +
+                       kZoneViolationEventType + R"json("
         }
     ],
     "deviceAgentSettingsModel": {
@@ -894,6 +910,13 @@ namespace sample_company
 
                 if (shouldEnqueue)
                 {
+                    if (!isVideoFrameDecodable(videoFrame))
+                    {
+                        ++m_droppedFrameCount;
+                        ++m_frameIndex;
+                        return true;
+                    }
+
                     m_lastEnqueueTime = now;
                     try
                     {
@@ -957,10 +980,17 @@ namespace sample_company
                             "device_agent.frame_encode_error",
                             std::chrono::seconds(10),
                             std::string("Frame encoding error: ") + e.what());
-                        pushPluginDiagnosticEvent(
-                            nx::sdk::IPluginDiagnosticEvent::Level::error,
-                            "Frame encoding error",
-                            e.what());
+                        static std::chrono::steady_clock::time_point lastEncodingDiag;
+                        const auto diagNow = std::chrono::steady_clock::now();
+                        if (lastEncodingDiag == std::chrono::steady_clock::time_point::min() ||
+                            diagNow - lastEncodingDiag >= std::chrono::seconds(10))
+                        {
+                            pushPluginDiagnosticEvent(
+                                nx::sdk::IPluginDiagnosticEvent::Level::error,
+                                "Frame encoding error",
+                                e.what());
+                            lastEncodingDiag = diagNow;
+                        }
                     }
                 }
 

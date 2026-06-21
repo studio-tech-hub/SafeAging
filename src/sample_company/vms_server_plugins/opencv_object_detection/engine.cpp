@@ -34,11 +34,11 @@ void Engine::doObtainDeviceAgent(
 
 std::string Engine::manifestString() const
 {
-    // Request YUV420 frames from NX so the plugin can convert them to OpenCV Mats
-    // before forwarding them to the Python analytics service.
+    // Request BGR frames — native OpenCV layout; avoids YUV420 plane issues on some
+    // ARM decoders (null Y plane / missing Y plane spam on QCS6490-class boxes).
     return /*suppress newline*/ 1 + R"json(
 {
-    "capabilities": "needUncompressedVideoFrames_yuv420"
+    "capabilities": "needUncompressedVideoFrames_bgr"
 }
 )json";
 }
