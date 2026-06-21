@@ -26,10 +26,8 @@ namespace sample_company {
 
                 if (pf == PixelFormat::yuv420)
                 {
-                    if (frame->data(0) && frame->lineSize(0) > 0)
-                        return true;
-                    // NV12-style: Y may be absent but rarely; require at least plane 0 or 1.
-                    return frame->data(1) != nullptr && frame->lineSize(1) > 0;
+                    // Y plane is mandatory for any YUV path; do not admit frames with only UV plane.
+                    return frame->data(0) != nullptr && frame->lineSize(0) > 0;
                 }
 
                 return frame->data(0) != nullptr && frame->lineSize(0) > 0;
