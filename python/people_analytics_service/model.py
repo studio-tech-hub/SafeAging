@@ -1,47 +1,26 @@
-from ultralytics import YOLO
-import torch
+"""Load and cache the YOLO model (CPU or Qualcomm QNN backend)."""
 
-from .config import DEVICE, MODEL_PATH, logger
-
+from .config import MODEL_PATH, YOLO_BACKEND, logger
+from . import yolo_backend
 
 model = None
 
 
 def load_model():
-    """Load YOLO model with PyTorch 2.6 compatibility."""
+    """Load YOLO model with backend from YOLO_BACKEND env (cpu | qnn_htp | qnn_gpu)."""
     global model
     if model is not None:
         return model
 
     try:
-        suffix = MODEL_PATH.rsplit(".", 1)[-1].lower() if "." in MODEL_PATH else "pt"
-        backend = "onnxruntime" if suffix == "onnx" else "pytorch"
-        logger.info(f"Loading YOLO model from: {MODEL_PATH} (backend={backend})")
-
-        original_torch_load = torch.load
-
-        def patched_torch_load(f, *args, **kwargs):
-            if "weights_only" not in kwargs:
-                kwargs["weights_only"] = False
-            return original_torch_load(f, *args, **kwargs)
-
-        torch.load = patched_torch_load
-
-        try:
-            model = YOLO(MODEL_PATH)
-            try:
-                model.fuse()
-            except Exception:
-                pass
-            try:
-                model.to(DEVICE)
-            except Exception as e:
-                logger.warning(f"Failed to move model to {DEVICE}: {e}")
-            logger.info("✅ YOLO model loaded successfully")
-        finally:
-            torch.load = original_torch_load
-
+        logger.info(
+            "Loading YOLO from %s (YOLO_BACKEND=%s)",
+            MODEL_PATH,
+            YOLO_BACKEND,
+        )
+        model = yolo_backend.load_yolo_model(MODEL_PATH)
+        logger.info("YOLO ready (active_backend=%s)", yolo_backend.active_backend())
         return model
     except Exception as e:
-        logger.error(f"❌ Failed to load YOLO model: {e}")
+        logger.error("Failed to load YOLO model: %s", e)
         raise

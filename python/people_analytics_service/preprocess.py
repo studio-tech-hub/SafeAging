@@ -67,12 +67,16 @@ def load_calibration() -> bool:
     return False
 
 
-def apply_roi_rect(frame: np.ndarray) -> tuple:
+def apply_roi_rect(frame: np.ndarray, roi: Optional[Dict[str, float]] = None) -> tuple:
     h, w = frame.shape[:2]
-    x1 = int(w * ROI_X_MIN)
-    y1 = int(h * ROI_Y_MIN)
-    x2 = int(w * ROI_X_MAX)
-    y2 = int(h * ROI_Y_MAX)
+    x_min = roi.get("x_min", ROI_X_MIN) if roi else ROI_X_MIN
+    y_min = roi.get("y_min", ROI_Y_MIN) if roi else ROI_Y_MIN
+    x_max = roi.get("x_max", ROI_X_MAX) if roi else ROI_X_MAX
+    y_max = roi.get("y_max", ROI_Y_MAX) if roi else ROI_Y_MAX
+    x1 = int(w * x_min)
+    y1 = int(h * y_min)
+    x2 = int(w * x_max)
+    y2 = int(h * y_max)
 
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
@@ -82,13 +86,14 @@ def apply_roi_rect(frame: np.ndarray) -> tuple:
     return cropped, roi_box
 
 
-def apply_roi_polygon(frame: np.ndarray) -> tuple:
+def apply_roi_polygon(frame: np.ndarray, polygon_json: Optional[str] = None) -> tuple:
     try:
-        if not ROI_POLYGON_JSON:
-            logger.warning("Polygon ROI enabled but ROI_POLYGON_JSON not provided")
+        raw = polygon_json if polygon_json is not None else ROI_POLYGON_JSON
+        if not raw:
+            logger.warning("Polygon ROI enabled but polygon JSON not provided")
             return frame, (0, 0, frame.shape[1], frame.shape[0])
 
-        polygon = json.loads(ROI_POLYGON_JSON)
+        polygon = json.loads(raw)
         h, w = frame.shape[:2]
 
         points = np.array([[int(p[0] * w), int(p[1] * h)] for p in polygon], dtype=np.int32)
@@ -109,14 +114,17 @@ def apply_roi_polygon(frame: np.ndarray) -> tuple:
         return frame, (0, 0, frame.shape[1], frame.shape[0])
 
 
-def apply_roi(frame: np.ndarray) -> tuple:
+def apply_roi(frame: np.ndarray, roi_override: Optional[Dict[str, Any]] = None) -> tuple:
     if not ENABLE_ROI:
         h, w = frame.shape[:2]
         return frame, (0, 0, w, h), None
 
-    if ROI_TYPE == "polygon":
-        return apply_roi_polygon(frame) + (ROI_TYPE,)
-    return apply_roi_rect(frame) + (ROI_TYPE,)
+    roi_type = (roi_override or {}).get("type", ROI_TYPE)
+    if roi_type == "polygon":
+        poly = (roi_override or {}).get("polygon_json") or ROI_POLYGON_JSON
+        return apply_roi_polygon(frame, polygon_json=poly) + ("polygon",)
+    rect = (roi_override or {}).get("rect") if roi_override else None
+    return apply_roi_rect(frame, roi=rect) + ("rect",)
 
 
 def undistort_frame(frame: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int]]:
@@ -244,6 +252,23 @@ def preprocess_frame(frame: np.ndarray) -> np.ndarray:
     if ENABLE_FRAME_ENHANCEMENT:
         frame = apply_frame_enhancement(frame)
     return frame
+
+
+def ensure_min_input_side(frame: np.ndarray, min_side: int) -> Tuple[np.ndarray, float]:
+    """Upscale frame so min(height, width) >= min_side.
+
+    Returns (frame, scale) where pixel coordinates in the returned frame are
+  ``original_coord * scale``. Map detections back with ``coord / scale``.
+    """
+    h, w = frame.shape[:2]
+    short = min(h, w)
+    if short >= min_side:
+        return frame, 1.0
+    scale = float(min_side) / float(short)
+    new_w = int(round(w * scale))
+    new_h = int(round(h * scale))
+    upscaled = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return upscaled, scale
 
 
 def multi_scale_inference_smart(yolo_model, frame: np.ndarray, original_h: int, original_w: int):

@@ -32,7 +32,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Face embedding dimension produced by ArcFace r50 (buffalo_l).
+# Face embedding dimension (buffalo_l/s ArcFace — 512-d).
 FACE_EMBEDDING_DIM: int = 512
 
 # ── model state ───────────────────────────────────────────────────────────────

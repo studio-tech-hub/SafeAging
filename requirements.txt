@@ -24,7 +24,9 @@ Pillow>=9.0.0
 # insightface provides SCRFD (detector) + ArcFace (recogniser) model packs.
 # onnxruntime: required for yolo26n.onnx inference (AI Box ARM64 / edge CPU).
 insightface==0.7.3
-onnxruntime>=1.16.0
+# Pin ORT 1.24.4 — benchmarked on QCS6490 A55 (1.27+ regresses on this board).
+# aarch64 images reinstall from docker/wheels/ in Dockerfile after this line.
+onnxruntime==1.24.4
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 requests>=2.28.0

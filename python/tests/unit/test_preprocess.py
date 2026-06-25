@@ -48,11 +48,32 @@ class TestApplyRoiRect:
         assert roi_box == (0, 0, 100, 100)
 
     def test_quarter_crop(self, frame_100):
-        # x ∈ [0.25, 0.75], y ∈ [0.25, 0.75] → 50×50 centre
-        cropped, roi_box = self._call(frame_100, 0.25, 0.25, 0.75, 0.75)
+        import people_analytics_service.preprocess as pp
+
+        with (
+            patch.object(pp, "ROI_X_MIN", 0.25),
+            patch.object(pp, "ROI_X_MAX", 0.75),
+            patch.object(pp, "ROI_Y_MIN", 0.25),
+            patch.object(pp, "ROI_Y_MAX", 0.75),
+        ):
+            cropped, roi_box = pp.apply_roi_rect(frame_100)
         h, w = cropped.shape[:2]
         assert w == 50 and h == 50
         assert roi_box == (25, 25, 75, 75)
+
+    def test_per_camera_rect_override(self, frame_100):
+        import people_analytics_service.preprocess as pp
+
+        with patch.object(pp, "ENABLE_ROI", True):
+            cropped, roi_box, roi_type = pp.apply_roi(
+                frame_100,
+                roi_override={
+                    "type": "rect",
+                    "rect": {"x_min": 0.0, "y_min": 0.5, "x_max": 1.0, "y_max": 1.0},
+                },
+            )
+        assert roi_type == "rect"
+        assert cropped.shape[0] == 50
 
     def test_top_half(self, frame_640):
         cropped, roi_box = self._call(frame_640, 0.0, 0.0, 1.0, 0.5)
@@ -209,3 +230,32 @@ class TestUndistortFrame:
         # With near-identity calibration, shape should be preserved
         assert result.shape[:2][0] > 0
         assert result.shape[:2][1] > 0
+
+
+# ---------------------------------------------------------------------------
+# ensure_min_input_side
+# ---------------------------------------------------------------------------
+
+class TestEnsureMinInputSide:
+    def test_no_op_when_already_large_enough(self):
+        import people_analytics_service.preprocess as pp
+
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        out, scale = pp.ensure_min_input_side(frame, 640)
+        assert scale == 1.0
+        assert out is frame
+
+    def test_upscales_short_side(self):
+        import people_analytics_service.preprocess as pp
+
+        frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        out, scale = pp.ensure_min_input_side(frame, 640)
+        assert scale == pytest.approx(640 / 360, rel=1e-3)
+        assert min(out.shape[:2]) >= 640
+
+    def test_square_small_frame(self, frame_100):
+        import people_analytics_service.preprocess as pp
+
+        out, scale = pp.ensure_min_input_side(frame_100, 640)
+        assert scale == 6.4
+        assert out.shape == (640, 640, 3)

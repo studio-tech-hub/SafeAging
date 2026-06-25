@@ -34,5 +34,17 @@ if ! alembic upgrade head; then
     echo "[entrypoint] WARNING: alembic upgrade failed — service may return 500 on admin API until DB is fixed."
 fi
 
+# Optional: offline install Qualcomm onnxruntime-qnn + matching onnxruntime (AI Box)
+WHEEL_DIR="/wheels"
+YOLO_BACKEND="${YOLO_BACKEND:-cpu}"
+if ls "${WHEEL_DIR}"/onnxruntime-1.24.4*.whl >/dev/null 2>&1; then
+    echo "[entrypoint] Installing onnxruntime 1.24.4 (offline, --no-deps) ..."
+    pip install --no-cache-dir --no-deps --force-reinstall "${WHEEL_DIR}"/onnxruntime-1.24.4*.whl
+fi
+if [ "${YOLO_BACKEND#qnn}" != "${YOLO_BACKEND}" ] && ls "${WHEEL_DIR}"/onnxruntime_qnn-*.whl >/dev/null 2>&1; then
+    echo "[entrypoint] Installing onnxruntime-qnn (offline, --no-deps) ..."
+    pip install --no-cache-dir --no-deps --force-reinstall "${WHEEL_DIR}"/onnxruntime_qnn-*.whl
+fi
+
 echo "[entrypoint] Starting SafeAging analytics service ..."
 exec python /app/python/service.py

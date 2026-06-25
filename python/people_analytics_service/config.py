@@ -79,6 +79,25 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# Minimum square inference input (px) for YOLO, face detection, and ONNX exports.
+MIN_INPUT_RESOLUTION = max(640, _env_int("MIN_INPUT_RESOLUTION", 640))
+
+
+def _clamp_min_square_resolution(env_name: str, default: int) -> int:
+    """Clamp a square input size env var to MIN_INPUT_RESOLUTION (default 640)."""
+    raw = _env_int(env_name, default)
+    if raw < MIN_INPUT_RESOLUTION:
+        logger.warning(
+            "%s=%d is below minimum %d; using %d",
+            env_name,
+            raw,
+            MIN_INPUT_RESOLUTION,
+            MIN_INPUT_RESOLUTION,
+        )
+        return MIN_INPUT_RESOLUTION
+    return raw
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -166,7 +185,23 @@ class AppConfig:
         self.fall_confidence_threshold = _clamp(
             _env_float("FALL_CONFIDENCE_THRESHOLD", 0.8), 0.0, 1.0, "FALL_CONFIDENCE_THRESHOLD"
         )
+        self.fall_confirm_frames = max(1, _env_int("FALL_CONFIRM_FRAMES", 3))
+        self.fall_velocity_ref_height = max(20, _env_int("FALL_VELOCITY_REF_HEIGHT", 120))
 
+        # Optional YOLO-pose overlay for fall (runs every N frames; adds latency).
+        self.enable_pose_fall = _env_bool("ENABLE_POSE_FALL", False)
+        self.pose_model_path = os.getenv("POSE_MODEL_PATH", "yolo11n-pose.pt").strip()
+        self.pose_imgsz = _clamp_min_square_resolution("POSE_IMGSZ", 640)
+        self.pose_interval_frames = max(1, _env_int("POSE_INTERVAL_FRAMES", 6))
+        self.pose_keypoint_conf = _clamp(
+            _env_float("POSE_KEYPOINT_CONF", 0.5), 0.0, 1.0, "POSE_KEYPOINT_CONF"
+        )
+        self.pose_torso_angle_threshold = max(
+            10.0, _env_float("POSE_TORSO_ANGLE_THRESHOLD", 55.0)
+        )
+
+        # Upscale decoded frames when short side < MIN_INPUT_RESOLUTION before YOLO only.
+        self.enable_input_upscale = _env_bool("ENABLE_INPUT_UPSCALE", True)
         self.enable_clahe = _env_bool("ENABLE_CLAHE", False)
         self.enable_multi_scale = _env_bool("ENABLE_MULTI_SCALE", False)
         self.enable_frame_enhancement = _env_bool("ENABLE_FRAME_ENHANCEMENT", False)
@@ -197,7 +232,21 @@ class AppConfig:
         self.distortion_coeffs_json = os.getenv("DISTORTION_COEFFS_JSON", "")
         self.calibration_file = os.getenv("CALIBRATION_FILE", "camera_calibration.json")
 
-        self.yolo_imgsz = max(64, _env_int("YOLO_IMGSZ", 640))
+        self.yolo_imgsz = _clamp_min_square_resolution("YOLO_IMGSZ", 640)
+        if "_256" in self.model_path or "_192" in self.model_path or "_160" in self.model_path or "_320" in self.model_path or "_416" in self.model_path:
+            logger.warning(
+                "MODEL_PATH=%s appears to be a sub-%d ONNX export; "
+                "use yolo26s.onnx or yolo26n.onnx (exported at %d) for production",
+                self.model_path,
+                MIN_INPUT_RESOLUTION,
+                MIN_INPUT_RESOLUTION,
+            )
+
+        # Qualcomm QNN (HTP NPU / Adreno GPU) — not NVIDIA CUDA
+        self.yolo_backend = os.getenv("YOLO_BACKEND", "cpu").strip().lower()
+        self.qnn_backend_path = os.getenv("QNN_BACKEND_PATH", "").strip()
+        self.qnn_htp_performance_mode = os.getenv("QNN_HTP_PERFORMANCE_MODE", "burst").strip()
+        self.qnn_htp_fp16 = _env_bool("QNN_HTP_FP16", True)
 
         self.device = os.getenv("DEVICE", "cuda:0" if cuda_available else "cpu")
         self.use_half = _env_bool("USE_HALF", False)
@@ -278,15 +327,19 @@ class AppConfig:
         self.face_match_threshold = _clamp(
             _env_float("FACE_MATCH_THRESHOLD", 0.45), 0.0, 1.0, "FACE_MATCH_THRESHOLD"
         )
-        # Run face recognition for a given track at most once every N frames
-        # (between attempts the cached identity is reused for a stable label).
+        # Run face on stable tracks immediately; retry Unknown on a time schedule.
+        self.face_recog_unknown_retry_sec = max(
+            1.0, _env_float("FACE_RECOG_UNKNOWN_RETRY_SEC", 8.0)
+        )
+        # Legacy frame interval (used only when FACE_RECOG_USE_TIME_SCHEDULER=false).
         self.face_recog_interval_frames = max(1, _env_int("FACE_RECOG_INTERVAL_FRAMES", 12))
+        self.face_recog_use_time_scheduler = _env_bool("FACE_RECOG_USE_TIME_SCHEDULER", True)
         # Minimum face bbox side (pixels) to attempt recognition.
         self.face_min_pixels = max(8, _env_int("FACE_MIN_PIXELS", 28))
         # insightface detector input size (square).
-        self.face_det_size = max(160, _env_int("FACE_DET_SIZE", 640))
-        # insightface model pack name (buffalo_l = SCRFD + ArcFace r50, GPU-friendly).
-        self.face_model_pack = os.getenv("FACE_MODEL_PACK", "buffalo_l").strip()
+        self.face_det_size = _clamp_min_square_resolution("FACE_DET_SIZE", 640)
+        # insightface model pack (buffalo_s = faster; buffalo_l = heavier / slightly more accurate).
+        self.face_model_pack = os.getenv("FACE_MODEL_PACK", "buffalo_s").strip()
         # Gallery (enrolled face embeddings) cache refresh interval.
         self.face_gallery_refresh_sec = max(5.0, _env_float("FACE_GALLERY_REFRESH_SEC", 30.0))
 
@@ -299,6 +352,10 @@ class AppConfig:
         self.enroll_video_sample_fps = _clamp(
             _env_float("ENROLL_VIDEO_SAMPLE_FPS", 4.0), 3.0, 5.0, "ENROLL_VIDEO_SAMPLE_FPS"
         )
+
+        # Health: mark service degraded when pipeline latency exceeds thresholds.
+        self.health_p95_degraded_ms = max(100.0, _env_float("HEALTH_P95_DEGRADED_MS", 800.0))
+        self.health_avg_degraded_ms = max(100.0, _env_float("HEALTH_AVG_DEGRADED_MS", 650.0))
 
 
 _load_local_env()
@@ -337,6 +394,15 @@ FALL_VELOCITY_THRESHOLD = CONFIG.fall_velocity_threshold
 FALL_ANGLE_CHANGE_THRESHOLD = CONFIG.fall_angle_change_threshold
 FALL_ASPECT_RATIO_THRESHOLD = CONFIG.fall_aspect_ratio_threshold
 FALL_CONFIDENCE_THRESHOLD = CONFIG.fall_confidence_threshold
+FALL_CONFIRM_FRAMES = CONFIG.fall_confirm_frames
+FALL_VELOCITY_REF_HEIGHT = CONFIG.fall_velocity_ref_height
+ENABLE_POSE_FALL = CONFIG.enable_pose_fall
+POSE_MODEL_PATH = CONFIG.pose_model_path
+POSE_IMGSZ = CONFIG.pose_imgsz
+POSE_INTERVAL_FRAMES = CONFIG.pose_interval_frames
+POSE_KEYPOINT_CONF = CONFIG.pose_keypoint_conf
+POSE_TORSO_ANGLE_THRESHOLD = CONFIG.pose_torso_angle_threshold
+ENABLE_INPUT_UPSCALE = CONFIG.enable_input_upscale
 ENABLE_CLAHE = CONFIG.enable_clahe
 ENABLE_MULTI_SCALE = CONFIG.enable_multi_scale
 ENABLE_FRAME_ENHANCEMENT = CONFIG.enable_frame_enhancement
@@ -355,6 +421,10 @@ CAMERA_MATRIX_JSON = CONFIG.camera_matrix_json
 DISTORTION_COEFFS_JSON = CONFIG.distortion_coeffs_json
 CALIBRATION_FILE = CONFIG.calibration_file
 YOLO_IMGSZ = CONFIG.yolo_imgsz
+YOLO_BACKEND = CONFIG.yolo_backend
+QNN_BACKEND_PATH = CONFIG.qnn_backend_path
+QNN_HTP_PERFORMANCE_MODE = CONFIG.qnn_htp_performance_mode
+QNN_HTP_FP16 = CONFIG.qnn_htp_fp16
 DEVICE = CONFIG.device
 USE_HALF = CONFIG.use_half
 TORCH_CUDNN_BENCHMARK = CONFIG.torch_cudnn_benchmark
@@ -410,7 +480,9 @@ REID_AUTO_LINK_ENABLED = CONFIG.reid_auto_link_enabled
 # Face recognition
 ENABLE_FACE_RECOGNITION = CONFIG.enable_face_recognition
 FACE_MATCH_THRESHOLD = CONFIG.face_match_threshold
+FACE_RECOG_UNKNOWN_RETRY_SEC = CONFIG.face_recog_unknown_retry_sec
 FACE_RECOG_INTERVAL_FRAMES = CONFIG.face_recog_interval_frames
+FACE_RECOG_USE_TIME_SCHEDULER = CONFIG.face_recog_use_time_scheduler
 FACE_MIN_PIXELS = CONFIG.face_min_pixels
 FACE_DET_SIZE = CONFIG.face_det_size
 FACE_MODEL_PACK = CONFIG.face_model_pack
@@ -418,6 +490,8 @@ FACE_GALLERY_REFRESH_SEC = CONFIG.face_gallery_refresh_sec
 ENROLL_FACE_MIN_IMAGES = CONFIG.enroll_face_min_images
 ENROLL_FACE_MAX_IMAGES = CONFIG.enroll_face_max_images
 ENROLL_VIDEO_SAMPLE_FPS = CONFIG.enroll_video_sample_fps
+HEALTH_P95_DEGRADED_MS = CONFIG.health_p95_degraded_ms
+HEALTH_AVG_DEGRADED_MS = CONFIG.health_avg_degraded_ms
 
 
 if DEVICE.startswith("cuda"):
@@ -446,7 +520,14 @@ def log_config_summary() -> None:
     logger.info(f"Confidence: {CONFIDENCE_THRESHOLD}")
     logger.info(f"IOU: {IOU_THRESHOLD}")
     logger.info(f"Person min h/w ratio: {PERSON_MIN_HW_RATIO}")
-    logger.info(f"ImgSize: {YOLO_IMGSZ}")
+    logger.info(f"ImgSize: {YOLO_IMGSZ} (min {MIN_INPUT_RESOLUTION})")
+    logger.info(f"Face det size: {FACE_DET_SIZE} (min {MIN_INPUT_RESOLUTION})")
+    logger.info(f"YOLO backend: {YOLO_BACKEND} (QNN=Qualcomm HTP/GPU, not CUDA)")
+    if YOLO_BACKEND.startswith("qnn"):
+        logger.info(
+            f"QNN: backend_path={QNN_BACKEND_PATH or '(auto)'} "
+            f"htp_mode={QNN_HTP_PERFORMANCE_MODE} htp_fp16={QNN_HTP_FP16}"
+        )
     logger.info(f"Device: {DEVICE} | FP16: {USE_HALF}")
     logger.info("=" * 60)
     logger.info(f"CLAHE: {ENABLE_CLAHE}")
@@ -469,10 +550,18 @@ def log_config_summary() -> None:
     logger.info("=" * 60)
     logger.info(f"Fall Detection: {ENABLE_FALL_DETECTION}")
     if ENABLE_FALL_DETECTION:
-        logger.info(f"  Velocity Threshold: {FALL_VELOCITY_THRESHOLD}px/frame")
+        logger.info(f"  Velocity Threshold: {FALL_VELOCITY_THRESHOLD}px/frame (ref_h={FALL_VELOCITY_REF_HEIGHT})")
         logger.info(f"  Angle Change Threshold: {FALL_ANGLE_CHANGE_THRESHOLD}°")
         logger.info(f"  Aspect Ratio Threshold: {FALL_ASPECT_RATIO_THRESHOLD}")
         logger.info(f"  Confidence Threshold: {FALL_CONFIDENCE_THRESHOLD}")
+        logger.info(f"  Confirm frames: {FALL_CONFIRM_FRAMES}")
+        logger.info(
+            f"  Pose overlay: {ENABLE_POSE_FALL} "
+            f"(model={POSE_MODEL_PATH}, every {POSE_INTERVAL_FRAMES}f, "
+            f"torso>{POSE_TORSO_ANGLE_THRESHOLD:.0f}°)"
+        )
+    logger.info(f"Face model pack: {FACE_MODEL_PACK}")
+    logger.info(f"Input upscale before YOLO: {ENABLE_INPUT_UPSCALE} (min {MIN_INPUT_RESOLUTION}px)")
     logger.info(f"Metrics: window={METRICS_WINDOW_SIZE} log_interval={METRICS_LOG_INTERVAL}")
     logger.info("=" * 60)
     logger.info(f"Log format: {LOG_FORMAT}")

@@ -10,7 +10,10 @@ from .config import (
     FALL_ANGLE_CHANGE_THRESHOLD,
     FALL_ASPECT_RATIO_THRESHOLD,
     FALL_CONFIDENCE_THRESHOLD,
+    FALL_CONFIRM_FRAMES,
+    FALL_VELOCITY_REF_HEIGHT,
     FALL_VELOCITY_THRESHOLD,
+    POSE_TORSO_ANGLE_THRESHOLD,
     ENABLE_FALL_DETECTION,
     HOLD_SUPPRESS_IOU,
     MATCH_IOU_THRESHOLD,
@@ -118,6 +121,9 @@ def get_camera_state(camera_id: str) -> Dict[str, Any]:
                     angle_change_threshold=FALL_ANGLE_CHANGE_THRESHOLD,
                     aspect_ratio_threshold=FALL_ASPECT_RATIO_THRESHOLD,
                     confidence_threshold=FALL_CONFIDENCE_THRESHOLD,
+                    confirm_frames=FALL_CONFIRM_FRAMES,
+                    velocity_ref_height=FALL_VELOCITY_REF_HEIGHT,
+                    pose_torso_angle_threshold=POSE_TORSO_ANGLE_THRESHOLD,
                 ) if ENABLE_FALL_DETECTION else None,
             }
         return camera_states[camera_id]

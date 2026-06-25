@@ -23,11 +23,19 @@ def main() -> int:
         help="Source weights (.pt); downloads via Ultralytics if missing",
     )
     parser.add_argument("--out", default="models/yolo26n.onnx", help="Output ONNX path")
-    parser.add_argument("--imgsz", type=int, default=640, help="Square input size")
+    parser.add_argument("--imgsz", type=int, default=640, help="Square input size (minimum 640)")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument("--simplify", action="store_true", default=True)
     parser.add_argument("--no-simplify", action="store_false", dest="simplify")
     args = parser.parse_args()
+
+    min_resolution = 640
+    if args.imgsz < min_resolution:
+        print(
+            f"ERROR: --imgsz must be >= {min_resolution} (got {args.imgsz})",
+            file=sys.stderr,
+        )
+        return 1
 
     repo_root = Path(__file__).resolve().parent.parent
     model_path = Path(args.model)
@@ -61,7 +69,7 @@ def main() -> int:
         print(f"Copied to {out_path}")
 
     print(f"OK: {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
-    print("Set on AI Box: MODEL_PATH=/app/models/yolo26n.onnx")
+    print(f"Set on AI Box: MODEL_PATH=/app/models/{out_path.name}")
     return 0
 
 

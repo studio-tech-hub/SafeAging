@@ -39,6 +39,7 @@ class TestFallDetectionTracker:
             angle_change_threshold=30.0,
             aspect_ratio_threshold=1.2,
             confidence_threshold=0.5,
+            confirm_frames=1,
         )
         defaults.update(kw)
         return FallDetectionTracker(**defaults)
@@ -109,13 +110,30 @@ class TestFallDetectionTracker:
     # --- reset -----------------------------------------------------------
 
     def test_reset_clears_fall_state(self):
-        t = self._tracker(velocity_threshold=10.0)
+        t = self._tracker(velocity_threshold=10.0, confirm_frames=1)
         t.update(_upright_bbox(cy=100), confidence=0.9, frame_idx=1)
         t.update(_upright_bbox(cy=160), confidence=0.9, frame_idx=2)
         assert t.fall_detected is True
         t.reset_fall()
         assert t.fall_detected is False
         assert t.fall_frame_count == 0
+
+    def test_pose_torso_hint_triggers_fall(self):
+        t = self._tracker(velocity_threshold=50.0, confirm_frames=1)
+        t.update(_upright_bbox(cy=100), confidence=0.9, frame_idx=1)
+        result = t.update(
+            _upright_bbox(cy=103),
+            confidence=0.9,
+            frame_idx=2,
+            pose_hint={"torso_angle_from_vertical": 70.0},
+        )
+        assert result is True
+
+        t = self._tracker(velocity_threshold=10.0, confirm_frames=3)
+        t.update(_upright_bbox(cy=100), confidence=0.9, frame_idx=1)
+        assert t.update(_upright_bbox(cy=160), confidence=0.9, frame_idx=2) is False
+        assert t.update(_upright_bbox(cy=220), confidence=0.9, frame_idx=3) is False
+        assert t.update(_upright_bbox(cy=280), confidence=0.9, frame_idx=4) is True
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +148,7 @@ class TestFallDetectionManager:
             aspect_ratio_threshold=1.2,
             confidence_threshold=0.5,
             tracker_ttl=10,
+            confirm_frames=1,
         )
         defaults.update(kw)
         return FallDetectionManager(**defaults)

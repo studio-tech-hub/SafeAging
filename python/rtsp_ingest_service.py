@@ -88,9 +88,27 @@ MAX_QUEUE_SIZE = 2
 AI_SERVICE_URL = "http://127.0.0.1:18000/infer"
 AI_API_KEY = os.getenv("AI_API_KEY", os.getenv("API_KEY", "")).strip()
 
-# Frame preprocessing
-FRAME_DOWNSCALE_WIDTH = 640  # Resize to 640px width for faster inference
+# Frame preprocessing — never send frames with either side below MIN_INPUT_SIDE.
+MIN_INPUT_SIDE = max(640, int(os.getenv("MIN_INPUT_RESOLUTION", "640")))
+# Optional max width downscale (0 = disabled). If set, result must still keep min side >= MIN_INPUT_SIDE.
+FRAME_MAX_WIDTH = int(os.getenv("FRAME_MAX_WIDTH", "0"))
 FRAME_ENCODE_QUALITY = 80    # JPEG quality (1-100)
+
+
+def _prepare_frame_for_analytics(frame: np.ndarray) -> np.ndarray:
+    """Resize so both dimensions are at least MIN_INPUT_SIDE before /infer."""
+    h, w = frame.shape[:2]
+    min_side = min(h, w)
+    if min_side < MIN_INPUT_SIDE:
+        scale = MIN_INPUT_SIDE / min_side
+        return cv2.resize(frame, (int(round(w * scale)), int(round(h * scale))))
+    if FRAME_MAX_WIDTH > 0 and w > FRAME_MAX_WIDTH:
+        scale = FRAME_MAX_WIDTH / w
+        new_w = FRAME_MAX_WIDTH
+        new_h = int(round(h * scale))
+        if min(new_w, new_h) >= MIN_INPUT_SIDE:
+            return cv2.resize(frame, (new_w, new_h))
+    return frame.copy()
 
 # Output options
 ENABLE_PREVIEW = False       # Show cv2.imshow live preview (set True to enable)
@@ -380,14 +398,8 @@ class RTSPIngestService:
             Tuple of (detections list, exception or None, frame_sent_to_ai)
         """
         try:
-            # Resize frame for faster inference.
-            # Keep the exact frame sent to AI so drawn boxes align with output coords.
-            if FRAME_DOWNSCALE_WIDTH > 0 and frame.shape[1] > FRAME_DOWNSCALE_WIDTH:
-                scale = FRAME_DOWNSCALE_WIDTH / frame.shape[1]
-                new_h = int(frame.shape[0] * scale)
-                frame_resized = cv2.resize(frame, (FRAME_DOWNSCALE_WIDTH, new_h))
-            else:
-                frame_resized = frame.copy()
+            # Resize frame for analytics (min side >= 640px; boxes align with sent frame).
+            frame_resized = _prepare_frame_for_analytics(frame)
             
             # Encode frame to JPEG
             ret, jpeg_bytes = cv2.imencode('.jpg', frame_resized, [cv2.IMWRITE_JPEG_QUALITY, FRAME_ENCODE_QUALITY])

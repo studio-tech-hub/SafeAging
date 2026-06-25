@@ -1,21 +1,10 @@
-"""Dependency health probes with TTL caching.
-
-Probes run at most once per _PROBE_TTL seconds; cached results are returned
-between probes to keep /health fast without hammering the dependencies.
-
-Updates the Prometheus DB_UP and OBJECT_STORAGE_UP gauges as a side effect.
-
-Usage in api.py:
-    await refresh_probes()
-    deps = dependency_snapshot()
-    status, reason_codes = compute_status(model_ok=True, deps=deps)
-"""
+"""Dependency health probes with TTL caching."""
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from .config import DATABASE_URL, S3_ENDPOINT, logger
+from .config import DATABASE_URL, S3_ENDPOINT, logger, HEALTH_AVG_DEGRADED_MS, HEALTH_P95_DEGRADED_MS
 
 _PROBE_TTL: float = 30.0  # seconds between live probes
 
@@ -112,6 +101,7 @@ def dependency_snapshot() -> Dict[str, str]:
 def compute_status(
     model_ok: bool,
     deps: Dict[str, str],
+    pipeline: Optional[Dict[str, object]] = None,
 ) -> Tuple[str, List[str]]:
     """Derive top-level health status and reason codes.
 
@@ -135,9 +125,30 @@ def compute_status(
     if deps.get("object_storage") == "down":
         reason_codes.append("object_storage_unreachable")
 
-    # Future placeholders — populated when their features land:
-    #   "outbox_backlog_high"  (Service P1.3)
-    #   "config_stale"         (Service P1.2)
+    if pipeline:
+        cameras = pipeline.get("cameras") or {}
+        if isinstance(cameras, dict):
+            for _cam_id, stats in cameras.items():
+                if not isinstance(stats, dict):
+                    continue
+                reqs = int(stats.get("requests", 0) or 0)
+                if reqs < 5:
+                    continue
+                avg_ms = float(stats.get("avg_infer_ms", 0) or 0)
+                p95_ms = float(stats.get("p95_infer_ms", 0) or 0)
+                if avg_ms >= HEALTH_AVG_DEGRADED_MS or p95_ms >= HEALTH_P95_DEGRADED_MS:
+                    reason_codes.append("pipeline_latency_high")
+                    break
+
+    try:
+        import psutil
+
+        load1 = psutil.getloadavg()[0]
+        cpu_count = psutil.cpu_count(logical=True) or 1
+        if load1 / cpu_count >= 0.85:
+            reason_codes.append("host_cpu_overloaded")
+    except Exception:
+        pass
 
     status = "degraded" if reason_codes else "healthy"
     return status, reason_codes

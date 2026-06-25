@@ -599,20 +599,26 @@ namespace sample_company
                 "name": "detection_frame_period",
                 "caption": "Detection Frame Period",
                 "defaultValue": 2,
-                "description": "Run detection every Nth frame (2 = every other frame)."
+                "minValue": 1,
+                "maxValue": 60,
+                "description": "Run detection every Nth frame (1 = every frame)."
             },
             {
                 "type": "SpinBox",
                 "name": "target_enqueue_fps",
                 "caption": "Target Enqueue FPS",
-                "defaultValue": 3,
-                "description": "Max frame enqueue rate to AI worker. Use 2-3 on CPU/dev; 5-8 on AI Box after tuning."
+                "defaultValue": 2,
+                "minValue": 1,
+                "maxValue": 60,
+                "description": "Max frame enqueue rate to AI worker. Use low values on CPU-only AI Box."
             },
             {
                 "type": "SpinBox",
                 "name": "frame_queue_max_size",
                 "caption": "Frame Queue Max Size",
                 "defaultValue": 1,
+                "minValue": 1,
+                "maxValue": 100,
                 "description": "Max buffered frames before dropping oldest (1 = prefer freshest frame)."
             },
             {
@@ -1188,21 +1194,24 @@ namespace sample_company
                             printableSettingValue(rawServiceRetryBackoffMs));
 
                 const bool detectionEnabled = parseBoolSettingValue(rawEnabled, true);
-                const int detectionPeriod = parseIntSettingValue(
+                const int requestedDetectionPeriod = parseIntSettingValue(
                     rawDetectionPeriod,
                     kDefaultDetectionFramePeriod,
                     1,
                     60);
-                const int enqueueFps = parseIntSettingValue(
+                const int requestedEnqueueFps = parseIntSettingValue(
                     rawEnqueueFps,
                     kDefaultTargetEnqueueFps,
                     1,
                     60);
-                const int queueMax = parseIntSettingValue(
+                const int requestedQueueMax = parseIntSettingValue(
                     rawQueueMax,
                     static_cast<int>(kDefaultFrameQueueMaxSize),
                     1,
                     100);
+                const int detectionPeriod = requestedDetectionPeriod;
+                const int enqueueFps = requestedEnqueueFps;
+                const int queueMax = requestedQueueMax;
                 const int metricsPeriod = parseIntSettingValue(
                     rawMetricsPeriod,
                     kDefaultMetricsLogPeriodSec,

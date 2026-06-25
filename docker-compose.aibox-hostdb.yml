@@ -1,8 +1,9 @@
-# AI Box overlay — QCS6490 kernel lacks SysV shm; PostgreSQL cannot run in Docker here.
-# Analytics uses EDGE_SQLITE_PATH (/app/runtime/edge_state.db) for persons, embeddings,
-# zones, events — admin UI and face gallery work without Postgres.
+# AI Box CPU production profile — QCS6490 @ 640px (commercial headroom).
 #
 #   docker compose -f docker-compose.yml -f docker-compose.aibox-hostdb.yml up -d
+#
+# Models: yolo26n.onnx only on CPU (do NOT use yolo26s here).
+# ORT 1.24.4 pinned in Dockerfile (aarch64 wheel).
 
 services:
   postgres:
@@ -14,23 +15,56 @@ services:
         condition: service_started
     environment:
       - DATABASE_URL=
-      # ── AI Box stable profile (QCS6490) ─────────────────────────────────────
-      # Must stay at 1 worker: camera track state lives in-process (not shared).
-      - UVICORN_WORKERS=${UVICORN_WORKERS:-1}
-      - MODEL_PATH=${MODEL_PATH:-/app/models/yolo26n.onnx}
+      # ── Inference (CPU lean, ~4 ORT threads total for headroom) ─────────────
+      - UVICORN_WORKERS=1
+      - MODEL_PATH=/app/models/yolo26n.onnx
       - YOLO_IMGSZ=640
-      - ENABLE_FACE_RECOGNITION=${ENABLE_FACE_RECOGNITION:-true}
-      # buffalo_l matches default enrollment; do not switch to buffalo_s on edge.
-      - FACE_MODEL_PACK=buffalo_l
-      - FACE_RECOG_INTERVAL_FRAMES=${FACE_RECOG_INTERVAL_FRAMES:-6}
-      - FACE_DET_SIZE=${FACE_DET_SIZE:-640}
-      - FACE_MATCH_THRESHOLD=${FACE_MATCH_THRESHOLD:-0.40}
-      - OUTPUT_TENTATIVE_TRACKS=true
-      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
-      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}
+      - YOLO_BACKEND=cpu_lean
+      - YOLO_LEAN_POOL_SIZE=2
+      - YOLO_LEAN_THREADS=2
+      - ENABLE_INPUT_UPSCALE=true
+      - CONFIDENCE_THRESHOLD=0.70
+      - IOU_THRESHOLD=0.45
+      - PERSON_MIN_HW_RATIO=0.75
+      - MIN_DETECTION_AREA=24
+      - TRACK_MIN_HITS=2
+      - OUTPUT_TENTATIVE_TRACKS=false
+      # ── Face (buffalo_s + time scheduler) ───────────────────────────────────
+      - ENABLE_FACE_RECOGNITION=true
+      - FACE_MODEL_PACK=buffalo_s
+      - FACE_DET_SIZE=640
+      - FACE_MIN_PIXELS=40
+      - FACE_MATCH_THRESHOLD=0.42
+      - FACE_RECOG_USE_TIME_SCHEDULER=true
+      - FACE_RECOG_UNKNOWN_RETRY_SEC=8
+      # ── Fall (bbox always; tier-2 pose crop only when suspected) ──────────
+      - ENABLE_FALL_DETECTION=true
+      - ENABLE_POSE_FALL=false
+      - FALL_CONFIRM_FRAMES=3
+      - FALL_VELOCITY_REF_HEIGHT=120
+      - FALL_VELOCITY_THRESHOLD=22
+      - FALL_ASPECT_RATIO_THRESHOLD=1.6
+      - FALL_CONFIDENCE_THRESHOLD=0.80
+      # ── ROI (per-camera via admin extra.roi; global rect fallback) ─────────
+      - ENABLE_ROI=true
+      - ROI_TYPE=rect
+      - ROI_X_MIN=0.0
+      - ROI_Y_MIN=0.0
+      - ROI_X_MAX=1.0
+      - ROI_Y_MAX=1.0
+      # ── Health / security ─────────────────────────────────────────────────
+      - HEALTH_P95_DEGRADED_MS=800
+      - HEALTH_AVG_DEGRADED_MS=650
+      - API_KEY_REQUIRED=true
+      - API_KEY=${API_KEY:-change-me-to-a-strong-secret}
+      - RATE_LIMIT_SKIP_LOOPBACK=true
+      - ENABLE_CLAHE=false
+      - ENABLE_MULTI_SCALE=false
+      - OMP_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
     volumes:
-      # Persist insightface model pack across container recreates (buffalo_l ~280MB).
       - safeaging-insightface:/root/.insightface
+      - /root/SafeAging/docker/wheels:/wheels:ro
 
 volumes:
   safeaging-insightface:

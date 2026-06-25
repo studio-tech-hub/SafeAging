@@ -118,7 +118,7 @@ private:
     static constexpr int kThresholdWarnThrottleSec = 60;
 
     static constexpr int kDefaultDetectionFramePeriod = 2;
-    static constexpr int kDefaultTargetEnqueueFps = 3;
+    static constexpr int kDefaultTargetEnqueueFps = 2;
     static constexpr size_t kDefaultFrameQueueMaxSize = 1;
     static constexpr int kDefaultMetricsLogPeriodSec = 10;
 
@@ -130,7 +130,7 @@ private:
     static constexpr int kDefaultHealthPollIntervalSec = 30;
     static constexpr int kHealthPollInitialDelaySec = 15;
     // When no tracks are rendered yet, allow a modest boost (not 10 fps — overloads CPU infer).
-    static constexpr int kAcquireBoostEnqueueFps = 4;
+    static constexpr int kAcquireBoostEnqueueFps = 2;
 
     // P2.2 – per-camera config poll defaults
     static constexpr int kDefaultConfigPollIntervalSec = 300; // 5 minutes

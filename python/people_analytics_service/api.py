@@ -29,6 +29,10 @@ from .config import (
     ENABLE_HISTORY_REMATCH,
     ENABLE_MULTI_SCALE,
     FACE_RECOG_INTERVAL_FRAMES,
+    FACE_RECOG_UNKNOWN_RETRY_SEC,
+    FACE_RECOG_USE_TIME_SCHEDULER,
+    ENABLE_INPUT_UPSCALE,
+    ENABLE_POSE_FALL,
     ENABLE_POST_NMS,
     ENABLE_ROI,
     ENABLE_UNDISTORT,
@@ -36,12 +40,16 @@ from .config import (
     HOLD_SUPPRESS_IOU,
     IOU_THRESHOLD,
     MIN_DETECTION_AREA,
+    MIN_INPUT_RESOLUTION,
     METRICS_LOG_INTERVAL,
     METRICS_WINDOW_SIZE,
     MODEL_PATH,
     NEW_TRACK_MIN_CONFIDENCE,
     OUTPUT_DEDUPE_IOU,
     OUTPUT_TENTATIVE_TRACKS,
+    POSE_INTERVAL_FRAMES,
+    POSE_KEYPOINT_CONF,
+    POSE_IMGSZ,
     PERSON_MIN_HW_RATIO,
     POST_NMS_IOU,
     RATE_LIMIT_ENABLED,
@@ -84,12 +92,15 @@ from .metrics import (
     YOLO_LATENCY,
 )
 from .model import load_model
+from . import yolo_backend
 from . import face_engine
+from . import pose_backend
 from .zone_engine import check_zones, get_zones_for_camera_sync
 from .config_engine import get_per_camera_config_sync
 from .preprocess import (
     apply_roi,
     auto_adjust_brightness,
+    ensure_min_input_side,
     load_calibration,
     multi_scale_inference_smart,
     preprocess_frame,
@@ -316,9 +327,10 @@ def _resolve_model_device(yolo_model=None) -> str:
 def _warmup_model(yolo_model) -> str:
     # Warm a small square frame to initialize PyTorch/CUDA context without
     # paying the full cost of the largest production imgsz at startup.
-    warmup_imgsz = max(64, min(int(YOLO_IMGSZ), 640))
+    warmup_imgsz = int(YOLO_IMGSZ)
     warmup_frame = np.zeros((warmup_imgsz, warmup_imgsz, 3), dtype=np.uint8)
-    yolo_model.predict(
+    yolo_backend.predict_yolo(
+        yolo_model,
         warmup_frame,
         conf=CONFIDENCE_THRESHOLD,
         iou=IOU_THRESHOLD,
@@ -326,9 +338,7 @@ def _warmup_model(yolo_model) -> str:
         imgsz=warmup_imgsz,
         verbose=False,
         augment=False,
-        device=DEVICE,
-        half=USE_HALF,
-    )[0]
+    )
     return _resolve_model_device(yolo_model)
 
 
@@ -416,19 +426,25 @@ def _apply_face_identity(
     for det in detections:
         if det.cls != "person":
             continue
-        # Identity labels are render-only; run on any output bbox (including
-        # tentative/degraded) so tuning detection does not drop face recognition.
+        if not det.stable or det.degraded:
+            continue
 
         tid = det.track_id
         cached = identity.get(tid)
 
         attempt = False
+        now_mono = time.monotonic()
         if cached is None:
             attempt = True
         elif not cached.get("recognized"):
-            last = cached.get("last_attempt", -10_000)
-            if camera_frame_idx - last >= FACE_RECOG_INTERVAL_FRAMES:
-                attempt = True
+            if FACE_RECOG_USE_TIME_SCHEDULER:
+                last_ts = cached.get("last_attempt_ts", 0.0)
+                if now_mono - last_ts >= FACE_RECOG_UNKNOWN_RETRY_SEC:
+                    attempt = True
+            else:
+                last = cached.get("last_attempt", -10_000)
+                if camera_frame_idx - last >= FACE_RECOG_INTERVAL_FRAMES:
+                    attempt = True
 
         if attempt:
             crop = _crop_person_head_region(frame, det, W, H)
@@ -456,6 +472,7 @@ def _apply_face_identity(
                     "no": no,
                     "score": match.score,
                     "last_attempt": camera_frame_idx,
+                    "last_attempt_ts": now_mono,
                 }
             else:
                 cached = {
@@ -466,6 +483,7 @@ def _apply_face_identity(
                     "age": None,
                     "no": None,
                     "last_attempt": camera_frame_idx,
+                    "last_attempt_ts": now_mono,
                 }
             with camera_lock:
                 identity[tid] = cached
@@ -624,11 +642,6 @@ async def health_check(response: Response):
         and snapshot["model_loaded"]
         and snapshot["warmup_ok"]
     )
-    status, reason_codes = compute_status(model_ok=model_ok, deps=deps)
-
-    snapshot["status"] = status
-    snapshot["reason_codes"] = reason_codes
-    snapshot["dependencies"] = deps
 
     # P P1.4 – aggregate per-camera pipeline stats for operator correlation
     with camera_states_lock:
@@ -651,13 +664,22 @@ async def health_check(response: Response):
             }
         except Exception:
             pass
-    snapshot["pipeline"] = {
+    pipeline = {
         "active_cameras": len(per_camera),
         "total_requests": total_requests,
         "total_errors": total_errors,
         "error_rate": round(total_errors / total_requests, 4) if total_requests > 0 else 0.0,
+        "yolo_backend": yolo_backend.active_backend(),
+        "qnn": yolo_backend.qnn_runtime_status(),
         "cameras": per_camera,
     }
+    snapshot["pipeline"] = pipeline
+
+    status, reason_codes = compute_status(model_ok=model_ok, deps=deps, pipeline=pipeline)
+
+    snapshot["status"] = status
+    snapshot["reason_codes"] = reason_codes
+    snapshot["dependencies"] = deps
 
     health_payload = HealthResponse(**snapshot)
     if not health_payload.ready:
@@ -792,6 +814,11 @@ def infer(req: InferRequest, request: Request):
                 logger.debug(f"[{camera_id}] Undistortion: {undistort_time_ms:.1f}ms")
         pre_roi_shape = frame.shape
 
+        cam_cfg = get_per_camera_config_sync(camera_id)
+        roi_override = None
+        if cam_cfg and isinstance(cam_cfg.get("extra"), dict):
+            roi_override = cam_cfg["extra"].get("roi")
+
         # ============================================
         # 1.5) ROI Crop (Region of Interest)
         # ============================================
@@ -799,7 +826,7 @@ def infer(req: InferRequest, request: Request):
         roi_type = None
         if ENABLE_ROI:
             roi_start = time.perf_counter()
-            frame, roi_box, roi_type = apply_roi(frame)
+            frame, roi_box, roi_type = apply_roi(frame, roi_override=roi_override)
             roi_time_ms = (time.perf_counter() - roi_start) * 1000.0
             preprocess_time_ms += roi_time_ms
             H_roi, W_roi = frame.shape[:2]
@@ -827,7 +854,6 @@ def infer(req: InferRequest, request: Request):
         # ============================================
         # 1.7) Per-camera config override (P2.2)
         # ============================================
-        cam_cfg = get_per_camera_config_sync(camera_id)
         _conf_threshold = (cam_cfg["confidence_threshold"] if cam_cfg and cam_cfg.get("confidence_threshold") is not None
                            else CONFIDENCE_THRESHOLD)
         _iou_threshold = (cam_cfg["iou_threshold"] if cam_cfg and cam_cfg.get("iou_threshold") is not None
@@ -851,24 +877,30 @@ def infer(req: InferRequest, request: Request):
                     logger.debug(f"Failed to save pre-YOLO frame: {e}")
             
             yolo_start = time.perf_counter()
+
+            yolo_frame = frame
+            yolo_inv_scale = 1.0
+            if ENABLE_INPUT_UPSCALE:
+                yolo_frame, yolo_scale = ensure_min_input_side(frame, MIN_INPUT_RESOLUTION)
+                if yolo_scale != 1.0:
+                    yolo_inv_scale = 1.0 / yolo_scale
             
             # Choose inference strategy
             if ENABLE_MULTI_SCALE:
                 # Smart multi-scale detection: only retry at larger scale if no detections
-                r = multi_scale_inference_smart(yolo_model, frame, H, W)
+                r = multi_scale_inference_smart(yolo_model, yolo_frame, H, W)
             else:
                 # Standard single-scale inference - PRODUCTION MODE
-                r = yolo_model.predict(
-                    frame,
+                r = yolo_backend.predict_yolo(
+                    yolo_model,
+                    yolo_frame,
                     conf=_conf_threshold,
                     iou=_iou_threshold,
                     classes=[0],  # person only
                     imgsz=YOLO_IMGSZ,
                     verbose=False,
                     augment=False,
-                    device=DEVICE,
-                    half=USE_HALF,
-                )[0]
+                )
             
             yolo_time_ms = (time.perf_counter() - yolo_start) * 1000.0
             
@@ -930,6 +962,11 @@ def infer(req: InferRequest, request: Request):
 
                 score = float(box.conf[0].item())
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
+                if yolo_inv_scale != 1.0:
+                    x1 *= yolo_inv_scale
+                    y1 *= yolo_inv_scale
+                    x2 *= yolo_inv_scale
+                    y2 *= yolo_inv_scale
 
                 # Clamp to frame boundaries
                 x1 = max(0.0, min(x1, W - 1.0))
@@ -1260,10 +1297,33 @@ def infer(req: InferRequest, request: Request):
                         'confidence': det.score,
                     })
                 
-                # Update fall detector with current frame detections
+                # Tier 1: bbox fall every frame
                 with camera_lock:
-                    fall_results = fall_detector.update(fall_input_detections, camera_frame_idx)
+                    fall_results = fall_detector.update(
+                        fall_input_detections,
+                        camera_frame_idx,
+                        pose_hints=None,
+                    )
                     fall_stats = fall_detector.get_stats()
+
+                # Tier 2: pose on person crop only when bbox signals pending fall
+                if ENABLE_POSE_FALL and fall_input_detections:
+                    pose_candidates = fall_detector.get_pose_candidate_track_ids()
+                    if pose_candidates:
+                        pose_hints = pose_backend.match_pose_to_crops(
+                            yolo_frame,
+                            fall_input_detections,
+                            pose_candidates,
+                            conf=POSE_KEYPOINT_CONF,
+                            imgsz=POSE_IMGSZ,
+                        )
+                        if pose_hints:
+                            with camera_lock:
+                                refined = fall_detector.apply_pose_hints(pose_hints)
+                                for tid, fell in refined.items():
+                                    if fell:
+                                        fall_results[tid] = True
+                                fall_stats = fall_detector.get_stats()
                 
                 # Mark detections with fall status
                 for det in detections:
