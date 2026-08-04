@@ -218,8 +218,23 @@ from the NMS fix resolve.
 
 ## Additive binary/multipart transport for /infer (P1-4)
 
-**Status: additive, opt-in, not yet field-validated.** Default behavior is
-unchanged; do not enable in production until benchmarked on real hardware.
+**Status: deployed to production AI Box (2026-08-04), additive and opt-in.**
+Every camera still defaults to `transport_mode=json_base64`; the new
+`/infer/binary` route and `MultipartBinaryTransport` C++ path exist and are
+verified reachable/functional, but no camera has been switched to
+`transport_mode=binary` yet — do not do so until the real-hardware
+benchmark below has been run.
+
+Deployment verification performed on the AI Box: the Python service was
+rebuilt/recreated with `POST /infer/binary` live (confirmed with a 422 on an
+empty request, then a full end-to-end multipart call returning the same
+result shape as `/infer` for the same frame); the plugin was rebuilt
+natively (aarch64, `build_plugin_aibox.sh --install`) and the manifest/`.so`
+on disk were confirmed to contain `transport_mode`/`MultipartBinaryTransport`;
+`networkoptix-mediaserver` restarted cleanly and all 4 production cameras
+reconnected on the (unchanged) `json_base64` transport with `total_errors: 0`
+afterwards. The previous `.so`/`manifest.json` were backed up to
+`/root/plugin_backups/` on the box before install, for rollback.
 
 - The analytics service now also accepts `POST /infer/binary`
   (`multipart/form-data`: `camera_id` form field + raw JPEG bytes as the
