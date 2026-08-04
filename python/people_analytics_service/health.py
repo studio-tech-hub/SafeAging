@@ -102,12 +102,16 @@ def compute_status(
     model_ok: bool,
     deps: Dict[str, str],
     pipeline: Optional[Dict[str, object]] = None,
+    auth_disabled: bool = False,
 ) -> Tuple[str, List[str]]:
     """Derive top-level health status and reason codes.
 
     Args:
-        model_ok: True when model is loaded and warmup succeeded.
-        deps:     Result of dependency_snapshot().
+        model_ok:      True when model is loaded and warmup succeeded.
+        deps:          Result of dependency_snapshot().
+        auth_disabled: True when API_KEY_REQUIRED is effectively false (P0-2)
+                       — surfaced as "auth_disabled" so operators/monitoring
+                       can alert on an unauthenticated deployment.
 
     Returns:
         (status, reason_codes)
@@ -118,6 +122,9 @@ def compute_status(
         return "not_ready", []
 
     reason_codes: List[str] = []
+
+    if auth_disabled:
+        reason_codes.append("auth_disabled")
 
     if deps.get("postgres") == "down":
         reason_codes.append("db_unreachable")

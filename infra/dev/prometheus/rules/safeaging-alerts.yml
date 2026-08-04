@@ -1,0 +1,74 @@
+groups:
+  - name: safeaging.production
+    rules:
+      - alert: SafeAgingAnalyticsDown
+        expr: up{job="safeaging-analytics"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: SafeAging analytics is down
+          description: Prometheus cannot scrape analytics /metrics.
+
+      - alert: SafeAgingDependencyDown
+        expr: safeaging_db_up == 0 or safeaging_object_storage_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: SafeAging dependency is down
+          description: PostgreSQL or MinIO health probe is failing.
+
+      - alert: SafeAgingInferenceP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le, camera_id) (rate(safeaging_infer_latency_seconds_bucket[5m]))
+          ) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SafeAging inference p95 latency is high
+          description: "camera={{ $labels.camera_id }} p95 latency is above 800ms for 5 minutes."
+
+      - alert: SafeAgingInferenceAvgAboveTarget
+        expr: |
+          (
+            sum by (camera_id) (rate(safeaging_infer_latency_seconds_sum[5m]))
+            /
+            sum by (camera_id) (rate(safeaging_infer_latency_seconds_count[5m]))
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: SafeAging inference average is above target
+          description: "camera={{ $labels.camera_id }} average latency is above 100ms target."
+
+      - alert: SafeAgingInferenceErrors
+        expr: sum by (camera_id) (rate(safeaging_infer_errors_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: SafeAging inference errors detected
+          description: "camera={{ $labels.camera_id }} has inference errors."
+
+      - alert: SafeAgingOutboxBacklog
+        expr: safeaging_outbox_pending > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: SafeAging outbox backlog is growing
+          description: Outbox has more than 50 pending items.
+
+      - alert: SafeAgingOutboxErrors
+        expr: sum by (kind) (rate(safeaging_outbox_errors_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: SafeAging outbox errors detected
+          description: "outbox error kind={{ $labels.kind }} is increasing."

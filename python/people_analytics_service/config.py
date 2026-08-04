@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -82,6 +83,17 @@ def _env_int(name: str, default: int) -> int:
 # Minimum square inference input (px) for YOLO, face detection, and ONNX exports.
 MIN_INPUT_RESOLUTION = max(640, _env_int("MIN_INPUT_RESOLUTION", 640))
 
+# Bumped whenever a recommended-*default* tuning change ships (e.g. P1-2's
+# CONFIDENCE_THRESHOLD 0.75->0.55 and ROI invalid-range fallback 0.3->0.0), so
+# support/ops can tell which documented defaults a given deployment was built
+# against from `log_config_summary()` alone, without needing its full .env.
+# This is NOT an API/DB schema version and has no effect on behavior by
+# itself — it never gates logic, only appears in logs.
+#   1 = pre-P1-2 baseline (CONFIDENCE_THRESHOLD=0.75, ROI fallback=[0.3, 1.0])
+#   2 = P1-2 (CONFIDENCE_THRESHOLD=0.55, ROI fallback=[0.0, 1.0], track-state-aware
+#       PERSON_MIN_HW_RATIO)
+CONFIG_SCHEMA_VERSION = 2
+
 
 def _clamp_min_square_resolution(env_name: str, default: int) -> int:
     """Clamp a square input size env var to MIN_INPUT_RESOLUTION (default 640)."""
@@ -109,6 +121,79 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_or_file(name: str, default: str = "") -> str:
+    """Read a secret from `{name}_FILE` (Docker/Kubernetes secrets convention,
+    e.g. API_KEY_FILE=/run/secrets/api_key) if set, else fall back to the
+    plain `{name}` env var, else `default` (P0-4).
+
+    `_FILE` takes precedence when both are set, matching the common
+    "Docker secrets" convention (e.g. the official postgres/mysql images) so
+    an operator can point `*_FILE` at a mounted secret without also having
+    to remember to unset the inline var. Purely additive: unset `_FILE` and
+    every existing plain-env-var deployment behaves exactly as before.
+    """
+    file_path = os.getenv(f"{name}_FILE", "").strip()
+    if not file_path:
+        return os.getenv(name, default).strip()
+    try:
+        return Path(file_path).read_text(encoding="utf-8").strip()
+    except OSError as e:
+        logger.warning(
+            f"Could not read {name}_FILE={file_path!r} ({e}); "
+            f"falling back to {name} env var."
+        )
+        return os.getenv(name, default).strip()
+
+
+# Known placeholder/default API key values (case-insensitive) that must never
+# be accepted as a "real" key when API_KEY_REQUIRED=true (P0-2).
+_INSECURE_API_KEY_VALUES = {
+    "",
+    "changeme",
+    "change-me",
+    "change_me",
+    "change-me-to-a-strong-secret",
+    "your-api-key-here",
+    "secret",
+    "password",
+    "admin",
+    "test",
+    "apikey",
+}
+
+
+# ── Secrets hygiene (P0-4) ────────────────────────────────────────────────
+# No diagnostic/support-bundle tool exists yet (planned for P1 observability
+# work), but any future one — and any ad hoc "dump config for a support
+# ticket" debugging — MUST redact through these first. Established now as a
+# convention so licensing keys / remote-update tokens (P4) follow the same
+# pattern from day one instead of inventing their own.
+_SECRET_KEY_PATTERN = re.compile(r"(API_KEY|PASSWORD|SECRET|TOKEN)", re.IGNORECASE)
+_REDACTED = "***REDACTED***"
+
+
+def is_secret_env_var(name: str) -> bool:
+    """True if an env-var-style name looks like it holds a secret (API_KEY,
+    *_PASSWORD, *_SECRET, *_TOKEN — including their *_FILE variants, since
+    e.g. API_KEY_FILE still matches "API_KEY"). Never dump os.environ or a
+    parsed .env file for logs/support bundles without filtering through
+    this (or redact_env_dict() below) first."""
+    return bool(_SECRET_KEY_PATTERN.search(name))
+
+
+def redact_env_dict(env: dict) -> dict:
+    """Return a copy of an env-var dict with secret-looking values replaced
+    by a fixed marker. Intended for any future diagnostic/support-bundle
+    tool (P1) that dumps configuration — e.g. `redact_env_dict(dict(os.environ))`."""
+    return {k: (_REDACTED if v and is_secret_env_var(k) else v) for k, v in env.items()}
+
+
+def redact_url_credentials(text: str) -> str:
+    """Mask `user:password@` credentials embedded in a URL-like string (e.g.
+    a Postgres DATABASE_URL) so it is safe to include in logs/diagnostics."""
+    return re.sub(r"://([^:/@\s]+):([^@/\s]+)@", rf"://\1:{_REDACTED}@", text)
+
+
 def _clamp(value: float, low: float, high: float, name: str) -> float:
     if value < low:
         logger.warning(f"{name}={value} is below {low}, clamping to {low}")
@@ -126,8 +211,16 @@ class AppConfig:
         self.service_port = _env_int("SERVICE_PORT", 18000)
         self.service_host = os.getenv("SERVICE_HOST", "127.0.0.1")
         self.model_path = os.getenv("MODEL_PATH", "yolo26n.pt")
+        # P1-2: default lowered 0.75 -> 0.55. The nano model at 640px with the old
+        # 0.75 default was tuned purely to suppress furniture false-positives, at
+        # the direct cost of missing small/far people — a much worse trade-off for
+        # a fall-detection/safety product than an occasional extra low-confidence
+        # box (which downstream tracking's TRACK_MIN_HITS/NMS/dedupe already
+        # filters before it becomes a "stable" output). Purely a documented-default
+        # change: any deployment with an explicit CONFIDENCE_THRESHOLD in its .env
+        # is completely unaffected.
         self.confidence_threshold = _clamp(
-            _env_float("CONFIDENCE_THRESHOLD", 0.75), 0.0, 1.0, "CONFIDENCE_THRESHOLD"
+            _env_float("CONFIDENCE_THRESHOLD", 0.55), 0.0, 1.0, "CONFIDENCE_THRESHOLD"
         )
         self.iou_threshold = _clamp(_env_float("IOU_THRESHOLD", 0.45), 0.0, 1.0, "IOU_THRESHOLD")
         self.min_detection_area = max(1, _env_int("MIN_DETECTION_AREA", 20))
@@ -208,6 +301,8 @@ class AppConfig:
         self.clahe_clip_limit = max(0.1, _env_float("CLAHE_CLIP_LIMIT", 2.0))
         self.clahe_tile_size = max(2, _env_int("CLAHE_TILE_SIZE", 16))
         self.save_debug_samples = _env_bool("SAVE_DEBUG_SAMPLES", False)
+        self.calib_capture_dir = os.getenv("CALIB_CAPTURE_DIR", "").strip()
+        self.calib_capture_max = max(0, _env_int("CALIB_CAPTURE_MAX", 0))
 
         self.enable_roi = _env_bool("ENABLE_ROI", True)
         self.roi_type = os.getenv("ROI_TYPE", "rect").strip().lower()
@@ -224,8 +319,13 @@ class AppConfig:
             logger.warning("ROI_X_MIN must be < ROI_X_MAX, fallback to [0.0, 1.0]")
             self.roi_x_min, self.roi_x_max = 0.0, 1.0
         if self.roi_y_min >= self.roi_y_max:
-            logger.warning("ROI_Y_MIN must be < ROI_Y_MAX, fallback to [0.3, 1.0]")
-            self.roi_y_min, self.roi_y_max = 0.3, 1.0
+            # P1-2: fall back to the full frame (0.0-1.0), not a guessed crop. The
+            # previous [0.3, 1.0] fallback was tuned for one specific camera framing
+            # and silently generalized as "the" default — for any other camera, it
+            # crops out the top of frame where a standing person's head appears. An
+            # invalid config should degrade to "no crop," never to a guessed one.
+            logger.warning("ROI_Y_MIN must be < ROI_Y_MAX, fallback to [0.0, 1.0] (full frame)")
+            self.roi_y_min, self.roi_y_max = 0.0, 1.0
 
         self.enable_undistort = _env_bool("ENABLE_UNDISTORT", False)
         self.camera_matrix_json = os.getenv("CAMERA_MATRIX_JSON", "")
@@ -247,6 +347,23 @@ class AppConfig:
         self.qnn_backend_path = os.getenv("QNN_BACKEND_PATH", "").strip()
         self.qnn_htp_performance_mode = os.getenv("QNN_HTP_PERFORMANCE_MODE", "burst").strip()
         self.qnn_htp_fp16 = _env_bool("QNN_HTP_FP16", True)
+        self.qnn_htp_arch = os.getenv("QNN_HTP_ARCH", "68").strip()
+        self.qnn_soc_model = os.getenv("QNN_SOC_MODEL", "").strip()
+        self.qnn_vtcm_mb = os.getenv("QNN_VTCM_MB", "").strip()
+        self.qnn_context_cache = _env_bool("QNN_CONTEXT_CACHE", True)
+        self.qnn_context_cache_dir = os.getenv("QNN_CONTEXT_CACHE_DIR", "/app/runtime/qnn_context").strip()
+        self.qnn_disable_cpu_fallback = _env_bool("QNN_DISABLE_CPU_FALLBACK", False)
+        # P1-3: coordinate space of end2end (NMS-embedded) ONNX box outputs.
+        # "auto" infers per-detection from overflow past frame bounds (documented
+        # fallback for already-exported models with no recorded contract); "canvas"
+        # forces letterbox-canvas rescaling; "frame" forces original-frame passthrough.
+        # Set explicitly once an export is known to always emit one or the other.
+        self.end2end_coord_space = os.getenv("END2END_COORD_SPACE", "auto").strip().lower()
+        if self.end2end_coord_space not in {"auto", "canvas", "frame"}:
+            logger.warning(
+                f"Invalid END2END_COORD_SPACE='{self.end2end_coord_space}', fallback to 'auto'"
+            )
+            self.end2end_coord_space = "auto"
 
         self.device = os.getenv("DEVICE", "cuda:0" if cuda_available else "cpu")
         self.use_half = _env_bool("USE_HALF", False)
@@ -255,12 +372,56 @@ class AppConfig:
         self.torch_cudnn_benchmark = _env_bool("TORCH_CUDNN_BENCHMARK", True)
 
         self.api_key_required = _env_bool("API_KEY_REQUIRED", True)
-        self.api_key = os.getenv("API_KEY", "").strip()
-        if self.api_key_required and not self.api_key:
+        # P0-4: API_KEY_FILE (Docker secrets convention) takes precedence over
+        # the inline API_KEY env var when both are set.
+        self.api_key = _env_or_file("API_KEY")
+        # Explicit, opt-in-only escape hatch (P0-2). Default False so nobody
+        # accidentally ships an unauthenticated deployment. Never set this on
+        # a network-reachable box — see tools/generate_api_key.py instead.
+        self.allow_insecure_no_auth = _env_bool("ALLOW_INSECURE_NO_AUTH", False)
+
+        api_key_is_placeholder = self.api_key.lower() in _INSECURE_API_KEY_VALUES
+        if self.api_key_required and (not self.api_key or api_key_is_placeholder):
+            if self.allow_insecure_no_auth:
+                logger.critical(
+                    "!!! SECURITY WARNING: API_KEY_REQUIRED=true but API_KEY is "
+                    "empty or a known placeholder, and ALLOW_INSECURE_NO_AUTH=true "
+                    "is set. Starting WITHOUT authentication — /infer, /admin/*, "
+                    "and /config/* are UNPROTECTED on the network. This must ONLY "
+                    "be used for an isolated lab/dev box. Never expose this "
+                    "configuration on a shared network or the internet. !!!"
+                )
+                self.api_key_required = False
+            else:
+                # Fail-closed (P0-2): a missing/placeholder key used to silently
+                # disable auth. It no longer does — refuse to start instead, so
+                # an insecure deployment can never happen by accident.
+                logger.critical(
+                    "FATAL: API_KEY_REQUIRED=true but API_KEY is empty or a "
+                    "known placeholder value. Refusing to start with "
+                    "authentication silently disabled. Fix with ONE of:\n"
+                    "  1) Set API_KEY to a strong random value:\n"
+                    "     python tools/generate_api_key.py\n"
+                    "  2) Set API_KEY_REQUIRED=false to intentionally run "
+                    "without auth (only for a fully isolated/trusted network).\n"
+                    "  3) Set ALLOW_INSECURE_NO_AUTH=true to explicitly "
+                    "acknowledge running without authentication (lab/dev only)."
+                )
+                raise RuntimeError(
+                    "API_KEY_REQUIRED=true but API_KEY is empty or a placeholder "
+                    "value. Set a real API_KEY (see tools/generate_api_key.py), "
+                    "set API_KEY_REQUIRED=false, or set ALLOW_INSECURE_NO_AUTH=true."
+                )
+
+        # True whenever protected endpoints end up unauthenticated, regardless
+        # of *why* (explicit API_KEY_REQUIRED=false or the escape hatch above).
+        # Surfaced in /health reason_codes so monitoring can alert on it.
+        self.auth_effectively_disabled = not self.api_key_required
+        if self.auth_effectively_disabled and not self.allow_insecure_no_auth:
             logger.warning(
-                "API_KEY_REQUIRED=true but API_KEY is empty. Authentication is disabled until API_KEY is set."
+                "API_KEY_REQUIRED=false — /infer, /admin/*, and /config/* are "
+                "UNPROTECTED. Only use this on a fully isolated/trusted network."
             )
-            self.api_key_required = False
 
         self.require_https = _env_bool("REQUIRE_HTTPS", False)
         self.tls_cert_file = os.getenv("TLS_CERT_FILE", "").strip()
@@ -284,10 +445,13 @@ class AppConfig:
         self.log_format = raw_log_format if raw_log_format in {"text", "json"} else "text"
 
         # ── External services (consumed by health probes + S P1.1/P1.3) ──────
-        self.database_url = os.getenv("DATABASE_URL", "").strip()
+        # P0-4: each of these accepts a `_FILE` variant (Docker secrets
+        # convention) that takes precedence over the inline value when set —
+        # e.g. DATABASE_URL_FILE=/run/secrets/database_url.
+        self.database_url = _env_or_file("DATABASE_URL")
         self.s3_endpoint = os.getenv("S3_ENDPOINT", "").strip()
-        self.s3_access_key = os.getenv("S3_ACCESS_KEY", "").strip()
-        self.s3_secret_key = os.getenv("S3_SECRET_KEY", "").strip()
+        self.s3_access_key = _env_or_file("S3_ACCESS_KEY")
+        self.s3_secret_key = _env_or_file("S3_SECRET_KEY")
         self.s3_bucket_snapshots = os.getenv("S3_BUCKET_SNAPSHOTS", "safeaging-snapshots").strip()
         self.s3_region = os.getenv("S3_REGION", "us-east-1").strip()
 
@@ -295,7 +459,7 @@ class AppConfig:
         self.smtp_host = os.getenv("SMTP_HOST", "").strip()
         self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
         self.smtp_user = os.getenv("SMTP_USER", "").strip()
-        self.smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+        self.smtp_password = _env_or_file("SMTP_PASSWORD")  # P0-4: SMTP_PASSWORD_FILE supported
         self.smtp_from = os.getenv("SMTP_FROM", "alerts@safeaging.local").strip()
         self.alert_email_to = os.getenv("ALERT_EMAIL_TO", "").strip()
         self.alert_fall_enabled = os.getenv("ALERT_FALL_ENABLED", "true").lower() == "true"
@@ -340,6 +504,11 @@ class AppConfig:
         self.face_det_size = _clamp_min_square_resolution("FACE_DET_SIZE", 640)
         # insightface model pack (buffalo_s = faster; buffalo_l = heavier / slightly more accurate).
         self.face_model_pack = os.getenv("FACE_MODEL_PACK", "buffalo_s").strip()
+        # cpu | qnn_gpu (Adreno via onnxruntime-qnn; falls back to CPU)
+        self.face_backend = os.getenv("FACE_BACKEND", "cpu").strip().lower()
+        self.enable_face_async = _env_bool("ENABLE_FACE_ASYNC", True)
+        self.face_async_workers = max(1, _env_int("FACE_ASYNC_WORKERS", 1))
+        self.face_async_queue_size = max(4, _env_int("FACE_ASYNC_QUEUE_SIZE", 32))
         # Gallery (enrolled face embeddings) cache refresh interval.
         self.face_gallery_refresh_sec = max(5.0, _env_float("FACE_GALLERY_REFRESH_SEC", 30.0))
 
@@ -409,6 +578,8 @@ ENABLE_FRAME_ENHANCEMENT = CONFIG.enable_frame_enhancement
 CLAHE_CLIP_LIMIT = CONFIG.clahe_clip_limit
 CLAHE_TILE_SIZE = CONFIG.clahe_tile_size
 SAVE_DEBUG_SAMPLES = CONFIG.save_debug_samples
+CALIB_CAPTURE_DIR = CONFIG.calib_capture_dir
+CALIB_CAPTURE_MAX = CONFIG.calib_capture_max
 ENABLE_ROI = CONFIG.enable_roi
 ROI_TYPE = CONFIG.roi_type
 ROI_X_MIN = CONFIG.roi_x_min
@@ -425,11 +596,20 @@ YOLO_BACKEND = CONFIG.yolo_backend
 QNN_BACKEND_PATH = CONFIG.qnn_backend_path
 QNN_HTP_PERFORMANCE_MODE = CONFIG.qnn_htp_performance_mode
 QNN_HTP_FP16 = CONFIG.qnn_htp_fp16
+QNN_HTP_ARCH = CONFIG.qnn_htp_arch
+QNN_SOC_MODEL = CONFIG.qnn_soc_model
+QNN_VTCM_MB = CONFIG.qnn_vtcm_mb
+QNN_CONTEXT_CACHE = CONFIG.qnn_context_cache
+QNN_CONTEXT_CACHE_DIR = CONFIG.qnn_context_cache_dir
+QNN_DISABLE_CPU_FALLBACK = CONFIG.qnn_disable_cpu_fallback
+END2END_COORD_SPACE = CONFIG.end2end_coord_space
 DEVICE = CONFIG.device
 USE_HALF = CONFIG.use_half
 TORCH_CUDNN_BENCHMARK = CONFIG.torch_cudnn_benchmark
 API_KEY_REQUIRED = CONFIG.api_key_required
 API_KEY = CONFIG.api_key
+ALLOW_INSECURE_NO_AUTH = CONFIG.allow_insecure_no_auth
+AUTH_EFFECTIVELY_DISABLED = CONFIG.auth_effectively_disabled
 REQUIRE_HTTPS = CONFIG.require_https
 TLS_CERT_FILE = CONFIG.tls_cert_file
 TLS_KEY_FILE = CONFIG.tls_key_file
@@ -474,6 +654,17 @@ RETENTION_CHECK_HOURS = CONFIG.retention_check_hours
 OUTBOX_DB_PATH = CONFIG.outbox_db_path
 OUTBOX_MAX_ATTEMPTS = CONFIG.outbox_max_attempts
 EDGE_SQLITE_PATH = CONFIG.edge_sqlite_path
+
+
+def normalize_camera_id(camera_id: str) -> str:
+    """Nx plugin uses ``{uuid}``; admin UI may omit braces — normalize for lookups."""
+    cid = (camera_id or "").strip()
+    if not cid or cid == "default":
+        return cid
+    if cid.startswith("{") and cid.endswith("}"):
+        return cid
+    core = cid.strip("{}")
+    return "{" + core + "}"
 # S P2.1
 REID_MATCH_THRESHOLD = CONFIG.reid_match_threshold
 REID_AUTO_LINK_ENABLED = CONFIG.reid_auto_link_enabled
@@ -486,6 +677,10 @@ FACE_RECOG_USE_TIME_SCHEDULER = CONFIG.face_recog_use_time_scheduler
 FACE_MIN_PIXELS = CONFIG.face_min_pixels
 FACE_DET_SIZE = CONFIG.face_det_size
 FACE_MODEL_PACK = CONFIG.face_model_pack
+FACE_BACKEND = CONFIG.face_backend
+ENABLE_FACE_ASYNC = CONFIG.enable_face_async
+FACE_ASYNC_WORKERS = CONFIG.face_async_workers
+FACE_ASYNC_QUEUE_SIZE = CONFIG.face_async_queue_size
 FACE_GALLERY_REFRESH_SEC = CONFIG.face_gallery_refresh_sec
 ENROLL_FACE_MIN_IMAGES = CONFIG.enroll_face_min_images
 ENROLL_FACE_MAX_IMAGES = CONFIG.enroll_face_max_images
@@ -513,6 +708,7 @@ configure_logging(LOG_FORMAT)
 def log_config_summary() -> None:
     logger.info("=" * 60)
     logger.info("YOLO26 People Analytics Service")
+    logger.info(f"Config schema version: {CONFIG_SCHEMA_VERSION}")
     logger.info("=" * 60)
     logger.info(f"Port: {SERVICE_PORT}")
     logger.info(f"Host: {SERVICE_HOST}")
@@ -526,7 +722,10 @@ def log_config_summary() -> None:
     if YOLO_BACKEND.startswith("qnn"):
         logger.info(
             f"QNN: backend_path={QNN_BACKEND_PATH or '(auto)'} "
-            f"htp_mode={QNN_HTP_PERFORMANCE_MODE} htp_fp16={QNN_HTP_FP16}"
+            f"htp_mode={QNN_HTP_PERFORMANCE_MODE} htp_fp16={QNN_HTP_FP16} "
+            f"htp_arch={QNN_HTP_ARCH} soc_model={QNN_SOC_MODEL or '(auto)'} "
+            f"context_cache={QNN_CONTEXT_CACHE} "
+            f"end2end_coord_space={END2END_COORD_SPACE}"
         )
     logger.info(f"Device: {DEVICE} | FP16: {USE_HALF}")
     logger.info("=" * 60)
@@ -561,6 +760,7 @@ def log_config_summary() -> None:
             f"torso>{POSE_TORSO_ANGLE_THRESHOLD:.0f}°)"
         )
     logger.info(f"Face model pack: {FACE_MODEL_PACK}")
+    logger.info(f"Face backend: {FACE_BACKEND} async={ENABLE_FACE_ASYNC} workers={FACE_ASYNC_WORKERS}")
     logger.info(f"Input upscale before YOLO: {ENABLE_INPUT_UPSCALE} (min {MIN_INPUT_RESOLUTION}px)")
     logger.info(f"Metrics: window={METRICS_WINDOW_SIZE} log_interval={METRICS_LOG_INTERVAL}")
     logger.info("=" * 60)
@@ -570,4 +770,11 @@ def log_config_summary() -> None:
         logger.info(f"Edge SQLite path: {EDGE_SQLITE_PATH}")
     logger.info(f"Object storage configured: {'yes' if S3_ENDPOINT else 'no'}")
     logger.info(f"Email alerts: {'yes' if SMTP_HOST and ALERT_EMAIL_TO else 'no'}")
+    logger.info("=" * 60)
+    if AUTH_EFFECTIVELY_DISABLED:
+        logger.warning("!" * 60)
+        logger.warning("! AUTHENTICATION IS DISABLED — /infer, /admin/*, /config/* are UNPROTECTED !")
+        logger.warning("!" * 60)
+    else:
+        logger.info(f"Authentication: ENABLED (API_KEY_REQUIRED={API_KEY_REQUIRED})")
     logger.info("=" * 60)

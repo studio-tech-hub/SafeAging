@@ -1,6 +1,7 @@
 ﻿import asyncio
 import base64
 import hmac
+import os
 import struct
 import threading
 import time
@@ -10,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict
@@ -18,12 +19,15 @@ from pydantic import BaseModel, ConfigDict
 from .config import (
     API_KEY,
     API_KEY_REQUIRED,
+    ALLOW_INSECURE_NO_AUTH,
+    AUTH_EFFECTIVELY_DISABLED,
     BBOX_SMOOTHING,
     CONFIDENCE_THRESHOLD,
     CORS_ALLOW_ORIGINS,
     DEVICE,
     ENABLE_CLAHE,
     ENABLE_FACE_RECOGNITION,
+    ENABLE_FACE_ASYNC,
     ENABLE_FALL_DETECTION,
     ENABLE_FRAME_ENHANCEMENT,
     ENABLE_HISTORY_REMATCH,
@@ -39,6 +43,7 @@ from .config import (
     FLICKER_REUSE_TIME,
     HOLD_SUPPRESS_IOU,
     IOU_THRESHOLD,
+    MATCH_IOU_THRESHOLD,
     MIN_DETECTION_AREA,
     MIN_INPUT_RESOLUTION,
     METRICS_LOG_INTERVAL,
@@ -59,6 +64,8 @@ from .config import (
     RATE_LIMIT_WINDOW_SECONDS,
     REQUIRE_HTTPS,
     SAVE_DEBUG_SAMPLES,
+    CALIB_CAPTURE_DIR,
+    CALIB_CAPTURE_MAX,
     SERVICE_HOST,
     SERVICE_PORT,
     TLS_CERT_FILE,
@@ -94,6 +101,8 @@ from .metrics import (
 from .model import load_model
 from . import yolo_backend
 from . import face_engine
+from . import face_worker
+from .face_identity import apply_cached_identity_to_det, commit_face_match, commit_face_miss
 from . import pose_backend
 from .zone_engine import check_zones, get_zones_for_camera_sync
 from .config_engine import get_per_camera_config_sync
@@ -119,12 +128,37 @@ from .tracking import (
     increment_camera_error,
     increment_camera_request,
     iou,
+    overlaps_confirmed_track,
     post_nms_dedupe,
     record_camera_metrics,
+    select_output_bbox,
     smooth_bbox,
     suppress_overlapping_holds,
     update_track_motion,
 )
+
+
+_calib_capture_lock = threading.Lock()
+_calib_capture_count = 0
+
+
+def _maybe_capture_calib_frame(camera_id: str, frame: np.ndarray, seq: int) -> None:
+    if not CALIB_CAPTURE_DIR or CALIB_CAPTURE_MAX <= 0:
+        return
+    global _calib_capture_count
+    with _calib_capture_lock:
+        if _calib_capture_count >= CALIB_CAPTURE_MAX:
+            return
+        _calib_capture_count += 1
+        idx = _calib_capture_count
+    try:
+        out_dir = CALIB_CAPTURE_DIR
+        os.makedirs(out_dir, exist_ok=True)
+        safe_cam = "".join(c if c.isalnum() or c in "-_{}" else "_" for c in (camera_id or "cam"))
+        path = os.path.join(out_dir, f"{safe_cam}_{seq:06d}_{idx:04d}.jpg")
+        cv2.imwrite(path, frame)
+    except Exception as exc:
+        logger.warning("[%s] calib capture failed: %s", camera_id, exc)
 
 
 log_config_summary()
@@ -350,8 +384,10 @@ def _record_camera_infer_error(state: Dict[str, Any], error_message: str) -> Non
 def _decode_current_transport_image(image_payload_b64: str, camera_id: str) -> tuple[np.ndarray, str, int, int]:
     """Decode the current JSON + base64 transport kept for plugin compatibility.
 
-    TODO: Keep this path for the current C++ plugin, but migrate toward a
-    multipart/form-data or raw binary upload path to remove base64 overhead.
+    This remains the default transport forever, for any plugin build that
+    doesn't opt into transport_mode=binary. See _decode_binary_transport_image()
+    for the additive multipart/binary alternative added in P1-4 to remove the
+    base64 encode/decode + ~33% payload-size overhead on hardware that opts in.
     """
     encoded_payload_bytes = len(image_payload_b64.encode("utf-8"))
     img_bytes = base64.b64decode(image_payload_b64)
@@ -379,28 +415,111 @@ def _decode_current_transport_image(image_payload_b64: str, camera_id: str) -> t
     return frame, "image_base64", encoded_payload_bytes, raw_payload_bytes
 
 
-def _crop_person_head_region(frame: np.ndarray, det: "Detection", W: int, H: int) -> Optional[np.ndarray]:
-    """Crop the upper region of a person bbox (head + shoulders) for face detection.
+def _decode_binary_transport_image(image_bytes: bytes, camera_id: str) -> tuple[np.ndarray, str, int, int]:
+    """Decode the additive multipart/binary transport (P1-4): raw JPEG bytes, no base64.
 
-    Faces are concentrated in the top portion of a standing person; cropping
-    there gives the detector a larger, cleaner face and is cheaper than the
-    full body. Coords are in the same input-frame space as the detection.
+    Same (frame, transport_name, encoded_bytes, raw_bytes) contract as
+    _decode_current_transport_image() so both transports can feed the shared
+    _run_person_detection_pipeline() unchanged. There is no base64 "encoded size"
+    concept for this transport (no inflation happens), so encoded_bytes and
+    raw_bytes both report the actual wire size for straightforward /metrics
+    comparison against the JSON+base64 transport.
+    """
+    raw_payload_bytes = len(image_bytes)
+    img_array = np.frombuffer(image_bytes, np.uint8)
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    logger.debug(
+        f"[{camera_id}] Decoded transport=image_binary_multipart payload_bytes={raw_payload_bytes}"
+    )
+    return frame, "image_binary_multipart", raw_payload_bytes, raw_payload_bytes
+
+
+def _crop_person_head_region(
+    frame: np.ndarray, det: "Detection", W: int, H: int
+) -> tuple[Optional[np.ndarray], tuple[int, int]]:
+    """Crop the person bbox (with margin) for SCRFD face detection.
+
+    InsightFace finds the face inside the full person box; using only the
+    upper 60% often misses on wide-angle / Nx downscaled frames.
+    Returns (crop_bgr, (origin_x, origin_y)) in frame pixel space.
     """
     x1 = det.x
     y1 = det.y
     bw = det.w
     bh = det.h
-    margin_x = bw * 0.12
+    margin_x = bw * 0.08
+    margin_y = bh * 0.05
     cx1 = int(max(0, x1 - margin_x))
     cx2 = int(min(W, x1 + bw + margin_x))
-    cy1 = int(max(0, y1))
-    cy2 = int(min(H, y1 + bh * 0.6))
-    if cx2 - cx1 < 8 or cy2 - cy1 < 8:
-        return None
-    return frame[cy1:cy2, cx1:cx2]
+    cy1 = int(max(0, y1 - margin_y))
+    cy2 = int(min(H, y1 + bh + margin_y))
+    if cx2 - cx1 < 16 or cy2 - cy1 < 16:
+        return None, (0, 0)
+    return frame[cy1:cy2, cx1:cx2], (cx1, cy1)
+
+
+def _refine_person_bbox_from_face(
+    det: "Detection",
+    crop: Optional[np.ndarray],
+    crop_origin: tuple[int, int],
+    frame_w: int,
+    frame_h: int,
+    frame: Optional[np.ndarray] = None,
+) -> None:
+    """Anchor the display bbox on SCRFD face location when YOLO is horizontally off."""
+    face_bbox = face_engine.detect_face_bbox(crop) if crop is not None and crop.size > 0 else None
+    ox, oy = crop_origin
+    if face_bbox is None and frame is not None:
+        # YOLO often shifts left on wide-angle cameras — search a wider region.
+        cx = det.x + det.w * 0.5
+        cy = det.y + det.h * 0.5
+        ew = min(float(frame_w), det.w * 1.8)
+        eh = min(float(frame_h), det.h * 1.4)
+        ex1 = max(0, int(cx - ew * 0.35))
+        ey1 = max(0, int(cy - eh * 0.30))
+        ex2 = min(frame_w, int(cx + ew * 0.65))
+        ey2 = min(frame_h, int(cy + eh * 0.70))
+        if ex2 - ex1 >= 32 and ey2 - ey1 >= 32:
+            big_crop = frame[ey1:ey2, ex1:ex2]
+            face_bbox = face_engine.detect_face_bbox(big_crop)
+            if face_bbox is not None:
+                ox, oy = ex1, ey1
+                crop = big_crop
+    if face_bbox is None:
+        return
+    fx1, fy1, fx2, fy2 = face_bbox
+    ff_x1 = ox + fx1
+    ff_y1 = oy + fy1
+    ff_x2 = ox + fx2
+    ff_y2 = oy + fy2
+    fw = ff_x2 - ff_x1
+    fh = ff_y2 - ff_y1
+    if fw < 8.0 or fh < 8.0:
+        return
+
+    pad_x = fw * 0.85
+    pad_up = fh * 0.35
+    pad_down = fh * 3.8
+    nx1 = max(0.0, ff_x1 - pad_x)
+    ny1 = max(0.0, ff_y1 - pad_up)
+    nx2 = min(float(frame_w), ff_x2 + pad_x)
+    ny2 = min(float(frame_h), ff_y2 + pad_down)
+
+    yx2 = det.x + det.w
+    yy2 = det.y + det.h
+    nx1 = min(nx1, det.x)
+    ny1 = min(ny1, det.y)
+    nx2 = max(nx2, yx2)
+    ny2 = max(ny2, yy2)
+
+    det.x = nx1
+    det.y = ny1
+    det.w = max(1.0, nx2 - nx1)
+    det.h = max(1.0, ny2 - ny1)
 
 
 def _apply_face_identity(
+    camera_id: str,
     state: Dict[str, Any],
     detections: List["Detection"],
     frame: np.ndarray,
@@ -418,7 +537,6 @@ def _apply_face_identity(
 
     with camera_lock:
         identity: Dict[int, Dict[str, Any]] = state.setdefault("identity", {})
-        person_no_map: Dict[str, int] = state.setdefault("person_no_map", {})
         recent_crops: Dict[int, np.ndarray] = state.setdefault("recent_crops", {})
 
     H, W = frame.shape[:2]
@@ -426,18 +544,24 @@ def _apply_face_identity(
     for det in detections:
         if det.cls != "person":
             continue
-        if not det.stable or det.degraded:
-            continue
+        # QNO often renders degraded fallback YOLO boxes (stable=False) when tracking
+        # has not confirmed yet — still run face on those boxes for identity labels.
 
         tid = det.track_id
         cached = identity.get(tid)
+
+        crop, crop_origin = _crop_person_head_region(frame, det, W, H)
+        if crop is not None and crop.size > 0:
+            _refine_person_bbox_from_face(det, crop, crop_origin, W, H, frame)
 
         attempt = False
         now_mono = time.monotonic()
         if cached is None:
             attempt = True
         elif not cached.get("recognized"):
-            if FACE_RECOG_USE_TIME_SCHEDULER:
+            if cached.get("pending") and ENABLE_FACE_ASYNC:
+                attempt = False
+            elif FACE_RECOG_USE_TIME_SCHEDULER:
                 last_ts = cached.get("last_attempt_ts", 0.0)
                 if now_mono - last_ts >= FACE_RECOG_UNKNOWN_RETRY_SEC:
                     attempt = True
@@ -447,61 +571,46 @@ def _apply_face_identity(
                     attempt = True
 
         if attempt:
-            crop = _crop_person_head_region(frame, det, W, H)
             if crop is not None and crop.size > 0:
-                # Keep a recent crop so an operator can enroll this (possibly
-                # Unknown) track from the live frame via the admin API.
                 with camera_lock:
                     recent_crops[tid] = crop.copy()
-            match = face_engine.recognize_crop(crop) if crop is not None else None
-            if match is not None:
-                no = person_no_map.get(match.person_id)
-                if no is None:
-                    with camera_lock:
-                        no = person_no_map.get(match.person_id)
-                        if no is None:
-                            no = int(state.get("next_person_no", 1))
-                            person_no_map[match.person_id] = no
-                            state["next_person_no"] = no + 1
-                cached = {
-                    "recognized": True,
-                    "person_id": match.person_id,
-                    "name": match.name,
-                    "gender": match.gender,
-                    "age": match.age,
-                    "no": no,
-                    "score": match.score,
-                    "last_attempt": camera_frame_idx,
-                    "last_attempt_ts": now_mono,
-                }
-            else:
-                cached = {
-                    "recognized": False,
-                    "person_id": None,
-                    "name": None,
-                    "gender": None,
-                    "age": None,
-                    "no": None,
-                    "last_attempt": camera_frame_idx,
-                    "last_attempt_ts": now_mono,
-                }
-            with camera_lock:
-                identity[tid] = cached
 
-        if cached and cached.get("recognized"):
-            det.recognized = True
-            det.person_id = cached.get("person_id")
-            det.person_name = cached.get("name")
-            det.person_gender = cached.get("gender")
-            det.person_age = cached.get("age")
-            det.person_no = cached.get("no")
-        else:
-            det.recognized = False
-            det.person_id = None
-            det.person_name = None
-            det.person_gender = None
-            det.person_age = None
-            det.person_no = None
+            pool = face_worker.get_pool() if ENABLE_FACE_ASYNC else None
+            queue_busy = (
+                pool is not None and pool.stats().get("queue_depth", 0) > 0
+            )
+            if pool is not None and queue_busy:
+                queued = face_worker.submit_recognition(
+                    camera_id=camera_id,
+                    track_id=tid,
+                    crop=crop,
+                    state=state,
+                    camera_lock=camera_lock,
+                    frame_idx=camera_frame_idx,
+                )
+                if queued:
+                    face_worker.mark_attempt_pending(
+                        state, camera_lock, tid, camera_frame_idx
+                    )
+            else:
+                match = face_engine.recognize_crop(crop) if crop is not None else None
+                if match is not None:
+                    commit_face_match(
+                        state, camera_lock, tid, match, camera_frame_idx
+                    )
+                    logger.info(
+                        "[%s] Face matched track=%s name=%s score=%.3f",
+                        camera_id,
+                        tid,
+                        match.name,
+                        match.score,
+                    )
+                else:
+                    commit_face_miss(state, camera_lock, tid, camera_frame_idx)
+
+        with camera_lock:
+            cached = identity.get(tid)
+        apply_cached_identity_to_det(det, cached)
 
 
 def _get_client_ip(request: Request) -> str:
@@ -675,7 +784,9 @@ async def health_check(response: Response):
     }
     snapshot["pipeline"] = pipeline
 
-    status, reason_codes = compute_status(model_ok=model_ok, deps=deps, pipeline=pipeline)
+    status, reason_codes = compute_status(
+        model_ok=model_ok, deps=deps, pipeline=pipeline, auth_disabled=AUTH_EFFECTIVELY_DISABLED
+    )
 
     snapshot["status"] = status
     snapshot["reason_codes"] = reason_codes
@@ -703,72 +814,39 @@ async def metrics_endpoint():
 # ============================
 # Inference Endpoint
 # ============================
-@app.post("/infer", response_model=List[Detection])
-def infer(req: InferRequest, request: Request):
-    """
-    Main inference endpoint.
-    
-    Args:
-        req: InferRequest with base64 encoded image
-        
-    Returns:
-        List[Detection]: Detections with track_id
-        
-    Expected by C++ plugin:
-    {
-        "cls": "person",
-        "score": 0.9,
-        "x": 180.0,
-        "y": 270.6,
-        "w": 120.0,
-        "h": 360.8,
-        "track_id": 1
-    }
-    """
-    increment_request_counter()   # global counter for /status total, not used for per-camera logic
-    request_started_at = time.perf_counter()
+def _run_person_detection_pipeline(
+    frame: np.ndarray,
+    *,
+    camera_id: str,
+    state: Dict[str, Any],
+    cam_seq: int,
+    request_started_at: float,
+    transport_name: str,
+    transport_encoded_bytes: int,
+    transport_raw_bytes: int,
+    decode_time_ms: float,
+    route_label: str = "/infer",
+) -> List[Detection]:
+    """Shared detection/tracking/fall/zone pipeline for an already-decoded BGR frame.
 
-    camera_id = req.camera_id or "default"
-    enforce_security(request, camera_id=camera_id, require_auth=True)
-    state = get_camera_state(camera_id)
-    camera_request_count = increment_camera_request(state)
-    # Use per-camera counter for all debug/log frequency checks (replaces global req_seq)
-    cam_seq = camera_request_count
-    decode_time_ms = 0.0
+    P1-4: extracted from the body of /infer so the additive /infer/binary
+    (multipart JPEG, no base64) route can share the exact same pipeline after
+    its own transport-specific decode step. Both routes are byte-for-byte
+    identical from this point on — only the transport-specific decode
+    (_decode_current_transport_image vs _decode_binary_transport_image) and
+    request bookkeeping done by each route handler differ.
+
+    camera_request_count and cam_seq are the same per-camera sequence number;
+    this function uses cam_seq for both roles (matches the pre-P1-4 code,
+    which aliased them under two names within a single function).
+    """
+    camera_request_count = cam_seq
     preprocess_time_ms = 0.0
     yolo_time_ms = 0.0
-    transport_name = "unknown"
-    transport_encoded_bytes = 0
-    transport_raw_bytes = 0
-    
-    try:
-        # ============================================
-        # 1) Decode current transport layer
-        # Keep JSON + base64 for plugin compatibility; isolate it here so a
-        # future multipart/raw-binary transport can replace this cleanly.
-        # ============================================
-        try:
-            decode_start = time.perf_counter()
-            frame, transport_name, transport_encoded_bytes, transport_raw_bytes = _decode_current_transport_image(
-                req.image,
-                camera_id,
-            )
-            decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
-            
-            if frame is None:
-                error_message = "Failed to decode image - got None"
-                _record_camera_infer_error(state, error_message)
-                logger.warning(f"[{camera_id}] {error_message}")
-                return []
-                 
-        except Exception as e:
-            decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
-            error_message = f"Image decode error: {type(e).__name__}: {e}"
-            _record_camera_infer_error(state, error_message)
-            logger.warning(f"[{camera_id}] {error_message}")
-            return []
 
+    try:
         H, W = frame.shape[:2]
+        _maybe_capture_calib_frame(camera_id, frame, cam_seq)
 
         # Keep a reference to the originally decoded full frame for event snapshots.
         # Detection coords are later remapped back to this input space, so snapshots
@@ -951,6 +1029,21 @@ def infer(req: InferRequest, request: Request):
         # ============================================
         # 3) Process YOLO outputs with tracking
         # ============================================
+        # Track state (persistent) — built *before* raw-detection filtering so the
+        # aspect-ratio filter below can be track-state-aware (P1-2): it needs to
+        # know which confirmed tracks already exist to decide whether a wide box
+        # is furniture (new candidate) or a person who has fallen (existing track).
+        track_by_id = {tr["id"]: tr for tr in tracks}
+        for tr in track_by_id.values():
+            tr.setdefault("status", "confirmed")
+            tr.setdefault("hits", TRACK_MIN_HITS)
+            tr.setdefault("misses", 0)
+            tr.setdefault("vx", 0.0)
+            tr.setdefault("vy", 0.0)
+            tr.setdefault("vw", 0.0)
+            tr.setdefault("vh", 0.0)
+            tr.setdefault("measurement_bbox", tr.get("bbox"))
+
         # Build raw detections first (for optional extra NMS)
         raw_dets: List[Dict[str, Any]] = []
         boxes_iter = r.boxes if r.boxes is not None else []
@@ -984,15 +1077,27 @@ def infer(req: InferRequest, request: Request):
                     logger.debug(f"[{camera_id}] Skipping small detection: {w_box:.1f}x{h_box:.1f} (area={area:.0f} < {MIN_DETECTION_AREA})")
                     continue
 
-                # Reject furniture-like wide boxes that YOLO occasionally confuses as people.
-                if hw_ratio < PERSON_MIN_HW_RATIO:
-                    logger.debug(
-                        f"[{camera_id}] Skipping wide person-like detection: "
-                        f"{w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f} < {PERSON_MIN_HW_RATIO:.2f}"
-                    )
-                    continue
-
                 det_box = (x1, y1, x2, y2)
+
+                # Reject furniture-like wide boxes that YOLO occasionally confuses as
+                # people — but only for brand-new track candidates. A wide box that
+                # overlaps an already-confirmed track is far more likely that same
+                # person now lying down (a fall) than furniture, so the filter must
+                # never drop a person mid-track (P1-2: this used to run before track
+                # association and blanket-rejected fall postures, directly
+                # undermining fall detection).
+                if hw_ratio < PERSON_MIN_HW_RATIO:
+                    if not overlaps_confirmed_track(det_box, track_by_id, MATCH_IOU_THRESHOLD):
+                        logger.debug(
+                            f"[{camera_id}] Skipping wide person-like detection: "
+                            f"{w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f} < {PERSON_MIN_HW_RATIO:.2f}"
+                        )
+                        continue
+                    logger.debug(
+                        f"[{camera_id}] Wide box kept — overlaps a confirmed track "
+                        f"(possible fall posture): {w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f}"
+                    )
+
                 raw_dets.append({"bbox": det_box, "score": score})
             except Exception as e:
                 logger.warning(f"[{camera_id}] Error parsing box: {type(e).__name__}: {e}")
@@ -1001,18 +1106,6 @@ def infer(req: InferRequest, request: Request):
         # Extra dedupe to avoid overlapping boxes for the same person
         if ENABLE_POST_NMS and len(raw_dets) > 1:
             raw_dets = post_nms_dedupe(raw_dets, POST_NMS_IOU)
-
-        # Track state (persistent)
-        track_by_id = {tr["id"]: tr for tr in tracks}
-        for tr in track_by_id.values():
-            tr.setdefault("status", "confirmed")
-            tr.setdefault("hits", TRACK_MIN_HITS)
-            tr.setdefault("misses", 0)
-            tr.setdefault("vx", 0.0)
-            tr.setdefault("vy", 0.0)
-            tr.setdefault("vw", 0.0)
-            tr.setdefault("vh", 0.0)
-            tr.setdefault("measurement_bbox", tr.get("bbox"))
 
         matched_ids = set()
         output_track_ids = set()
@@ -1178,7 +1271,11 @@ def infer(req: InferRequest, request: Request):
             if not tr:
                 continue
             is_confirmed = tr.get("status") == "confirmed"
-            x1, y1, x2, y2 = tr["bbox"]
+            # P1-1: render the smoothed track box — see select_output_bbox() docstring.
+            # measurement_bbox remains the source of truth fed to fall detection below,
+            # which needs true measurements, not the smoothed/lagged box.
+            bbox_out = select_output_bbox(tr)
+            x1, y1, x2, y2 = bbox_out
             w_box = max(0.0, x2 - x1)
             h_box = max(0.0, y2 - y1)
             if w_box <= 1.0 or h_box <= 1.0:
@@ -1291,9 +1388,17 @@ def infer(req: InferRequest, request: Request):
                 for det in detections:
                     if not det.stable or det.degraded:
                         continue
+                    # P1-1: use the raw YOLO measurement (measurement_bbox), not the
+                    # rendered detection box — det.x/y/w/h now reflect the smoothed
+                    # track box (see output-selection fix above), and fall-detection's
+                    # velocity/aspect-ratio math needs true measurements so smoothing
+                    # doesn't damp or lag the real fall signal.
+                    tr = track_by_id.get(det.track_id)
+                    raw_bbox = tr.get("measurement_bbox") if tr else None
+                    bbox = raw_bbox or (det.x, det.y, det.x + det.w, det.y + det.h)
                     fall_input_detections.append({
                         'track_id': det.track_id,
-                        'bbox': (det.x, det.y, det.x + det.w, det.y + det.h),
+                        'bbox': bbox,
                         'confidence': det.score,
                     })
                 
@@ -1359,6 +1464,7 @@ def infer(req: InferRequest, request: Request):
         if ENABLE_FACE_RECOGNITION and detections:
             try:
                 _apply_face_identity(
+                    camera_id=camera_id,
                     state=state,
                     detections=detections,
                     frame=snapshot_source_frame,
@@ -1366,7 +1472,7 @@ def infer(req: InferRequest, request: Request):
                     camera_lock=camera_lock,
                 )
             except Exception as _fe:
-                logger.debug("[%s] Face recognition error: %s", camera_id, _fe)
+                logger.warning("[%s] Face recognition error: %s", camera_id, _fe)
 
         # ============================================
         # 3.7) Zone check (P2.2)
@@ -1598,12 +1704,163 @@ def infer(req: InferRequest, request: Request):
         return detections
 
     except Exception as e:
-        error_message = f"Unexpected error in /infer: {type(e).__name__}: {e}"
+        error_message = f"Unexpected error in {route_label}: {type(e).__name__}: {e}"
         _record_camera_infer_error(state, error_message)
         logger.error(f"[{camera_id}] {error_message}", exc_info=True)
         INFER_REQUESTS.labels(camera_id=camera_id, status="error").inc()
         INFER_ERRORS.labels(camera_id=camera_id, kind="unknown").inc()
         return []
+
+
+@app.post("/infer", response_model=List[Detection])
+def infer(req: InferRequest, request: Request):
+    """
+    Main inference endpoint.
+    
+    Args:
+        req: InferRequest with base64 encoded image
+        
+    Returns:
+        List[Detection]: Detections with track_id
+        
+    Expected by C++ plugin:
+    {
+        "cls": "person",
+        "score": 0.9,
+        "x": 180.0,
+        "y": 270.6,
+        "w": 120.0,
+        "h": 360.8,
+        "track_id": 1
+    }
+    """
+    increment_request_counter()   # global counter for /status total, not used for per-camera logic
+    request_started_at = time.perf_counter()
+
+    from .config import normalize_camera_id
+
+    camera_id = normalize_camera_id(req.camera_id or "default")
+    enforce_security(request, camera_id=camera_id, require_auth=True)
+    state = get_camera_state(camera_id)
+    camera_request_count = increment_camera_request(state)
+    # Use per-camera counter for all debug/log frequency checks (replaces global req_seq)
+    cam_seq = camera_request_count
+
+    # ============================================
+    # 1) Decode current transport layer
+    # Keep JSON + base64 for plugin compatibility; isolated here so the
+    # additive /infer/binary transport (P1-4) below shares everything
+    # downstream via _run_person_detection_pipeline().
+    # ============================================
+    decode_start = time.perf_counter()
+    try:
+        frame, transport_name, transport_encoded_bytes, transport_raw_bytes = _decode_current_transport_image(
+            req.image,
+            camera_id,
+        )
+        decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
+
+        if frame is None:
+            error_message = "Failed to decode image - got None"
+            _record_camera_infer_error(state, error_message)
+            logger.warning(f"[{camera_id}] {error_message}")
+            return []
+
+    except Exception as e:
+        decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
+        error_message = f"Image decode error: {type(e).__name__}: {e}"
+        _record_camera_infer_error(state, error_message)
+        logger.warning(f"[{camera_id}] {error_message}")
+        return []
+
+    return _run_person_detection_pipeline(
+        frame,
+        camera_id=camera_id,
+        state=state,
+        cam_seq=cam_seq,
+        request_started_at=request_started_at,
+        transport_name=transport_name,
+        transport_encoded_bytes=transport_encoded_bytes,
+        transport_raw_bytes=transport_raw_bytes,
+        decode_time_ms=decode_time_ms,
+        route_label="/infer",
+    )
+
+
+@app.post("/infer/binary", response_model=List[Detection])
+def infer_binary(
+    request: Request,
+    camera_id: str = Form("default"),
+    image: UploadFile = File(...),
+):
+    """P1-4: additive binary/multipart transport for /infer.
+
+    Accepts multipart/form-data with a `camera_id` form field and the raw
+    JPEG bytes as a file part (`image`) — no base64 wrapping. Base64 inflates
+    payload size ~33% and costs both sides an extra encode/decode pass per
+    frame; this route removes that tax for any plugin build that opts in via
+    the transport_mode=binary setting.
+
+    Fully additive: /infer (JSON+base64) is completely unchanged and remains
+    the default transport for every existing plugin build. This route shares
+    the exact same detection/tracking/fall/zone pipeline via
+    _run_person_detection_pipeline() — the only difference is how the JPEG
+    bytes arrive on the wire.
+
+    Deliberately a sync `def`, not `async def`: FastAPI dispatches sync route
+    handlers to its worker thread pool automatically, matching /infer's
+    behaviour. The pipeline below is CPU-bound (YOLO inference, OpenCV) and
+    would otherwise block the asyncio event loop for the whole request if
+    this were `async def`, starving /health, /metrics and every other
+    in-flight request on the same event loop. UploadFile.file is the
+    underlying SpooledTemporaryFile, so plain sync .read() is correct here
+    (no event loop involved) — see FastAPI's own guidance on sync endpoints
+    for CPU-bound file uploads.
+    """
+    increment_request_counter()
+    request_started_at = time.perf_counter()
+
+    from .config import normalize_camera_id
+
+    resolved_camera_id = normalize_camera_id(camera_id or "default")
+    enforce_security(request, camera_id=resolved_camera_id, require_auth=True)
+    state = get_camera_state(resolved_camera_id)
+    camera_request_count = increment_camera_request(state)
+
+    decode_start = time.perf_counter()
+    try:
+        image_bytes = image.file.read()
+        frame, transport_name, transport_encoded_bytes, transport_raw_bytes = _decode_binary_transport_image(
+            image_bytes,
+            resolved_camera_id,
+        )
+        decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
+
+        if frame is None:
+            error_message = "Failed to decode image - got None"
+            _record_camera_infer_error(state, error_message)
+            logger.warning(f"[{resolved_camera_id}] {error_message}")
+            return []
+
+    except Exception as e:
+        decode_time_ms = (time.perf_counter() - decode_start) * 1000.0
+        error_message = f"Image decode error: {type(e).__name__}: {e}"
+        _record_camera_infer_error(state, error_message)
+        logger.warning(f"[{resolved_camera_id}] {error_message}")
+        return []
+
+    return _run_person_detection_pipeline(
+        frame,
+        camera_id=resolved_camera_id,
+        state=state,
+        cam_seq=camera_request_count,
+        request_started_at=request_started_at,
+        transport_name=transport_name,
+        transport_encoded_bytes=transport_encoded_bytes,
+        transport_raw_bytes=transport_raw_bytes,
+        decode_time_ms=decode_time_ms,
+        route_label="/infer/binary",
+    )
 
 
 # ============================
@@ -1856,6 +2113,14 @@ async def startup_event():
     logger.info(f"Auth API key: {'ENABLED' if API_KEY_REQUIRED else 'DISABLED'}")
     if API_KEY_REQUIRED:
         logger.info("Protected endpoints require header: X-API-Key: <API_KEY>")
+    if AUTH_EFFECTIVELY_DISABLED:
+        for _ in range(3):
+            logger.critical(
+                "!!! AUTHENTICATION DISABLED — /infer, /admin/*, /config/* are "
+                "reachable WITHOUT an API key on this network. "
+                f"ALLOW_INSECURE_NO_AUTH={ALLOW_INSECURE_NO_AUTH}. "
+                "Set API_KEY_REQUIRED=true and API_KEY to secure this deployment. !!!"
+            )
     logger.info(f"Rate limit: {'ENABLED' if RATE_LIMIT_ENABLED else 'DISABLED'}")
     if RATE_LIMIT_ENABLED:
         logger.info(
@@ -1878,7 +2143,12 @@ async def startup_event():
     # Non-blocking: if the DB URL is missing or unreachable the service starts
     # anyway and reports "degraded" in /health until the connection recovers.
     try:
-        init_engine()
+        from .config import DATABASE_URL as _DATABASE_URL
+
+        # Pass the already-resolved value explicitly (P0-4: supports
+        # DATABASE_URL_FILE) instead of letting init_engine() re-read the raw
+        # env var itself, which would bypass the _FILE secrets convention.
+        init_engine(_DATABASE_URL)
         from .db.session import is_edge_mode
 
         if is_edge_mode():
@@ -1988,6 +2258,10 @@ async def startup_event():
 
 async def _background_face_warmup() -> None:
     try:
+        from .config import ENABLE_FACE_ASYNC, FACE_ASYNC_QUEUE_SIZE, FACE_ASYNC_WORKERS
+
+        if ENABLE_FACE_ASYNC:
+            face_worker.ensure_started(FACE_ASYNC_WORKERS, FACE_ASYNC_QUEUE_SIZE)
         logger.info("Face recognition warmup started (background)")
         ready = await asyncio.to_thread(face_engine.warmup)
         if ready:

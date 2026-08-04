@@ -1,0 +1,78 @@
+SafeAging — Proprietary Software License (DRAFT — Pending Legal Review)
+Copyright (c) 2026 SafeAging. All rights reserved.
+
+================================================================================
+ THIS IS A PLACEHOLDER, NOT A FINALIZED LEGAL DOCUMENT.
+ It exists so the repository is never in a legally undefined state (no
+ LICENSE file at all) while a final license/EULA is drafted and reviewed by
+ whoever owns legal/licensing decisions for SafeAging. See "Action required"
+ at the bottom before any commercial release, sale, or external distribution.
+================================================================================
+
+No license, express or implied, is granted to any person to use, copy,
+modify, merge, publish, distribute, sublicense, and/or sell copies of this
+software, or to permit persons to whom the software is furnished to do so,
+except as may be separately agreed in a signed, written agreement between
+SafeAging and the recipient (e.g. a commercial License Agreement / EULA
+accompanying a paid deployment, or an internal employment/contractor
+agreement).
+
+In the absence of such a separate written agreement, this software is
+provided for internal evaluation and development purposes only, and:
+
+  - MAY NOT be redistributed, sublicensed, or resold, in source or binary
+    form, to any third party;
+  - MAY NOT be used to build or provide a competing commercial product or
+    service;
+  - MAY NOT be publicly disclosed (posted to a public repository, forum,
+    or otherwise made available to the public) without prior written
+    authorization from SafeAging;
+  - Is provided "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+    INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+    FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING
+    FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+ACTION REQUIRED (engineering note — not itself part of the license terms
+above; delete this section once a final license is in place):
+
+"All rights reserved" was chosen deliberately as the placeholder default
+because it is the strictest and legally safest position available without
+committing to final terms — it blocks redistribution/sublicensing by
+default until someone with legal authority decides otherwise, rather than
+accidentally under-protecting the codebase. Before any commercial release,
+sale, or distribution outside the organization, replace this file with a
+final license reviewed by whoever owns legal/licensing decisions, covering
+at minimum:
+
+  1. Distribution model: does an end customer receive a EULA (a commercial
+     license granting specific, limited rights to run the software), or
+     does the code stay fully closed with a service/appliance model (the
+     customer receives a sealed AI Box and never touches source or
+     binaries directly)? This materially changes what the LICENSE needs to
+     say.
+
+  2. Third-party dependency license compliance — in particular
+     `ultralytics` (the YOLO26 training/export library pinned in
+     requirements.txt), which ships under AGPL-3.0 by default. Confirm
+     whether this project's actual usage (offline model export vs. any
+     runtime linkage) requires an Ultralytics Enterprise License before
+     commercial distribution — this is a real compliance risk, not a
+     formality. See README.md § "Third-party licenses" for the full list
+     of dependencies to review.
+
+  3. Data protection / privacy terms for face-recognition (biometric) data
+     — regulations vary significantly by jurisdiction (GDPR in the EU,
+     Vietnam's Personal Data Protection Decree, BIPA-style biometric laws
+     in parts of the US, etc.) and by deployment sector (healthcare/elder
+     care carries additional obligations in most jurisdictions). This
+     belongs in a separate Data Processing Agreement / privacy policy, not
+     necessarily in LICENSE itself, but must exist before commercial sale.
+
+  4. Patent grant / indemnification terms, warranty/liability limits
+     appropriate for a product deployed in elder-care and safety-critical
+     contexts (fall detection, zone violation alerting) — a technical team
+     should not finalize these without counsel given the liability profile.

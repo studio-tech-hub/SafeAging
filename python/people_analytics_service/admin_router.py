@@ -20,7 +20,7 @@ from .retention import get_status as _retention_status
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .config import API_KEY, API_KEY_REQUIRED
+from .config import API_KEY, API_KEY_REQUIRED, normalize_camera_id
 from .db import get_session
 from .db import dal
 from .config import logger
@@ -442,8 +442,10 @@ async def list_zones(
 @router.post("/zones", response_model=ZoneOut, status_code=201, summary="Create zone")
 async def create_zone(body: ZoneCreate):
     _require_db()
+    payload = body.model_dump()
+    payload["camera_id"] = normalize_camera_id(payload["camera_id"])
     async with get_session() as session:
-        zone = await dal.create_zone(session, **body.model_dump())
+        zone = await dal.create_zone(session, **payload)
         out = ZoneOut.model_validate(zone)
         await session.commit()
     invalidate_zone_cache(out.camera_id)
@@ -478,17 +480,17 @@ async def update_zone(zone_id: uuid.UUID, body: ZoneUpdate):
     return out
 
 
-@router.delete("/zones/{zone_id}", status_code=204, summary="Deactivate zone (active→false)")
+@router.delete("/zones/{zone_id}", status_code=204, summary="Remove zone permanently")
 async def delete_zone(zone_id: uuid.UUID):
     _require_db()
     async with get_session() as session:
-        zone = await dal.update_zone(session, zone_id, active=False)
+        zone = await dal.delete_zone(session, zone_id)
         if zone is None:
             raise HTTPException(status_code=404, detail=f"Zone {zone_id} not found")
-        out = ZoneOut.model_validate(zone)
+        camera_id = normalize_camera_id(zone.camera_id)
         await session.commit()
-    invalidate_zone_cache(out.camera_id)
-    logger.info(f"[admin] Deactivated zone id={zone_id}")
+    invalidate_zone_cache(camera_id)
+    logger.info(f"[admin] Removed zone id={zone_id} camera={camera_id}")
 
 
 # ── Event endpoints ─────────────────────────────────────────────────────────────

@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
+"""Full stack restart on AI Box (wipes Postgres volume, recreates postgres/minio/analytics).
+
+Reads connection settings the same way as tools/_ssh_*.py — see
+tools/ops_aibox_check.py / tools/ops.env.example for AIBOX_HOST, AIBOX_USER,
+AIBOX_PASSWORD (or AIBOX_SSH_KEY_PATH). For backward compatibility, a legacy
+SSH_PASSWORD env var is still honored if AIBOX_PASSWORD is not set.
+"""
 import os
 import sys
-import time
 
-import paramiko
+from _ssh_common import REPO_ROOT, connect, get_credentials, run, upload_files
 
-HOST = "192.168.1.210"
-ROOT = os.path.join(os.path.dirname(__file__), "..")
+if not os.environ.get("AIBOX_PASSWORD") and os.environ.get("SSH_PASSWORD"):
+    os.environ["AIBOX_PASSWORD"] = os.environ["SSH_PASSWORD"]
 
-
-def run(c, cmd, timeout=120):
-    _, o, e = c.exec_command(cmd, timeout=timeout)
-    return (o.read() + e.read()).decode(errors="replace")
-
-
-def main() -> int:
-    pw = os.environ["SSH_PASSWORD"]
-    c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(HOST, username="root", password=pw, timeout=20, banner_timeout=20, auth_timeout=20)
-    sftp = c.open_sftp()
-    sftp.put(os.path.join(ROOT, "docker-compose.yml"), "/root/SafeAging/docker-compose.yml")
-    sftp.close()
-
-    script = """
+SCRIPT = """
 set -e
 cd /root/SafeAging
 docker compose down
@@ -43,13 +34,25 @@ docker ps -a
 ss -tlnp | grep -E ':18000|:15432' || true
 docker logs safeaging-postgres 2>&1 | tail -5
 """
-    with c.open_sftp().file("/tmp/restart_stack.sh", "w") as f:
-        f.write(script)
-    c.open_sftp().chmod("/tmp/restart_stack.sh", 0o755)
-    print(run(c, "bash /tmp/restart_stack.sh", timeout=600))
+
+
+def main() -> int:
+    creds = get_credentials()
+    c = connect(creds, timeout=20)
+    upload_files(c, ["docker-compose.yml"], creds=creds, repo_root=REPO_ROOT)
+
+    sftp = c.open_sftp()
+    try:
+        with sftp.file("/tmp/restart_stack.sh", "w") as f:
+            f.write(SCRIPT)
+        sftp.chmod("/tmp/restart_stack.sh", 0o755)
+    finally:
+        sftp.close()
+
+    code, _, _ = run(c, "bash /tmp/restart_stack.sh", timeout=600)
     c.close()
-    return 0
+    return code
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

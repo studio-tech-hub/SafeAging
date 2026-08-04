@@ -12,14 +12,30 @@ services:
   analytics:
     devices:
       - /dev/adsprpc-smd:/dev/adsprpc-smd
+      - /dev/adsprpc-smd-secure:/dev/adsprpc-smd-secure
       - /dev/ion:/dev/ion
       - /dev/kgsl-3d0:/dev/kgsl-3d0
     environment:
-      - YOLO_BACKEND=${YOLO_BACKEND:-cpu}
+      - PRODUCT_SOC=${PRODUCT_SOC:-6490}
+      - DSP_ARCH=${DSP_ARCH:-68}
+      - YOLO_BACKEND=${YOLO_BACKEND:-qnn_htp}
       - QNN_BACKEND_PATH=${QNN_BACKEND_PATH:-}
+      - QNN_HTP_ARCH=${QNN_HTP_ARCH:-68}
+      - QNN_SOC_MODEL=${QNN_SOC_MODEL:-35}
       - QNN_HTP_PERFORMANCE_MODE=${QNN_HTP_PERFORMANCE_MODE:-burst}
-      - QNN_HTP_FP16=${QNN_HTP_FP16:-true}
-      - MODEL_PATH=${MODEL_PATH:-/app/models/yolo26n.onnx}
+      - QNN_HTP_FP16=${QNN_HTP_FP16:-false}
+      - QNN_VTCM_MB=${QNN_VTCM_MB:-}
+      - QNN_CONTEXT_CACHE=${QNN_CONTEXT_CACHE:-false}
+      - QNN_CONTEXT_CACHE_DIR=${QNN_CONTEXT_CACHE_DIR:-/app/runtime/qnn_context}
+      - QNN_DISABLE_CPU_FALLBACK=${QNN_DISABLE_CPU_FALLBACK:-false}
+      - LD_LIBRARY_PATH=/qnn-host-libs:/usr/lib
+      - YOLO_LEAN_POOL_SIZE=${YOLO_LEAN_POOL_SIZE:-1}
+      - YOLO_LEAN_THREADS=${YOLO_LEAN_THREADS:-1}
+      - MODEL_PATH=/app/models/yolo26n_qdq.onnx
     volumes:
+      - /dsp:/dsp:ro
       - /usr/lib/rfsa/adsp:/usr/lib/rfsa/adsp:ro
+      - /usr/lib/libcdsprpc.so:/qnn-host-libs/libcdsprpc.so:ro
+      - /opt/qti/usr/lib/liblog.so.0.0.0.liblog:/qnn-host-libs/liblog.so.0:ro
+      - /usr/lib/libion.so.0.0.0:/qnn-host-libs/libion.so.0:ro
       - /root/wheels:/wheels:ro

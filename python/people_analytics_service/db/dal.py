@@ -224,6 +224,10 @@ async def list_zones(
     camera_id: str | None = None,
     active_only: bool = True,
 ) -> list[Zone]:
+    from ..config import normalize_camera_id
+
+    if camera_id:
+        camera_id = normalize_camera_id(camera_id)
     if is_edge_mode():
         return await _edge_call("list_zones", camera_id, active_only)
     stmt = select(Zone)
@@ -261,6 +265,24 @@ async def update_zone(
     )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
+
+
+async def delete_zone(session: AsyncSession, zone_id: uuid.UUID) -> Zone | None:
+    """Hard-delete a zone. Returns the removed row metadata, or None if missing."""
+    if is_edge_mode():
+        zone = await get_zone(session, zone_id)
+        if zone is None:
+            return None
+        ok = await _edge_call("delete_zone", zone_id)
+        return zone if ok else None
+    zone = await get_zone(session, zone_id)
+    if zone is None:
+        return None
+    await session.execute(
+        update(Event).where(Event.zone_id == zone_id).values(zone_id=None)
+    )
+    await session.execute(delete(Zone).where(Zone.id == zone_id))
+    return zone
 
 
 # ── Event ─────────────────────────────────────────────────────────────────────

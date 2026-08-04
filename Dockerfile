@@ -9,6 +9,13 @@
 
 FROM python:3.11-slim
 
+# P0-5: OCI standard labels + embedded LICENSE, so the license terms travel
+# with every built/distributed image, not just the source repo.
+LABEL org.opencontainers.image.title="SafeAging Analytics Service" \
+      org.opencontainers.image.vendor="SafeAging" \
+      org.opencontainers.image.licenses="UNLICENSED" \
+      org.opencontainers.image.description="AI video analytics (YOLO26 detection, tracking, face recognition, fall/zone detection) for Nx Witness VMS integration."
+
 # System libraries: OpenCV headless + PyTorch + insightface (needs g++ for Cython ext)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libglib2.0-0 \
@@ -37,6 +44,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Application source ────────────────────────────────────────────────────────
 COPY python/ ./python/
+COPY LICENSE ./LICENSE
 
 # ── S P2.1 – Pre-cache MobileNetV3-Small weights so container starts offline ──
 RUN python - <<'EOF'

@@ -73,6 +73,9 @@ def get_zones_for_camera_sync(camera_id: str) -> list:
     Returns the cached list immediately. Schedules a background refresh
     if the cache is cold or older than _ZONE_CACHE_TTL_SEC.
     """
+    from .config import normalize_camera_id
+
+    camera_id = normalize_camera_id(camera_id)
     now = time.monotonic()
     with _zone_cache_lock:
         entry = _zone_cache.get(camera_id)
@@ -161,7 +164,7 @@ def check_zones(detections: list, zones: list, camera_id: str) -> list[ZoneViola
     new_state: dict[int, frozenset] = {}
 
     for det in detections:
-        if not det.stable or det.degraded:
+        if det.cls != "person":
             continue
 
         # Foot point: bottom-centre of bbox — best proxy for person's floor position.

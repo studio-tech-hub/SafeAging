@@ -1,3 +1,11 @@
+# LOCAL DEVELOPMENT ONLY (P0-3). Lightweight infra-only stack (no `analytics`
+# service) for running the Python service directly on the host against real
+# Postgres/MinIO/Prometheus/Grafana containers. Intentionally keeps
+# zero-config soft-default credentials for fast iteration — exempted from
+# tools/check_compose_security.py's required-secret checks for exactly that
+# reason. NEVER deploy this file, or copy these defaults, to an AI Box or
+# anything network-reachable — use the root docker-compose.yml (which
+# requires real secrets; see tools/generate_secrets.py) for that.
 services:
   postgres:
     image: postgres:16
@@ -64,6 +72,7 @@ services:
       - "${PROMETHEUS_PORT:-19090}:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
       - safeaging-prometheus-data:/prometheus
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -266,15 +266,67 @@ def smooth_bbox(
     )
 
 
+def select_output_bbox(track: Dict[str, Any]) -> tuple[float, float, float, float]:
+    """Bbox to render/report for a track (P1-1).
+
+    Prefers the smoothed box (``track["bbox"]``), which ``smooth_bbox()`` already
+    recomputes on every matched frame per ``BBOX_SMOOTHING`` — this used to be
+    computed and then discarded in favor of the raw measurement at the call site,
+    silently defeating ``BBOX_SMOOTHING`` and causing the "jittery boxes" reports.
+
+    Falls back to ``track["measurement_bbox"]`` only if "bbox" is unset, which
+    should not happen in practice since every track sets "bbox" at creation.
+
+    When ``BBOX_SMOOTHING=0``, the matched-track update path in api.py sets
+    ``track["bbox"] = det_box`` directly instead of calling ``smooth_bbox()``, so
+    "bbox" already equals the raw measurement in that case — this preserves the
+    exact "no smoothing" behavior for operators who opt out, with no extra branch
+    needed here.
+    """
+    return track.get("bbox") or track.get("measurement_bbox")
+
+
+def greedy_nms_indices(
+    boxes_xyxy: List[Tuple[float, float, float, float]],
+    scores: List[float],
+    iou_thresh: float,
+) -> List[int]:
+    """Greedy NMS on xyxy boxes using this module's own ``iou()`` (P1-3).
+
+    Sorts candidates by score descending and keeps a box only if its IoU
+    against every already-kept box is strictly below ``iou_thresh``. Returns
+    the indices of survivors into the original ``boxes_xyxy``/``scores``
+    sequences, ordered highest-score-first.
+
+    This exists so every NMS/dedupe decision in the service shares one
+    coordinate-space contract (plain xyxy tuples in, ``iou()`` semantics)
+    instead of depending on cv2.dnn.NMSBoxes' implicit [x, y, w, h] input
+    format. Passing xyxy boxes into that OpenCV API (as yolo_backend.py used
+    to) silently mis-scales every box into a much larger one anchored at the
+    same top-left corner, which makes the suppression decision depend on a
+    box's absolute position in the frame instead of only its geometry
+    relative to other boxes -- see the P1-3 regression tests in
+    test_yolo_backend.py for a concrete before/after case.
+    """
+    n = len(scores)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: float(scores[i]), reverse=True)
+    kept: List[int] = []
+    for i in order:
+        box_i = tuple(float(v) for v in boxes_xyxy[i])
+        if all(iou(box_i, tuple(float(v) for v in boxes_xyxy[j])) < iou_thresh for j in kept):
+            kept.append(i)
+    return kept
+
+
 def post_nms_dedupe(dets: List[Dict[str, Any]], iou_thresh: float) -> List[Dict[str, Any]]:
     if len(dets) <= 1:
         return dets
-    dets_sorted = sorted(dets, key=lambda d: d["score"], reverse=True)
-    kept: List[Dict[str, Any]] = []
-    for det in dets_sorted:
-        if all(iou(det["bbox"], k["bbox"]) < iou_thresh for k in kept):
-            kept.append(det)
-    return kept
+    boxes = [d["bbox"] for d in dets]
+    scores = [d["score"] for d in dets]
+    picked = greedy_nms_indices(boxes, scores, iou_thresh)
+    return [dets[i] for i in picked]
 
 
 def has_duplicate_track_overlap(
@@ -289,6 +341,33 @@ def has_duplicate_track_overlap(
         if now_ts - last_seen > recent_only_sec:
             continue
         if iou(det_box, tr["bbox"]) >= overlap_iou:
+            return True
+    return False
+
+
+def overlaps_confirmed_track(
+    det_box: tuple[float, float, float, float],
+    track_by_id: Dict[int, Dict[str, Any]],
+    iou_threshold: float,
+) -> bool:
+    """True if det_box plausibly belongs to an already-CONFIRMED track (P1-2).
+
+    Used to make the furniture-rejecting aspect-ratio filter (PERSON_MIN_HW_RATIO)
+    track-state-aware: a wide/low box that overlaps a track that was already a
+    confirmed person is far more likely that same person now lying down (a fall)
+    than a new piece of furniture, so the ratio filter should only ever gate
+    *new* track candidates — never drop a person mid-track. Reuses the same IoU
+    semantics as the tracker's own detection-to-track gating (MATCH_IOU_THRESHOLD
+    is the caller's typical choice) so "plausibly the same person" means the same
+    thing here as it does during actual assignment in global_track_assignment().
+    """
+    for tr in track_by_id.values():
+        if tr.get("status") != "confirmed":
+            continue
+        bbox = tr.get("bbox") or tr.get("measurement_bbox")
+        if not bbox:
+            continue
+        if iou(det_box, bbox) >= iou_threshold:
             return True
     return False
 

@@ -74,6 +74,10 @@ async def update_zone(zone_id: uuid.UUID, **kwargs: Any):
     return await _run(store.update_zone, zone_id, **kwargs)
 
 
+async def delete_zone(zone_id: uuid.UUID) -> bool:
+    return await _run(store.delete_zone, zone_id)
+
+
 async def get_event(event_id: uuid.UUID):
     return await _run(store.get_event, event_id)
 

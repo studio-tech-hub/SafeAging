@@ -633,8 +633,12 @@ def list_zones(
     clauses = []
     params: list[Any] = []
     if camera_id:
-        clauses.append("camera_id = ?")
-        params.append(camera_id)
+        from ..config import normalize_camera_id
+
+        cid = normalize_camera_id(camera_id)
+        bare = cid.strip("{}")
+        clauses.append("(camera_id = ? OR camera_id = ?)")
+        params.extend([cid, bare])
     if active_only:
         clauses.append("active = 1")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -705,6 +709,21 @@ def update_zone(zone_id: uuid.UUID, **kwargs: Any) -> ZoneRecord | None:
         finally:
             conn.close()
     return get_zone(zone_id)
+
+
+def delete_zone(zone_id: uuid.UUID) -> bool:
+    zid = _uuid_str(zone_id)
+    with _lock:
+        conn = _connect()
+        try:
+            conn.execute(
+                "UPDATE events SET zone_id = NULL WHERE zone_id = ?", (zid,)
+            )
+            cur = conn.execute("DELETE FROM zones WHERE id = ?", (zid,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
 
 
 # ── Event ─────────────────────────────────────────────────────────────────────

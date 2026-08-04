@@ -26,8 +26,10 @@
 
 #include "engine.h"
 #include "frame.h"
+#include "multipart_binary_transport.h"
 #include "object_detector.h"
 #include "object_tracker.h"
+#include "transport_client.h"
 
 namespace sample_company {
 namespace vms_server_plugins {
@@ -40,6 +42,12 @@ struct FrameJob
     std::string cameraId;
     int64_t timestampUs;
     int64_t frameIndex;
+    // P1-4 — the actual JPEG-encoded pixel dimensions (post any downscale applied
+    // in encodeFrameToJpeg()), NOT necessarily frame->width/height. The transport
+    // layer needs these exact dimensions to normalize detection boxes without
+    // re-decoding the JPEG.
+    int frameWidth = 0;
+    int frameHeight = 0;
 };
 
 struct RenderedDetectionState
@@ -88,7 +96,15 @@ private:
         const nx::sdk::analytics::IUncompressedVideoFrame* videoFrame);
 
     void workerThreadRun();
-    std::vector<uint8_t> encodeFrameToJpeg(const Frame& frame, int targetWidth = 0);
+    // outEncodedWidth/outEncodedHeight (P1-4), when non-null, receive the actual
+    // encoded frame's pixel dimensions (post any downscale to targetWidth) —
+    // callers thread these through to the transport layer instead of
+    // re-decoding the JPEG later just to recover them.
+    std::vector<uint8_t> encodeFrameToJpeg(
+        const Frame& frame,
+        int targetWidth = 0,
+        int* outEncodedWidth = nullptr,
+        int* outEncodedHeight = nullptr);
     MetadataPacketList processFrameJob(const FrameJob& job);
     MetadataPacketList buildDisabledCleanupPackets(int64_t timestampUs);
     void clearPendingFrameQueue();
@@ -119,6 +135,7 @@ private:
 
     static constexpr int kDefaultDetectionFramePeriod = 2;
     static constexpr int kDefaultTargetEnqueueFps = 2;
+    static constexpr int kDefaultConfidenceThresholdPercent = 70;
     static constexpr size_t kDefaultFrameQueueMaxSize = 1;
     static constexpr int kDefaultMetricsLogPeriodSec = 10;
 
@@ -145,6 +162,21 @@ private:
     std::string m_cameraId;   //< Stable identity key sent to the service (Nx UUID)
 
     const std::unique_ptr<ObjectDetector> m_objectDetector;
+
+    // P1-4 — Strategy pattern: both transports are always constructed and kept
+    // configured in sync (see settingsReceived()), but only one is ever the
+    // active one at a time, selected via the "transport_mode" plugin setting
+    // (default json_base64). DeviceAgent's hot path (processFrameJob) depends
+    // only on the ITransportClient interface via m_activeTransport, so adding
+    // future transports needs no change there — just another concrete class
+    // and a new branch in the settingsReceived() selection logic.
+    // m_activeTransport is a non-owning pointer into one of the two members
+    // below and is never null after construction; std::atomic because it's
+    // written from the settings-apply path and read from the worker thread.
+    const std::unique_ptr<JsonBase64Transport> m_jsonBase64Transport;
+    const std::unique_ptr<MultipartBinaryTransport> m_multipartBinaryTransport;
+    std::atomic<ITransportClient*> m_activeTransport{nullptr};
+
     std::unique_ptr<ObjectTracker> m_objectTracker;
     int m_frameIndex = 0;
 
@@ -213,6 +245,7 @@ private:
 
     std::atomic<int> m_detectionFramePeriod{kDefaultDetectionFramePeriod};
     std::atomic<int> m_targetEnqueueFps{kDefaultTargetEnqueueFps};
+    std::atomic<int> m_confidenceThresholdPercent{kDefaultConfidenceThresholdPercent};
     std::atomic<size_t> m_frameQueueMaxSize{kDefaultFrameQueueMaxSize};
     std::atomic<int> m_metricsLogPeriodSec{kDefaultMetricsLogPeriodSec};
     std::atomic<int> m_lastEffectiveEnqueueFps{kDefaultTargetEnqueueFps};

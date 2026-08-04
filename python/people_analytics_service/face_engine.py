@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,8 @@ class FaceMatch:
 
 def _build_app():
     """Create and prepare an insightface FaceAnalysis app. Returns None on failure."""
-    from .config import DEVICE, FACE_DET_SIZE, FACE_MODEL_PACK
+    from .config import FACE_DET_SIZE, FACE_MODEL_PACK
+    from .face_providers import build_face_providers
 
     try:
         from insightface.app import FaceAnalysis
@@ -60,23 +62,34 @@ def _build_app():
         logger.warning("[face] insightface not available: %s", exc)
         return None
 
-    use_cuda = str(DEVICE).startswith("cuda")
-    providers = (
-        ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        if use_cuda
-        else ["CPUExecutionProvider"]
-    )
-    ctx_id = 0 if use_cuda else -1
+    providers, provider_options, backend_label = build_face_providers()
+    ctx_id = -1
 
     try:
-        app = FaceAnalysis(name=FACE_MODEL_PACK, providers=providers)
+        kwargs: dict = {"name": FACE_MODEL_PACK, "providers": providers}
+        if provider_options is not None:
+            kwargs["provider_options"] = provider_options
+        app = FaceAnalysis(**kwargs)
         app.prepare(ctx_id=ctx_id, det_size=(FACE_DET_SIZE, FACE_DET_SIZE))
         logger.info(
-            "[face] insightface '%s' ready (providers=%s, det_size=%d)",
-            FACE_MODEL_PACK, providers, FACE_DET_SIZE,
+            "[face] insightface '%s' ready backend=%s providers=%s det_size=%d",
+            FACE_MODEL_PACK,
+            backend_label,
+            providers,
+            FACE_DET_SIZE,
         )
         return app
     except Exception as exc:
+        if backend_label == "qnn_gpu":
+            logger.warning("[face] QNN GPU load failed (%s); retrying CPU", exc)
+            try:
+                app = FaceAnalysis(name=FACE_MODEL_PACK, providers=["CPUExecutionProvider"])
+                app.prepare(ctx_id=-1, det_size=(FACE_DET_SIZE, FACE_DET_SIZE))
+                logger.info("[face] insightface '%s' ready backend=cpu (fallback)", FACE_MODEL_PACK)
+                return app
+            except Exception as cpu_exc:
+                logger.error("[face] CPU fallback failed: %s", cpu_exc, exc_info=True)
+                return None
         logger.error("[face] Failed to load insightface model: %s", exc, exc_info=True)
         return None
 
@@ -129,6 +142,17 @@ def extract_embedding(bgr_crop: np.ndarray) -> Optional[np.ndarray]:
 
     from .config import FACE_MIN_PIXELS
 
+    # Upscale tiny crops so SCRFD can find faces on distant cameras.
+    h, w = bgr_crop.shape[:2]
+    min_side = min(h, w)
+    if min_side < 160:
+        scale = 160.0 / max(min_side, 1)
+        bgr_crop = cv2.resize(
+            bgr_crop,
+            (int(round(w * scale)), int(round(h * scale))),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
     try:
         faces = app.get(bgr_crop)
     except Exception as exc:
@@ -158,6 +182,44 @@ def extract_embedding(bgr_crop: np.ndarray) -> Optional[np.ndarray]:
         if n > 1e-6:
             emb = emb / n
     return np.asarray(emb, dtype=np.float32)
+
+
+def detect_face_bbox(bgr_crop: np.ndarray) -> Optional[tuple[float, float, float, float]]:
+    """Return the largest face xyxy in the crop's pixel coordinates."""
+    app = _get_app()
+    if app is None or bgr_crop is None or bgr_crop.size == 0:
+        return None
+
+    h, w = bgr_crop.shape[:2]
+    scale = 1.0
+    work = bgr_crop
+    if min(h, w) < 160:
+        scale = 160.0 / max(min(h, w), 1)
+        work = cv2.resize(
+            bgr_crop,
+            (int(round(w * scale)), int(round(h * scale))),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    try:
+        faces = app.get(work)
+    except Exception as exc:
+        logger.debug("[face] bbox detection error: %s", exc)
+        return None
+
+    if not faces:
+        return None
+
+    def _area(f) -> float:
+        x1, y1, x2, y2 = f.bbox
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    face = max(faces, key=_area)
+    x1, y1, x2, y2 = (float(v) for v in face.bbox)
+    if scale != 1.0:
+        inv = 1.0 / scale
+        x1, y1, x2, y2 = x1 * inv, y1 * inv, x2 * inv, y2 * inv
+    return (x1, y1, x2, y2)
 
 
 def embedding_to_bytes(vec: np.ndarray) -> bytes:
@@ -311,12 +373,23 @@ def match_embedding(query: np.ndarray, threshold: Optional[float] = None) -> Opt
 
     if best is not None and best_score >= thr:
         return best
+    if best is not None:
+        logger.info(
+            "[face] Gallery miss: best=%.3f thr=%.3f person=%s",
+            best_score,
+            thr,
+            best.name,
+        )
     return None
 
 
 def recognize_crop(bgr_crop: np.ndarray, threshold: Optional[float] = None) -> Optional[FaceMatch]:
     """Convenience: extract embedding from a crop and match against the gallery."""
+    if bgr_crop is None or bgr_crop.size == 0:
+        return None
     emb = extract_embedding(bgr_crop)
     if emb is None:
+        h, w = bgr_crop.shape[:2]
+        logger.info("[face] No face detected in crop %dx%d", w, h)
         return None
     return match_embedding(emb, threshold)

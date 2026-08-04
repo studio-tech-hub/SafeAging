@@ -11,11 +11,14 @@ from people_analytics_service.tracking import (
     center_distance_ratio,
     combined_track_score,
     dedupe_output_tracks,
+    greedy_nms_indices,
     has_duplicate_track_overlap,
     hungarian_minimize,
     iou,
+    overlaps_confirmed_track,
     post_nms_dedupe,
     predict_track_bbox,
+    select_output_bbox,
     smooth_bbox,
     update_track_motion,
 )
@@ -109,6 +112,58 @@ class TestSmoothBbox:
 
 
 # ---------------------------------------------------------------------------
+# select_output_bbox (P1-1: the rendered/output box must be the smoothed one,
+# not the raw measurement — smooth_bbox() was being computed and discarded).
+# ---------------------------------------------------------------------------
+
+class TestSelectOutputBbox:
+    def test_prefers_smoothed_bbox_over_raw_measurement(self):
+        # Mirrors api.py's matched-track update: tr["bbox"] holds the smoothed
+        # value, tr["measurement_bbox"] holds the latest raw YOLO measurement.
+        old = (0.0, 0.0, 10.0, 10.0)
+        new = (50.0, 50.0, 60.0, 60.0)
+        smoothed = smooth_bbox(old, new, alpha=0.85)
+        track = {"bbox": smoothed, "measurement_bbox": new}
+        assert select_output_bbox(track) == smoothed
+
+    def test_end_to_end_smoothing_differs_from_raw_measurement(self):
+        """Proves smoothing is actually applied end-to-end (the P1-1 bug: it was
+        computed via smooth_bbox() but never reached the output)."""
+        old = (0.0, 0.0, 10.0, 10.0)
+        new = (20.0, 20.0, 30.0, 30.0)
+        smoothed = smooth_bbox(old, new, alpha=0.85)
+        track = {"bbox": smoothed, "measurement_bbox": new}
+        selected = select_output_bbox(track)
+        assert selected != new
+        assert selected == smoothed
+
+    def test_regression_guard_large_jump_still_uses_smoothed_box(self):
+        """Pins the P1-1 bug so it can't silently regress: even on a large, fast
+        jump (which pushes smooth_bbox()'s adaptive alpha up via
+        center_distance_ratio so it "snaps" quickly), the selected output must
+        still be the smoothed value, not the raw measurement."""
+        old = (0.0, 0.0, 10.0, 10.0)
+        new = (200.0, 200.0, 210.0, 210.0)  # large jump
+        smoothed = smooth_bbox(old, new, alpha=0.85)
+        track = {"bbox": smoothed, "measurement_bbox": new}
+        assert select_output_bbox(track) != new
+        assert select_output_bbox(track) == smoothed
+
+    def test_smoothing_disabled_is_backward_compatible_with_raw_output(self):
+        """BBOX_SMOOTHING=0 semantics: api.py's matched-track update sets
+        tr["bbox"] = det_box directly in that case (smooth_bbox() is never
+        called), so "bbox" already equals the raw measurement — operators who
+        want the old razor-sharp/no-lag boxes see identical behavior."""
+        raw = (5.0, 5.0, 15.0, 15.0)
+        track = {"bbox": raw, "measurement_bbox": raw}
+        assert select_output_bbox(track) == raw
+
+    def test_missing_bbox_falls_back_to_measurement_bbox(self):
+        track = {"measurement_bbox": (1.0, 2.0, 3.0, 4.0)}
+        assert select_output_bbox(track) == (1.0, 2.0, 3.0, 4.0)
+
+
+# ---------------------------------------------------------------------------
 # post_nms_dedupe
 # ---------------------------------------------------------------------------
 
@@ -145,6 +200,71 @@ class TestPostNmsDedupe:
 
 
 # ---------------------------------------------------------------------------
+# greedy_nms_indices (P1-3: xyxy-native NMS via iou(), replaces the
+# cv2.dnn.NMSBoxes-based yolo_backend._nms_indices, which silently expected
+# [x, y, w, h] input and mis-scaled xyxy boxes into much larger ones anchored
+# at the same top-left corner -- making suppression depend on a box's
+# absolute position in the frame instead of only its overlap with others.)
+# ---------------------------------------------------------------------------
+
+class TestGreedyNmsIndices:
+    def test_empty_input(self):
+        assert greedy_nms_indices([], [], 0.5) == []
+
+    def test_single_box_kept(self):
+        assert greedy_nms_indices([(0.0, 0.0, 10.0, 10.0)], [0.9], 0.5) == [0]
+
+    def test_non_overlapping_both_kept(self):
+        boxes = [(0.0, 0.0, 10.0, 10.0), (50.0, 50.0, 60.0, 60.0)]
+        scores = [0.9, 0.8]
+        assert greedy_nms_indices(boxes, scores, 0.5) == [0, 1]
+
+    def test_duplicate_suppressed_highest_score_first(self):
+        boxes = [(0.0, 0.0, 10.0, 10.0), (1.0, 1.0, 11.0, 11.0)]  # ~90% overlap
+        scores = [0.7, 0.9]
+        assert greedy_nms_indices(boxes, scores, 0.5) == [1]
+
+    def test_translation_invariant_near_and_far_from_origin(self):
+        """P1-3 regression: same relative geometry must NMS identically
+        regardless of absolute frame position.
+
+        True IoU of this box pair is ~0.39, below the 0.45 threshold, so
+        both boxes must survive whether the pair sits near the frame origin
+        or far away from it. The pre-fix cv2.dnn.NMSBoxes-based
+        implementation passed xyxy straight in as if it were [x, y, w, h]:
+        near the origin (x1=y1=0) that happens to coincide with the true
+        box, but far from the origin it inflates each box into one anchored
+        at (x1, y1) with far corner at (x1 + x2, y1 + y2) -- e.g. a box at
+        (300, 300, 340, 340) (true 40x40) became a 340x340 box, which
+        pushed the *apparent* IoU with its neighbor up to ~0.84 and wrongly
+        suppressed it (empirically measured against the pre-fix
+        cv2.dnn.NMSBoxes-based implementation before this test was added).
+        """
+        near = [(0.0, 0.0, 40.0, 40.0), (10.0, 10.0, 50.0, 50.0)]
+        far = [(300.0, 300.0, 340.0, 340.0), (310.0, 310.0, 350.0, 350.0)]
+        scores = [0.9, 0.8]
+        true_iou_near = iou(near[0], near[1])
+        true_iou_far = iou(far[0], far[1])
+        assert true_iou_near == pytest.approx(true_iou_far)
+        assert true_iou_near < 0.45  # below threshold -> neither should suppress the other
+
+        assert greedy_nms_indices(near, scores, 0.45) == [0, 1]
+        assert greedy_nms_indices(far, scores, 0.45) == [0, 1]
+
+    def test_matches_post_nms_dedupe_on_same_input(self):
+        dets = [
+            {"score": 0.9, "bbox": (0.0, 0.0, 10.0, 10.0)},
+            {"score": 0.7, "bbox": (1.0, 1.0, 11.0, 11.0)},
+            {"score": 0.8, "bbox": (50.0, 50.0, 60.0, 60.0)},
+        ]
+        boxes = [d["bbox"] for d in dets]
+        scores = [d["score"] for d in dets]
+        picked = greedy_nms_indices(boxes, scores, 0.5)
+        expected = post_nms_dedupe(dets, 0.5)
+        assert [dets[i] for i in picked] == expected
+
+
+# ---------------------------------------------------------------------------
 # has_duplicate_track_overlap
 # ---------------------------------------------------------------------------
 
@@ -167,6 +287,61 @@ class TestHasDuplicateTrackOverlap:
         det_box = (1.0, 1.0, 11.0, 11.0)
         # recent_only_sec=1, now_ts=10 → stale
         assert not has_duplicate_track_overlap(det_box, track_by_id, now_ts=10.0, overlap_iou=0.5, recent_only_sec=1.0)
+
+
+# ---------------------------------------------------------------------------
+# overlaps_confirmed_track (P1-2: makes PERSON_MIN_HW_RATIO track-state-aware —
+# a wide/low box overlapping an already-confirmed track should bypass the
+# furniture-rejecting ratio filter, since it's far more likely a fall than a
+# new piece of furniture; brand-new candidates still get the strict filter.)
+# ---------------------------------------------------------------------------
+
+class TestOverlapsConfirmedTrack:
+    def _track(self, x1, y1, x2, y2, status="confirmed"):
+        return {
+            "bbox": (float(x1), float(y1), float(x2), float(y2)),
+            "status": status,
+        }
+
+    def test_wide_box_over_confirmed_track_bypasses_filter(self):
+        """The core P1-2 fix: a fallen-posture-shaped box overlapping a track
+        that was already confirmed must be allowed through (bypass=True)."""
+        track_by_id = {1: self._track(0, 0, 100, 100, status="confirmed")}
+        wide_fallen_box = (5.0, 40.0, 95.0, 90.0)  # low h/w ratio, overlaps track 1
+        assert overlaps_confirmed_track(wide_fallen_box, track_by_id, iou_threshold=0.12)
+
+    def test_wide_box_with_no_nearby_track_stays_filtered(self):
+        """A brand-new wide candidate with no overlapping track must NOT bypass
+        the filter — this is exactly the furniture false-positive case the
+        filter exists to catch."""
+        track_by_id = {1: self._track(0, 0, 100, 100, status="confirmed")}
+        far_away_box = (500.0, 500.0, 600.0, 550.0)
+        assert not overlaps_confirmed_track(far_away_box, track_by_id, iou_threshold=0.12)
+
+    def test_tentative_track_does_not_bypass_filter(self):
+        """Only CONFIRMED tracks may bypass the ratio filter — a tentative
+        (not-yet-established) track candidate must still be held to the strict
+        furniture filter, per the P1-2 spec ('only applies to new/tentative
+        track candidates')."""
+        track_by_id = {1: self._track(0, 0, 100, 100, status="tentative")}
+        wide_box = (5.0, 40.0, 95.0, 90.0)
+        assert not overlaps_confirmed_track(wide_box, track_by_id, iou_threshold=0.12)
+
+    def test_low_overlap_below_threshold_does_not_bypass(self):
+        """Overlap must meet the same IoU bar the tracker itself uses to
+        consider a detection a candidate match — a box that barely grazes a
+        confirmed track's last-known position should not bypass the filter."""
+        track_by_id = {1: self._track(0, 0, 10, 10, status="confirmed")}
+        barely_touching_box = (9.5, 9.5, 30.0, 30.0)
+        assert not overlaps_confirmed_track(barely_touching_box, track_by_id, iou_threshold=0.12)
+
+    def test_no_tracks_returns_false(self):
+        assert not overlaps_confirmed_track((0.0, 0.0, 10.0, 10.0), {}, iou_threshold=0.12)
+
+    def test_falls_back_to_measurement_bbox_when_bbox_missing(self):
+        track_by_id = {1: {"status": "confirmed", "measurement_bbox": (0.0, 0.0, 100.0, 100.0)}}
+        wide_box = (5.0, 40.0, 95.0, 90.0)
+        assert overlaps_confirmed_track(wide_box, track_by_id, iou_threshold=0.12)
 
 
 # ---------------------------------------------------------------------------

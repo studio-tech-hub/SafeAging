@@ -365,31 +365,95 @@ async function renderZones(){
   const el=document.getElementById("tab-zones");
   const zs=await api("/admin/zones?active_only=false");
   let html='<div class="card"><h3>Create zone (polygon)</h3><div class="row">'+
-    '<input id="zCam" placeholder="camera_id">'+
+    '<input id="zCam" placeholder="{uuid} e.g. {a3d57074-...}">'+
     '<input id="zName" placeholder="Zone name">'+
     '<select id="zType"><option value="forbidden">forbidden</option><option value="entry">entry</option><option value="exit">exit</option><option value="roi">roi</option></select>'+
-    '</div><div class="field" style="margin-top:8px"><label>Polygon points (pixels): [[x,y],[x,y],...]</label>'+
-    '<textarea id="zPts" rows="2" placeholder="[[100,100],[400,100],[400,400],[100,400]]" style="width:100%"></textarea></div>'+
+    '</div><div class="field" style="margin-top:8px"><label>Polygon points (pixels)</label>'+
+    '<textarea id="zPts" rows="3" placeholder="280,73,317,79,285,136,213,109" style="width:100%"></textarea></div>'+
     '<button onclick="addZone()">Create zone</button>'+
-    '<p class="muted">Coordinates are in full-frame camera pixels.</p></div>';
+    '<p class="muted">Paste from image-map.net (<code>280,73,317,79,...</code> or full HTML) — auto-converts to '+
+    '<code>[[x,y],...]</code> on paste. Coordinates are in full-frame camera pixels (640×360).</p></div>';
   html+='<div class="card"><h3>Zones</h3><table><tr><th>Camera</th><th>Name</th><th>Type</th><th>Active</th><th></th></tr>';
   zs.forEach(z=>{ html+=`<tr><td>${z.camera_id}</td><td>${z.name}</td><td>${z.zone_type}</td>
     <td>${z.active?'<span class="tag ok">on</span>':'<span class="tag bad">off</span>'}</td>
-    <td><button class="secondary" onclick="delZone('${z.id}')">Disable</button></td></tr>`; });
+    <td><button class="secondary" onclick="delZone('${z.id}')">Remove</button></td></tr>`; });
   html+='</table></div>';
   el.innerHTML=html;
+  wirePolygonInput(document.getElementById("zPts"));
 }
+
+function validatePolygonPoints(parsed){
+  if(!Array.isArray(parsed) || parsed.length < 3)
+    throw new Error("Need at least 3 points");
+  return parsed.map(p=>{
+    if(Array.isArray(p) && p.length >= 2){
+      const x = Number(p[0]), y = Number(p[1]);
+      if(Number.isNaN(x) || Number.isNaN(y)) throw new Error("Invalid [x,y] numbers");
+      return [x, y];
+    }
+    throw new Error("Each point must be [x,y]");
+  });
+}
+
+function parsePolygonPoints(raw){
+  if(!raw || !String(raw).trim()) throw new Error("Enter polygon coordinates");
+  let s = String(raw).trim();
+  const coordsMatch = s.match(/coords\s*=\s*["']([^"']+)["']/i);
+  if(coordsMatch) s = coordsMatch[1].trim();
+  if(s.startsWith("[")) return validatePolygonPoints(JSON.parse(s));
+  const nums = s.split(/[\s,;]+/).filter(Boolean).map(Number);
+  if(nums.some(n=>Number.isNaN(n))) throw new Error("Invalid number in coordinates");
+  if(nums.length < 6 || nums.length % 2 !== 0)
+    throw new Error("Need at least 3 points (even count: x,y,x,y,...)");
+  const pts = [];
+  for(let i=0; i<nums.length; i+=2) pts.push([nums[i], nums[i+1]]);
+  return validatePolygonPoints(pts);
+}
+
+function formatPolygonPoints(pts){
+  return JSON.stringify(pts);
+}
+
+function wirePolygonInput(el){
+  if(!el || el.dataset.wired) return;
+  el.dataset.wired = "1";
+  const normalize = ()=>{
+    const raw = el.value.trim();
+    if(!raw){ el.classList.remove("invalid"); return; }
+    try{
+      el.value = formatPolygonPoints(parsePolygonPoints(raw));
+      el.classList.remove("invalid");
+    }catch(e){
+      el.classList.add("invalid");
+    }
+  };
+  el.addEventListener("paste", ()=>setTimeout(normalize, 0));
+  el.addEventListener("blur", normalize);
+}
+
+function normalizeCameraId(raw){
+  let cid=(raw||"").trim();
+  if(!cid) return cid;
+  if(cid.startsWith("{") && cid.endsWith("}")) return cid;
+  return "{"+cid.replace(/^\{|\}$/g,"")+"}";
+}
+
 async function addZone(){
-  let pts; try{ pts=JSON.parse(document.getElementById("zPts").value); }catch(e){ toast("Invalid polygon JSON"); return; }
-  const body={ camera_id:document.getElementById("zCam").value.trim(),
+  let pts;
+  try{ pts = parsePolygonPoints(document.getElementById("zPts").value); }
+  catch(e){ toast(e.message || "Invalid polygon"); return; }
+  document.getElementById("zPts").value = formatPolygonPoints(pts);
+  const camEl=document.getElementById("zCam");
+  camEl.value=normalizeCameraId(camEl.value);
+  const body={ camera_id:camEl.value.trim(),
     name:document.getElementById("zName").value.trim(),
     zone_type:document.getElementById("zType").value,
     geometry:{points:pts}, active:true };
   if(!body.camera_id||!body.name){ toast("Enter camera_id and zone name"); return; }
   try{ await api("/admin/zones",{method:"POST",body}); toast("Zone created"); render(); }catch(e){ toast(e.message); }
 }
-async function delZone(id){ if(!confirm("Disable this zone?"))return;
-  try{ await api(`/admin/zones/${id}`,{method:"DELETE"}); toast("Zone disabled"); render(); }catch(e){ toast(e.message); } }
+async function delZone(id){ if(!confirm("Remove this zone permanently?"))return;
+  try{ await api(`/admin/zones/${id}`,{method:"DELETE"}); toast("Zone removed"); render(); }catch(e){ toast(e.message); } }
 
 render();
 wireDateInput(document.getElementById("enrollDob"));

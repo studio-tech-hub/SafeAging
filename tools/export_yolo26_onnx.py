@@ -25,6 +25,12 @@ def main() -> int:
     parser.add_argument("--out", default="models/yolo26n.onnx", help="Output ONNX path")
     parser.add_argument("--imgsz", type=int, default=640, help="Square input size (minimum 640)")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
+    parser.add_argument(
+        "--nms",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Embed end2end NMS/TopK in ONNX (default). Use --no-nms for QNN HTP backbone-only export.",
+    )
     parser.add_argument("--simplify", action="store_true", default=True)
     parser.add_argument("--no-simplify", action="store_false", dest="simplify")
     args = parser.parse_args()
@@ -56,12 +62,14 @@ def main() -> int:
     print(f"Loading: {model_path}")
     model = YOLO(str(model_path))
 
-    print(f"Exporting ONNX → {out_path} (imgsz={args.imgsz}, opset={args.opset})")
+    nms_label = "end2end" if args.nms else "backbone-only (nms=False, CPU post-NMS)"
+    print(f"Exporting ONNX → {out_path} (imgsz={args.imgsz}, opset={args.opset}, {nms_label})")
     export_path = model.export(
         format="onnx",
         imgsz=args.imgsz,
         opset=args.opset,
         simplify=args.simplify,
+        nms=args.nms,
     )
     export_path = Path(export_path)
     if export_path.resolve() != out_path.resolve():

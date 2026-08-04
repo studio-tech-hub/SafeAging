@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
+#include <sstream>
+#include <iomanip>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -46,6 +48,33 @@ namespace sample_company
                 int renderTrackHoldMs(int targetEnqueueFps)
                 {
                     return std::clamp(1800 / std::max(1, targetEnqueueFps), 220, 420);
+                }
+
+                std::string formatMetricFixed2(double value)
+                {
+                    std::ostringstream oss;
+                    oss << std::fixed << std::setprecision(2) << value;
+                    return oss.str();
+                }
+
+                std::string formatPipelineMetrics(
+                    double inFps,
+                    double procFps,
+                    uint64_t dropped,
+                    size_t queueLen,
+                    size_t maxDepth,
+                    int effectiveEnqueueFps,
+                    double avgInferMs)
+                {
+                    std::ostringstream oss;
+                    oss << "In FPS = " << formatMetricFixed2(inFps)
+                        << "  Proc FPS = " << formatMetricFixed2(procFps) << '\n'
+                        << "Dropped = " << dropped
+                        << "  Queue = " << queueLen << '\n'
+                        << "Max Depth = " << maxDepth << '\n'
+                        << "Effective Enqueue FPS = " << effectiveEnqueueFps << '\n'
+                        << "Avg Infer MS = " << formatMetricFixed2(avgInferMs);
+                    return oss.str();
                 }
 
                 template<typename T, typename = void>
@@ -261,6 +290,9 @@ namespace sample_company
                   m_cameraName(resolveCameraName(deviceInfo)),
                   m_cameraId(resolveStableCameraId(deviceInfo)),
                   m_objectDetector(std::make_unique<ObjectDetector>()),
+                  m_jsonBase64Transport(std::make_unique<JsonBase64Transport>(*m_objectDetector)),
+                  m_multipartBinaryTransport(std::make_unique<MultipartBinaryTransport>()),
+                  m_activeTransport(m_jsonBase64Transport.get()), //< default transport; see settingsReceived()
                   m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this),
                   m_workerShouldStop(false),
@@ -429,9 +461,12 @@ namespace sample_company
                 }
 
                 // P2.3 – Register this camera with the service so the service knows its
-                // display name. Best-effort: a failure just logs and the poll loop continues.
+                // display name and per-camera detection threshold.
                 {
-                    const bool ok = m_objectDetector->registerCamera(m_cameraId, m_cameraName);
+                    const int confPct = m_confidenceThresholdPercent.load(std::memory_order_relaxed);
+                    const float confThreshold = static_cast<float>(confPct) / 100.0f;
+                    const bool ok = m_objectDetector->registerCamera(
+                        m_cameraId, m_cameraName, confThreshold);
                     if (ok)
                         logutil::log(logutil::Level::info,
                             "Camera registered with service camera_id=\"" + m_cameraId +
@@ -596,6 +631,15 @@ namespace sample_company
             },
             {
                 "type": "SpinBox",
+                "name": "confidence_threshold_percent",
+                "caption": "Detection Threshold (%)",
+                "defaultValue": 70,
+                "minValue": 10,
+                "maxValue": 99,
+                "description": "Minimum person confidence 10–99 (70 = 0.70). Sent to analytics service for this camera."
+            },
+            {
+                "type": "SpinBox",
                 "name": "detection_frame_period",
                 "caption": "Detection Frame Period",
                 "defaultValue": 2,
@@ -690,6 +734,13 @@ namespace sample_company
                 "caption": "Retry Backoff (ms)",
                 "defaultValue": 250,
                 "description": "Delay between analytics service retry attempts."
+            },
+            {
+                "type": "TextField",
+                "name": "transport_mode",
+                "caption": "Transport Mode",
+                "defaultValue": "json_base64",
+                "description": "How frames are sent to the analytics service: 'json_base64' (default, proven) or 'binary' (additive multipart/form-data transport, lower CPU/payload overhead — validate before relying on it in production). Unrecognized values fall back to json_base64."
             },
             {
                 "type": "CheckBox",
@@ -927,7 +978,10 @@ namespace sample_company
                     try
                     {
                         Frame frame(videoFrame, m_frameIndex);
-                        std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 640);
+                        int encodedWidth = 0;
+                        int encodedHeight = 0;
+                        std::vector<uint8_t> jpegBytes =
+                            encodeFrameToJpeg(frame, 640, &encodedWidth, &encodedHeight);
 
                         FrameJob job;
                         job.jpegBytes = std::move(jpegBytes);
@@ -935,6 +989,8 @@ namespace sample_company
                         job.cameraId = m_cameraId; //< stable UUID, not display name
                         job.timestampUs = frame.timestampUs;
                         job.frameIndex = m_frameIndex;
+                        job.frameWidth = encodedWidth;
+                        job.frameHeight = encodedHeight;
 
                         {
                             std::unique_lock<std::mutex> lk(m_frameQueueMutex);
@@ -1035,33 +1091,24 @@ namespace sample_company
                         queueLen = m_frameQueue.size();
                     }
 
-                    logutil::log(
-                        logutil::Level::info,
-                        "Pipeline metrics: in_fps=" + std::to_string(inFps) +
-                            ", proc_fps=" + std::to_string(procFps) +
-                            ", drop=" + std::to_string(deltaDropped) +
-                            ", queue=" + std::to_string(queueLen) +
-                            ", max_depth=" + std::to_string(maxDepth) +
-                            ", effective_enqueue_fps=" +
-                            std::to_string(m_lastEffectiveEnqueueFps.load(std::memory_order_relaxed)) +
-                            ", avg_infer_ms=" + std::to_string(avgInferMs));
+                    const std::string metricsText = formatPipelineMetrics(
+                        inFps,
+                        procFps,
+                        deltaDropped,
+                        queueLen,
+                        maxDepth,
+                        m_lastEffectiveEnqueueFps.load(std::memory_order_relaxed),
+                        avgInferMs);
+
+                    logutil::log(logutil::Level::info, "Pipeline metrics:\n" + metricsText);
 
                     if (m_lastMetricsDiagTime == std::chrono::steady_clock::time_point::min() ||
                         now - m_lastMetricsDiagTime >= std::chrono::seconds(kMetricsDiagThrottleSec))
                     {
-                        const std::string diag =
-                            "in_fps=" + std::to_string(inFps) +
-                            ", proc_fps=" + std::to_string(procFps) +
-                            ", dropped=" + std::to_string(deltaDropped) +
-                            ", queue=" + std::to_string(queueLen) +
-                            ", max_depth=" + std::to_string(maxDepth) +
-                            ", effective_enqueue_fps=" +
-                            std::to_string(m_lastEffectiveEnqueueFps.load(std::memory_order_relaxed)) +
-                            ", avg_infer_ms=" + std::to_string(avgInferMs);
                         pushPluginDiagnosticEvent(
                             nx::sdk::IPluginDiagnosticEvent::Level::info,
                             "Pipeline metrics",
-                            diag.c_str());
+                            metricsText.c_str());
                         m_lastMetricsDiagTime = now;
                     }
 
@@ -1151,6 +1198,8 @@ namespace sample_company
             nx::sdk::Result<const nx::sdk::ISettingsResponse*> DeviceAgent::settingsReceived()
             {
                 const std::string rawEnabled = settingValue("enabled");
+                const std::string rawConfidenceThreshold =
+                    settingValue("confidence_threshold_percent");
                 const std::string rawDetectionPeriod = settingValue("detection_frame_period");
                 const std::string rawEnqueueFps = settingValue("target_enqueue_fps");
                 const std::string rawQueueMax = settingValue("frame_queue_max_size");
@@ -1168,11 +1217,14 @@ namespace sample_company
                 const std::string rawServiceRetryCount = settingValue("service_retry_count");
                 const std::string rawServiceRetryBackoffMs =
                     settingValue("service_retry_backoff_ms");
+                const std::string rawTransportMode = settingValue("transport_mode");
 
                 logutil::log(
                     logutil::Level::info,
                     "Raw settings from Nx: enabled=" +
                         printableSettingValue(rawEnabled) +
+                        ", confidence_threshold_percent=" +
+                        printableSettingValue(rawConfidenceThreshold) +
                         ", detection_frame_period=" +
                         printableSettingValue(rawDetectionPeriod) +
                         ", target_enqueue_fps=" + printableSettingValue(rawEnqueueFps) +
@@ -1191,9 +1243,15 @@ namespace sample_company
                         ", service_retry_count=" +
                             printableSettingValue(rawServiceRetryCount) +
                         ", service_retry_backoff_ms=" +
-                            printableSettingValue(rawServiceRetryBackoffMs));
+                            printableSettingValue(rawServiceRetryBackoffMs) +
+                        ", transport_mode=" + printableSettingValue(rawTransportMode));
 
                 const bool detectionEnabled = parseBoolSettingValue(rawEnabled, true);
+                const int confidenceThresholdPercent = parseIntSettingValue(
+                    rawConfidenceThreshold,
+                    kDefaultConfidenceThresholdPercent,
+                    10,
+                    99);
                 const int requestedDetectionPeriod = parseIntSettingValue(
                     rawDetectionPeriod,
                     kDefaultDetectionFramePeriod,
@@ -1256,6 +1314,27 @@ namespace sample_company
                     0,
                     std::numeric_limits<int>::max());
 
+                // P1-4 — transport_mode selects the Strategy implementation DeviceAgent
+                // sends frames through. Free-text TextField (not a dropdown) because the
+                // Nx Metadata SDK version this plugin targets does not have a confirmed
+                // ComboBox/enum settings-model item type; an unrecognized value safely
+                // falls back to the proven default rather than failing settingsReceived().
+                std::string transportMode = parseTextSettingValue(rawTransportMode, "json_base64");
+                std::transform(transportMode.begin(), transportMode.end(), transportMode.begin(),
+                    [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+                if (transportMode != "json_base64"
+                    && transportMode != "binary"
+                    && transportMode != "multipart_binary")
+                {
+                    logutil::logThrottled(
+                        logutil::Level::warn,
+                        "device_agent.unknown_transport_mode",
+                        std::chrono::seconds(60),
+                        "Unknown transport_mode=\"" + transportMode +
+                            "\" (expected json_base64 or binary); falling back to json_base64");
+                    transportMode = "json_base64";
+                }
+
                 const bool previousDetectionEnabled =
                     m_detectionEnabled.load(std::memory_order_relaxed);
                 {
@@ -1264,12 +1343,45 @@ namespace sample_company
                 }
                 m_detectionFramePeriod.store(detectionPeriod, std::memory_order_relaxed);
                 m_targetEnqueueFps.store(enqueueFps, std::memory_order_relaxed);
+                m_confidenceThresholdPercent.store(
+                    confidenceThresholdPercent, std::memory_order_relaxed);
                 m_frameQueueMaxSize.store(static_cast<size_t>(queueMax), std::memory_order_relaxed);
                 m_metricsLogPeriodSec.store(metricsPeriod, std::memory_order_relaxed);
                 m_lastEffectiveEnqueueFps.store(
                     detectionEnabled ? enqueueFps : 0,
                     std::memory_order_relaxed);
                 m_objectDetector->setServiceConfig(serviceConfig);
+                m_multipartBinaryTransport->setServiceConfig(serviceConfig);
+
+                ITransportClient* const selectedTransport = (transportMode == "binary"
+                        || transportMode == "multipart_binary")
+                    ? static_cast<ITransportClient*>(m_multipartBinaryTransport.get())
+                    : static_cast<ITransportClient*>(m_jsonBase64Transport.get());
+                m_activeTransport.store(selectedTransport, std::memory_order_relaxed);
+                logutil::log(
+                    logutil::Level::info,
+                    "Transport mode=" + transportMode + " active_transport=" +
+                        (selectedTransport == static_cast<ITransportClient*>(m_jsonBase64Transport.get())
+                            ? "JsonBase64Transport"
+                            : "MultipartBinaryTransport"));
+
+                {
+                    const float confThreshold =
+                        static_cast<float>(confidenceThresholdPercent) / 100.0f;
+                    const bool regOk = m_objectDetector->registerCamera(
+                        m_cameraId, m_cameraName, confThreshold);
+                    if (regOk)
+                        logutil::log(logutil::Level::info,
+                            "Camera config synced camera_id=\"" + m_cameraId +
+                                "\" confidence_threshold=" +
+                                std::to_string(confThreshold));
+                    else
+                        logutil::logThrottled(
+                            logutil::Level::warn,
+                            "device_agent.sync_camera_config." + m_cameraId,
+                            std::chrono::seconds(60),
+                            "Camera config sync failed camera_id=\"" + m_cameraId + "\"");
+                }
 
                 if (!detectionEnabled)
                 {
@@ -1289,6 +1401,9 @@ namespace sample_company
                         std::to_string(m_detectionFramePeriod.load(std::memory_order_relaxed)) +
                         ", target_enqueue_fps=" +
                         std::to_string(m_targetEnqueueFps.load(std::memory_order_relaxed)) +
+                        ", confidence_threshold_percent=" +
+                        std::to_string(
+                            m_confidenceThresholdPercent.load(std::memory_order_relaxed)) +
                         ", frame_queue_max_size=" +
                         std::to_string(m_frameQueueMaxSize.load(std::memory_order_relaxed)) +
                         ", metrics_log_period_sec=" +
@@ -1343,6 +1458,7 @@ namespace sample_company
                     m_debugConfig = debugConfig;
                 }
                 m_objectDetector->setDebugDumpConfig(debugConfig);
+                m_multipartBinaryTransport->setDebugDumpConfig(debugConfig);
 
                 if (debugDumpEnabled)
                 {
@@ -1504,7 +1620,8 @@ namespace sample_company
             // ============================================================
             // FLOW 2: Encode frame to JPEG bytes
             // ============================================================
-            std::vector<uint8_t> DeviceAgent::encodeFrameToJpeg(const Frame &frame, int targetWidth)
+            std::vector<uint8_t> DeviceAgent::encodeFrameToJpeg(
+                const Frame &frame, int targetWidth, int* outEncodedWidth, int* outEncodedHeight)
             {
                 cv::Mat sendImg = frame.cvMat;
 
@@ -1516,6 +1633,14 @@ namespace sample_company
                     int newH = std::max(1, (int)std::round(frame.height * scale));
                     cv::resize(sendImg, sendImg, cv::Size(targetWidth, newH));
                 }
+
+                // P1-4 — report the actual encoded pixel dimensions (post any downscale
+                // above) so callers can thread them through to the transport layer
+                // instead of re-decoding the JPEG later just to recover them.
+                if (outEncodedWidth)
+                    *outEncodedWidth = sendImg.cols;
+                if (outEncodedHeight)
+                    *outEncodedHeight = sendImg.rows;
 
                 // Encode to JPEG
                 std::vector<uint8_t> jpegBytes;
@@ -1544,8 +1669,12 @@ namespace sample_company
                     if (!m_detectionEnabled.load(std::memory_order_relaxed))
                         return result;
 
-                    // Call Python AI service with JPEG bytes
-                    DetectionList detections = m_objectDetector->run(job.cameraId, job.jpegBytes);
+                    // Call the analytics service via the currently-selected transport
+                    // (JSON+base64 by default, or additive multipart/binary — P1-4).
+                    ITransportClient* const transport =
+                        m_activeTransport.load(std::memory_order_relaxed);
+                    DetectionList detections = transport->sendFrame(
+                        job.cameraId, job.jpegBytes, job.frameWidth, job.frameHeight);
 
                     // The Python service is already the authoritative source for track_id and
                     // track state. The plugin renders those detections directly and uses only
@@ -1924,40 +2053,39 @@ namespace sample_company
         {
             objectMetadata->setTypeId(kPersonObjectType);
 
-            // Identity fields: only publish after a successful match so Nx does not
-            // aggregate "Unknown" with the resolved name across the object lifetime.
-            if (detection->recognized)
-            {
-                if (!detection->personName.empty())
-                {
-                    objectMetadata->addAttribute(makePtr<Attribute>(
-                        IAttribute::Type::string,
-                        "Person name",
-                        detection->personName));
-                }
-                if (!detection->personGender.empty())
-                {
-                    objectMetadata->addAttribute(makePtr<Attribute>(
-                        IAttribute::Type::string,
-                        "Gender",
-                        detection->personGender));
-                }
-                if (detection->personAge >= 0)
-                {
-                    objectMetadata->addAttribute(makePtr<Attribute>(
-                        IAttribute::Type::string,
-                        "Age",
-                        std::to_string(detection->personAge)));
-                }
-            }
+            const std::string personName =
+                (detection->recognized && !detection->personName.empty())
+                    ? detection->personName
+                    : "Unknown";
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Person name",
+                personName));
 
-            if (!detection->zoneName.empty())
-            {
-                objectMetadata->addAttribute(makePtr<Attribute>(
-                    IAttribute::Type::string,
-                    "Zone Name",
-                    detection->zoneName));
-            }
+            const std::string gender =
+                (detection->recognized && !detection->personGender.empty())
+                    ? detection->personGender
+                    : "Unknown";
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Gender",
+                gender));
+
+            const std::string age =
+                (detection->recognized && detection->personAge >= 0)
+                    ? std::to_string(detection->personAge)
+                    : "Unknown";
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Age",
+                age));
+
+            const std::string zoneLabel =
+                detection->zoneName.empty() ? "Unknown" : detection->zoneName;
+            objectMetadata->addAttribute(makePtr<Attribute>(
+                IAttribute::Type::string,
+                "Zone Name",
+                zoneLabel));
         }
                     else if (detection->classLabel == "cat")
                     {
@@ -2032,8 +2160,14 @@ namespace sample_company
                         "Legacy processFrame path invoked — this should not happen in normal operation");
 
                     // Local tracker used only here; Python service is authoritative.
-                    std::vector<uint8_t> jpegBytes = encodeFrameToJpeg(frame, 640);
-                    DetectionList detections = m_objectDetector->run(m_cameraId, jpegBytes);
+                    int encodedWidth = 0;
+                    int encodedHeight = 0;
+                    std::vector<uint8_t> jpegBytes =
+                        encodeFrameToJpeg(frame, 640, &encodedWidth, &encodedHeight);
+                    ITransportClient* const transport =
+                        m_activeTransport.load(std::memory_order_relaxed);
+                    DetectionList detections =
+                        transport->sendFrame(m_cameraId, jpegBytes, encodedWidth, encodedHeight);
                     const auto trackingResult = m_objectTracker->run(frame, detections);
 
                     const auto &objectMetadataPacket =

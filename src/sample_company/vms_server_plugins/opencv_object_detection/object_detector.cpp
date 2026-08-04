@@ -848,13 +848,16 @@ namespace sample_company {
             // ============================================================
             bool ObjectDetector::registerCamera(
                 const std::string& cameraId,
-                const std::string& displayName) const
+                const std::string& displayName,
+                float confidenceThreshold) const
             {
                 const AiServiceClientConfig config = serviceConfig();
                 const std::string path = "/admin/camera-configs/" + cameraId;
 
                 json body;
                 body["extra"] = {{"display_name", displayName}};
+                if (confidenceThreshold >= 0.0f && confidenceThreshold <= 1.0f)
+                    body["confidence_threshold"] = confidenceThreshold;
                 const std::string bodyStr = body.dump();
 
                 const auto doPut = [&](auto& client) -> httplib::Result
@@ -901,7 +904,11 @@ namespace sample_company {
             // ============================================================
             // FLOW 2: New method - run inference on JPEG bytes
             // ============================================================
-            DetectionList ObjectDetector::run(const std::string& cameraId, const std::vector<uint8_t>& jpegBytes)
+            DetectionList ObjectDetector::run(
+                const std::string& cameraId,
+                const std::vector<uint8_t>& jpegBytes,
+                int frameWidth,
+                int frameHeight)
             {
                 if (isTerminated())
                     return {};
@@ -911,7 +918,7 @@ namespace sample_company {
                     if (jpegBytes.empty())
                         throw ObjectDetectionError("JPEG bytes are empty");
                     
-                    return callPythonService(cameraId, jpegBytes);
+                    return callPythonService(cameraId, jpegBytes, frameWidth, frameHeight);
                 }
                 catch (const ObjectDetectionError&)
                 {
@@ -929,13 +936,22 @@ namespace sample_company {
             // ============================================================
             DetectionList ObjectDetector::callPythonService(
                 const std::string& cameraId,
-                const std::vector<uint8_t>& jpegBytes)
+                const std::vector<uint8_t>& jpegBytes,
+                int frameWidth,
+                int frameHeight)
             {
                 DetectionList result;
                 const std::string normalizedCameraId = normalizeCameraKey(cameraId);
                 const AiServiceClientConfig config = serviceConfig();
                 const DebugDumpConfig debugConfig = debugDumpConfig();
                 const std::string serviceTarget = serviceEndpoint(config);
+
+                if (frameWidth <= 0 || frameHeight <= 0)
+                {
+                    throw ObjectDetectionError(
+                        "Invalid frame dimensions passed to callPythonService: " +
+                        std::to_string(frameWidth) + "x" + std::to_string(frameHeight));
+                }
 
                 try
                 {
@@ -969,27 +985,41 @@ namespace sample_company {
                     if (b64.empty())
                         throw ObjectDetectionError("Failed to base64 encode JPEG bytes");
 
-                    const cv::Mat decodedJpeg = cv::imdecode(jpegBytes, cv::IMREAD_COLOR);
-                    if (decodedJpeg.empty())
-                        throw ObjectDetectionError("Failed to decode JPEG bytes to determine frame dimensions");
-
-                    const int frameW = decodedJpeg.cols;
-                    const int frameH = decodedJpeg.rows;
+                    // P1-4: frameW/frameH now come from the caller (which already knows
+                    // its own encoded JPEG dimensions) instead of decoding jpegBytes here
+                    // on every single request. The JPEG is only decoded below, lazily,
+                    // when debug frame dumping is actually enabled (default off) — that
+                    // is the only remaining consumer that needs a decoded cv::Mat.
+                    const int frameW = frameWidth;
+                    const int frameH = frameHeight;
 
                     // Handle debug frame dumping - only if debug is enabled
                     uint64_t dumpSeq = 0;
                     std::unique_ptr<FrameDumpContext> dumpCtx;
+                    cv::Mat decodedJpegForDump;
                     if (debugConfig.enabled && (debugConfig.dumpInput || debugConfig.dumpOutput))
                     {
                         dumpSeq = nextFrameDumpSeq();
                         // Apply frame sampling: only dump if (dumpSeq - 1) % everyNFrames == 0
                         if ((dumpSeq - 1) % std::max(1, debugConfig.everyNFrames) == 0)
                         {
-                            dumpCtx = std::make_unique<FrameDumpContext>();
-                            dumpCtx->rootDir = debugConfig.rootDir;
-                            if (debugConfig.dumpInput)
+                            decodedJpegForDump = cv::imdecode(jpegBytes, cv::IMREAD_COLOR);
+                            if (decodedJpegForDump.empty())
                             {
-                                dumpInputFrame(*dumpCtx, normalizedCameraId, dumpSeq, decodedJpeg);
+                                logutil::logThrottled(
+                                    logutil::Level::warn,
+                                    "object_detector.flow2.dump_decode_failed",
+                                    std::chrono::seconds(30),
+                                    "Failed to decode JPEG bytes for debug frame dump; skipping dump for this frame");
+                            }
+                            else
+                            {
+                                dumpCtx = std::make_unique<FrameDumpContext>();
+                                dumpCtx->rootDir = debugConfig.rootDir;
+                                if (debugConfig.dumpInput)
+                                {
+                                    dumpInputFrame(*dumpCtx, normalizedCameraId, dumpSeq, decodedJpegForDump);
+                                }
                             }
                         }
                     }
@@ -1262,7 +1292,7 @@ namespace sample_company {
                     // Dump output frame if debug is enabled
                     if (dumpCtx && debugConfig.dumpOutput)
                     {
-                        dumpOutputFrame(*dumpCtx, normalizedCameraId, dumpSeq, decodedJpeg, debugBoxes);
+                        dumpOutputFrame(*dumpCtx, normalizedCameraId, dumpSeq, decodedJpegForDump, debugBoxes);
                     }
                     
                     return result;

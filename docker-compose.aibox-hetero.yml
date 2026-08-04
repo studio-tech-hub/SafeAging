@@ -1,0 +1,34 @@
+# QCS6490 heterogeneous pipeline — NPU YOLO + GPU face + CPU track/API.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.aibox-hostdb.yml \
+#     -f docker-compose.aibox-qnn.yml -f docker-compose.aibox-hetero.yml up -d --force-recreate analytics
+#
+# Requires:
+#   models/yolo26n_backbone_qdq.onnx  (backbone-only QDQ, CPU NMS in lean pool)
+#   calib_frames/ for (re)export
+
+services:
+  analytics:
+    environment:
+      - MODEL_PATH=/app/models/yolo26n_backbone_qdq.onnx
+      - YOLO_BACKEND=qnn_htp
+      - YOLO_LEAN_POOL_SIZE=1
+      - QNN_DISABLE_CPU_FALLBACK=false
+      - FACE_BACKEND=qnn_gpu
+      - ENABLE_FACE_ASYNC=true
+      - FACE_ASYNC_WORKERS=1
+      - FACE_ASYNC_QUEUE_SIZE=32
+      - FACE_MATCH_THRESHOLD=0.38
+      - FACE_MIN_PIXELS=24
+      # QNO often stays tentative for 2+ frames; emit tracks immediately for face identity.
+      - TRACK_MIN_HITS=1
+      - OUTPUT_TENTATIVE_TRACKS=true
+      # Plugin already sends 640px-wide frames — extra upscale skews letterbox/bbox.
+      - ENABLE_INPUT_UPSCALE=false
+      # Temporary: save decoded infer frames for zone polygon setup (disable after use).
+      - CALIB_CAPTURE_DIR=/app/calib_frames
+      - CALIB_CAPTURE_MAX=60
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+    volumes:
+      - /root/SafeAging/calib_frames:/app/calib_frames

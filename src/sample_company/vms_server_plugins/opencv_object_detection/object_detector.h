@@ -12,6 +12,7 @@
 #include <nx/sdk/uuid.h>
 
 #include "detection.h"
+#include "transport_client.h"
 
 namespace sample_company {
 namespace vms_server_plugins {
@@ -87,7 +88,14 @@ public:
     void setDebugDumpConfig(const DebugDumpConfig& debugConfig);
 
     // Call the configured local/remote analytics service with camera id and encoded frame payload.
-    DetectionList run(const std::string& cameraId, const std::vector<uint8_t>& jpegBytes);
+    // frameWidth/frameHeight (P1-4) must be the jpegBytes' actual encoded pixel
+    // dimensions; the caller (DeviceAgent) already knows them from the encode
+    // step, which avoids a redundant cv::imdecode here just to recover them.
+    DetectionList run(
+        const std::string& cameraId,
+        const std::vector<uint8_t>& jpegBytes,
+        int frameWidth,
+        int frameHeight);
 
     // Probe GET /health — lightweight, never throws. Used by health poll thread.
     HealthCheckResult checkHealth() const;
@@ -97,14 +105,20 @@ public:
 
     // P2.3 — Register/update camera metadata in the service via PUT /admin/camera-configs.
     // Returns true on HTTP 200/201, false on any failure. Never throws.
-    bool registerCamera(const std::string& cameraId, const std::string& displayName) const;
+    // confidenceThreshold in [0,1] is optional; omitted when < 0.
+    bool registerCamera(
+        const std::string& cameraId,
+        const std::string& displayName,
+        float confidenceThreshold = -1.0f) const;
 
 private:
     AiServiceClientConfig serviceConfig() const;
     DebugDumpConfig debugDumpConfig() const;
     DetectionList callPythonService(
         const std::string& cameraId,
-        const std::vector<uint8_t>& jpegBytes);
+        const std::vector<uint8_t>& jpegBytes,
+        int frameWidth,
+        int frameHeight);
 
 private:
     mutable std::mutex m_serviceConfigMutex;
@@ -112,6 +126,31 @@ private:
     mutable std::mutex m_debugConfigMutex;
     DebugDumpConfig m_debugConfig;
     bool m_terminated = false;
+};
+
+// P1-4 — ITransportClient implementation for the current, default JSON+base64
+// transport. Deliberately a thin wrapper around ObjectDetector::run(): the
+// existing method already owns circuit breaking, retries, response parsing
+// and debug dumping, all proven in production, so this class only adapts
+// that call to the Strategy interface DeviceAgent depends on. See
+// MultipartBinaryTransport (multipart_binary_transport.h) for the additive,
+// opt-in alternative.
+class JsonBase64Transport: public ITransportClient
+{
+public:
+    explicit JsonBase64Transport(ObjectDetector& detector): m_detector(detector) {}
+
+    DetectionList sendFrame(
+        const std::string& cameraId,
+        const std::vector<uint8_t>& jpegBytes,
+        int frameWidth,
+        int frameHeight) override
+    {
+        return m_detector.run(cameraId, jpegBytes, frameWidth, frameHeight);
+    }
+
+private:
+    ObjectDetector& m_detector;
 };
 
 } // namespace opencv_object_detection

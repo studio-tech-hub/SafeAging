@@ -1,5 +1,12 @@
 # SafeAging — All-in-one Docker Compose
 #
+# First boot, any environment (P0-3): generate all required secrets once —
+# API_KEY, POSTGRES_PASSWORD, MINIO_ROOT_PASSWORD, GRAFANA_ADMIN_PASSWORD —
+# into .env with:
+#   python tools/generate_secrets.py
+# Compose refuses to start (clear error, no silent weak defaults) until this
+# is done. See .env.example for what each variable is used for.
+#
 # Dev (Windows/WSL):
 #   docker compose up --build
 #
@@ -44,7 +51,9 @@ services:
     environment:
       # Override with Docker-internal service names — do NOT change these
       - SERVICE_HOST=0.0.0.0
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-safeaging}:${POSTGRES_PASSWORD:-safeaging_dev_password}@postgres:5432/${POSTGRES_DB:-safeaging}
+      # Required (P0-3): same POSTGRES_PASSWORD used by the postgres service
+      # below — generate both together with python tools/generate_secrets.py.
+      - "DATABASE_URL=postgresql://${POSTGRES_USER:-safeaging}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env - generate all required secrets with python tools/generate_secrets.py}@postgres:5432/${POSTGRES_DB:-safeaging}"
       - S3_ENDPOINT=http://minio:9000
       - MODEL_PATH=${MODEL_PATH:-/app/models/yolo26n.onnx}
       - YOLO_IMGSZ=640
@@ -55,8 +64,13 @@ services:
       - RATE_LIMIT_MAX_PER_IP=2400
       - CALIBRATION_FILE=/app/models/camera_calibration.json
       - EDGE_SQLITE_PATH=/app/runtime/edge_state.db
-      # Plugin runs with empty API key until deviceAgentSettingsModel is rebuilt into the DLL
-      - API_KEY_REQUIRED=false
+      # Fail-closed by default (P0-2): the service refuses to start if
+      # API_KEY_REQUIRED=true and API_KEY is unset/placeholder — generate one
+      # with `python tools/generate_api_key.py` and set it in .env.
+      # Set ALLOW_INSECURE_NO_AUTH=true in .env to explicitly run without auth
+      # (isolated lab/dev only — never on a shared network).
+      - "API_KEY_REQUIRED=${API_KEY_REQUIRED:-true}"
+      - "API_KEY=${API_KEY:?Set API_KEY in .env - generate one with python tools/generate_api_key.py, or set ALLOW_INSECURE_NO_AUTH=true for isolated lab/dev use}"
     ports:
       - "${SERVICE_PORT:-18000}:18000"
     volumes:
@@ -89,7 +103,10 @@ services:
     environment:
       POSTGRES_DB:       ${POSTGRES_DB:-safeaging}
       POSTGRES_USER:     ${POSTGRES_USER:-safeaging}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-safeaging_dev_password}
+      # Required (P0-3): no shipped default — a guessable password on the
+      # metadata DB is a lateral-movement risk. Generate with
+      # python tools/generate_secrets.py (or manually: openssl rand -base64 24).
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env - generate all required secrets with python tools/generate_secrets.py}"
     ports:
       - "${POSTGRES_PORT:-15432}:5432"
     volumes:
@@ -111,7 +128,11 @@ services:
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER:     ${MINIO_ROOT_USER:-safeaging}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-safeaging_minio_password}
+      # Required (P0-3): no shipped default — this is the root credential for
+      # all snapshot/crop object storage. Generate with
+      # python tools/generate_secrets.py. Keep S3_SECRET_KEY in .env in sync
+      # with this value (the analytics service authenticates as this user).
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env - generate all required secrets with python tools/generate_secrets.py}"
     ports:
       - "${MINIO_API_PORT:-19000}:9000"
       - "${MINIO_CONSOLE_PORT:-19001}:9001"
@@ -144,7 +165,7 @@ services:
         echo "MinIO buckets ready."
     environment:
       MINIO_ROOT_USER:        ${MINIO_ROOT_USER:-safeaging}
-      MINIO_ROOT_PASSWORD:    ${MINIO_ROOT_PASSWORD:-safeaging_minio_password}
+      MINIO_ROOT_PASSWORD:    "${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env - generate all required secrets with python tools/generate_secrets.py}"
       MINIO_BUCKET_SNAPSHOTS: ${MINIO_BUCKET_SNAPSHOTS:-safeaging-snapshots}
     networks:
       - safeaging-net
@@ -162,6 +183,7 @@ services:
       - "${PROMETHEUS_PORT:-19090}:9090"
     volumes:
       - ./infra/dev/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/dev/prometheus/rules:/etc/prometheus/rules:ro
       - safeaging-prometheus-data:/prometheus
     networks:
       - safeaging-net
@@ -175,7 +197,10 @@ services:
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_USER:     ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Required (P0-3): no shipped default — Grafana admin/admin is one of
+      # the most commonly scanned-for default credentials on the internet.
+      # Generate with python tools/generate_secrets.py.
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env - generate all required secrets with python tools/generate_secrets.py}"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/safeaging.json
     ports:
       - "${GRAFANA_PORT:-13000}:3000"

@@ -13,6 +13,10 @@ services:
     depends_on: !override
       minio:
         condition: service_started
+    ports: !override
+      # Nx mediaserver/plugin runs on the same AI Box and calls 127.0.0.1.
+      # Do not expose /health, /status, /metrics, or /infer to the LAN.
+      - "127.0.0.1:${SERVICE_PORT:-18000}:18000"
     environment:
       - DATABASE_URL=
       # ── Inference (CPU lean, ~4 ORT threads total for headroom) ─────────────
@@ -52,11 +56,19 @@ services:
       - ROI_Y_MIN=0.0
       - ROI_X_MAX=1.0
       - ROI_Y_MAX=1.0
-      # ── Health / security ─────────────────────────────────────────────────
+      # ── Health / security (P0-2) ────────────────────────────────────────────
+      # Fail-closed by default, same as docker-compose.yml. BEFORE deploying
+      # this to a box with cameras already configured in Nx Client: set the
+      # SAME value as "Service API Key" on every camera's YOLO26 plugin
+      # settings first, or the plugin gets HTTP 401 and detections stop.
+      # Rollback / temporary bridge while migrating field units: set
+      # ALLOW_INSECURE_NO_AUTH=true in the box's .env to keep the previous
+      # (unauthenticated) behavior without editing this file.
       - HEALTH_P95_DEGRADED_MS=800
       - HEALTH_AVG_DEGRADED_MS=650
-      - API_KEY_REQUIRED=true
-      - API_KEY=${API_KEY:-change-me-to-a-strong-secret}
+      - "API_KEY_REQUIRED=${API_KEY_REQUIRED:-true}"
+      - "API_KEY=${API_KEY:?Set API_KEY in .env - generate one with python tools/generate_api_key.py - and configure the matching Service API Key on every camera in Nx Client, or set ALLOW_INSECURE_NO_AUTH=true to defer}"
+      - "ALLOW_INSECURE_NO_AUTH=${ALLOW_INSECURE_NO_AUTH:-false}"
       - RATE_LIMIT_SKIP_LOOPBACK=true
       - ENABLE_CLAHE=false
       - ENABLE_MULTI_SCALE=false

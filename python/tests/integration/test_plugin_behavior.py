@@ -62,6 +62,20 @@ def _infer(frame_b64: str, camera_id: str, timeout: int = 20) -> requests.Respon
     )
 
 
+def _infer_binary(jpeg_bytes: bytes, camera_id: str, timeout: int = 20) -> requests.Response:
+    """P1-4: multipart/form-data transport — the additive counterpart of _infer().
+
+    Mirrors what MultipartBinaryTransport (C++ plugin, transport_mode=binary)
+    sends: camera_id as a form field, raw JPEG bytes as the `image` file part.
+    """
+    return requests.post(
+        SERVICE_URL + "/infer/binary",
+        data={"camera_id": camera_id},
+        files={"image": ("frame.jpg", jpeg_bytes, "image/jpeg")},
+        timeout=timeout,
+    )
+
+
 def _health(timeout: int = 5) -> requests.Response:
     return requests.get(SERVICE_URL + "/health", timeout=timeout)
 
@@ -785,3 +799,110 @@ class TestQueuePolicyEdgeCases:
             assert len(ids) == len(set(ids)), (
                 f"Duplicate track IDs in single response: {ids}"
             )
+
+
+@pytest.mark.integration
+class TestBinaryTransportPlugin:
+    """P1-4 — the same plugin-facing contract tests as above (backpressure,
+    error handling, track-id stability), but against the additive
+    /infer/binary (multipart/form-data) route instead of /infer
+    (JSON+base64). transport_mode=binary must be a drop-in replacement from
+    the C++ plugin's perspective: same status codes, same response shape,
+    same tracking behaviour — see also TestInferBinary in
+    python/tests/unit/../integration/test_api.py for the byte-level parity
+    check against /infer on the very first frame of a new camera.
+    """
+
+    def test_infer_binary_returns_200(self, frame_bgr):
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        assert ok
+        r = _infer_binary(buf.tobytes(), _cam())
+        assert r.status_code == 200
+
+    def test_concurrent_requests_same_camera(self, frame_bgr):
+        """10 parallel /infer/binary requests from the same camera must all return 200."""
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        assert ok
+        jpeg_bytes = buf.tobytes()
+        cam = _cam()
+        results = []
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            futs = [ex.submit(_infer_binary, jpeg_bytes, cam) for _ in range(10)]
+            for f in as_completed(futs):
+                results.append(f.result().status_code)
+        failed = [s for s in results if s != 200]
+        assert not failed, f"{len(failed)} / {len(results)} requests failed: {failed}"
+
+    def test_invalid_image_does_not_cause_5xx(self):
+        """Corrupt JPEG bytes must NOT return 5xx (would open the C++ circuit breaker)."""
+        r = _infer_binary(b"not a real jpeg payload", _cam())
+        assert r.status_code < 500, (
+            f"Invalid payload must not return 5xx (got {r.status_code}); "
+            "this would trigger the circuit breaker unnecessarily"
+        )
+
+    def test_missing_image_field_returns_422(self):
+        """Missing required 'image' file part must return 422 Unprocessable Entity."""
+        r = requests.post(
+            SERVICE_URL + "/infer/binary",
+            data={"camera_id": _cam()},
+            timeout=10,
+        )
+        assert r.status_code == 422, f"Expected 422, got {r.status_code}: {r.text}"
+
+    def test_missing_camera_id_still_succeeds(self, frame_bgr):
+        """Optional camera_id form field: omitting it should still process (defaults to 'default')."""
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        assert ok
+        r = requests.post(
+            SERVICE_URL + "/infer/binary",
+            files={"image": ("frame.jpg", buf.tobytes(), "image/jpeg")},
+            timeout=20,
+        )
+        assert r.status_code in (200, 422), (
+            f"Unexpected status for missing camera_id: {r.status_code}"
+        )
+
+    def test_rapid_same_camera_no_duplicate_track_ids(self, real_frame_b64):
+        """10 sequential frames over /infer/binary must not produce duplicate
+        track IDs within a single response, matching /infer's guarantee."""
+        jpeg_bytes = base64.b64decode(real_frame_b64)
+        cam = _cam()
+        for _ in range(10):
+            r = _infer_binary(jpeg_bytes, cam)
+            assert r.status_code == 200
+            dets = r.json()
+            assert isinstance(dets, list)
+            ids = [d["track_id"] for d in dets if d.get("track_id") is not None]
+            assert len(ids) == len(set(ids)), (
+                f"Duplicate track IDs in single response: {ids}"
+            )
+
+    def test_track_ids_stable_across_consecutive_frames(self, real_frame_b64):
+        """Same real scene sent repeatedly over /infer/binary → track IDs must be
+        reused across frames, not reshuffled (same guarantee as /infer)."""
+        jpeg_bytes = base64.b64decode(real_frame_b64)
+        cam = _cam()
+        all_ids_per_frame: List[set] = []
+        for _ in range(5):
+            r = _infer_binary(jpeg_bytes, cam)
+            assert r.status_code == 200
+            dets = r.json()
+            assert isinstance(dets, list)
+            ids = {d["track_id"] for d in dets if d.get("track_id")}
+            all_ids_per_frame.append(ids)
+            time.sleep(0.1)
+
+        frames_with_detections = [ids for ids in all_ids_per_frame if ids]
+        if len(frames_with_detections) < 2:
+            pytest.skip("Not enough detections to test track ID stability")
+
+        first_ids = frames_with_detections[0]
+        later_ids = set().union(*frames_with_detections[1:])
+        overlap = first_ids & later_ids
+        assert overlap, (
+            f"No track ID overlap between frames: first={first_ids}, later={later_ids}"
+        )

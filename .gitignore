@@ -108,6 +108,41 @@ graph_info.json
 *.bak
 *.swp
 *~
+tmp/
+tmp_*.txt
+
+# ==========================================
+# LOCAL / SESSION ARTIFACTS (do not commit)
+# ==========================================
+datasets/
+models/yolo26n_qnn_model/
+docker/wheels/*.whl
+calib_frames/
+
+# One-off SSH session scripts — keep curated ops scripts only
+tools/_ssh_*.py
+!tools/_ssh_deploy_hetero.py
+!tools/_ssh_hetero_fix.py
+!tools/_ssh_verify_hetero_live.py
+!tools/_ssh_deploy_threshold_ui.py
+!tools/_ssh_deploy_metrics_fmt.py
+!tools/_ssh_deploy_plugin.py
+!tools/_ssh_rollback_cpu.py
+!tools/_ssh_check_ui.py
+!tools/_ssh_check_face.py
+!tools/_ssh_face_gpu_restore.py
+!tools/_ssh_common.py
+
+# AI Box ops credentials (P0-1) — never commit real values, see tools/ops.env.example
+tools/ops.env
+
+# QNN one-off diagnostics (production scripts live in tools/qnn/*.py without leading _)
+tools/qnn/_gpu_probe.py
+tools/qnn/_col5_scan.py
+tools/qnn/_conf_threshold_scan.py
+tools/qnn/_htp_diag.py
+tools/qnn/_ort_htp_sweep.py
+tools/qnn/_ort_htp_host_test.py
 
 # ==========================================
 # OS SPECIFIC

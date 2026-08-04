@@ -19,6 +19,15 @@
             },
             {
                 "type": "SpinBox",
+                "name": "confidence_threshold_percent",
+                "caption": "Detection Threshold (%)",
+                "defaultValue": 70,
+                "minValue": 10,
+                "maxValue": 99,
+                "description": "Minimum person confidence 10–99 (70 = 0.70). Sent to analytics service for this camera."
+            },
+            {
+                "type": "SpinBox",
                 "name": "detection_frame_period",
                 "caption": "Detection Frame Period",
                 "defaultValue": 2,
@@ -113,6 +122,13 @@
                 "caption": "Retry Backoff (ms)",
                 "defaultValue": 250,
                 "description": "Delay between analytics service retry attempts."
+            },
+            {
+                "type": "TextField",
+                "name": "transport_mode",
+                "caption": "Transport Mode",
+                "defaultValue": "json_base64",
+                "description": "How frames are sent to the analytics service: 'json_base64' (default, proven) or 'binary' (additive multipart/form-data transport, lower CPU/payload overhead — validate before relying on it in production). Unrecognized values fall back to json_base64."
             },
             {
                 "type": "CheckBox",
