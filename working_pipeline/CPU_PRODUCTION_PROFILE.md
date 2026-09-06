@@ -162,7 +162,9 @@ simulation clip and compare missed-detection / false-positive counts.
 ## Lean/QNN NMS and letterbox coordinate fixes (P1-3)
 
 **Scope:** only affects the `cpu_lean` and `qnn_htp`/`qnn_gpu`/`qnn` backends
-(`YOLO_BACKEND` other than the default `cpu`). The default Ultralytics CPU
+(`YOLO_BACKEND` other than the plain `cpu` fallback — see "Recommended
+default backend: cpu_lean (P1-5)" below for why `cpu_lean`, not plain `cpu`,
+is what new deployments should actually run). The plain Ultralytics `cpu`
 backend uses Ultralytics' own internal NMS and letterbox handling and was
 never affected by either bug below.
 
@@ -210,11 +212,63 @@ never affected by either bug below.
   `END2END_COORD_SPACE=canvas` or `=frame` explicitly once confirmed, rather
   than depending on the heuristic long-term.
 
-Neither change alters output on the default `cpu` backend. Re-run
+Neither change alters output on the plain `cpu` backend. Re-run
 `tools/qnn/validate_qdq_detect.py` and `tools/qnn/benchmark_yolo_backend.py`
 on real QNN hardware before promoting any `cpu_lean`/`qnn_*` deployment —
 detection counts may shift slightly as duplicate/incorrectly-suppressed boxes
 from the NMS fix resolve.
+
+## Recommended default backend: cpu_lean (P1-5)
+
+**Gated on P1-3 above having landed** (it fixes the one correctness bug —
+the greedy-NMS box-format mismatch — that was specific to `cpu_lean`'s raw-
+head output path). With that fix in, `cpu_lean` is on par with plain `cpu`
+for detection accuracy while being **~3-4x faster under 3+ concurrent camera
+streams** (see the benchmarked comment in `yolo_backend.py`'s module
+docstring), because a single shared ORT session's intra-op thread pool
+(+ torch OMP threads) is exactly what serializes/contends under concurrent
+requests — `cpu_lean`'s small pool of dedicated, pinned-thread sessions
+removes that contention entirely.
+
+Before this task, `cpu_lean` already shipped and was already the profile
+used by `docker-compose.aibox-hostdb.yml` (the actual AI Box production
+overlay — see "Active configuration" above) — but the generic `.env.example`
+template that dev/new deployments copy still defaulted to plain `cpu`, so
+that documented, already-tested speedup was not actually the default
+experience for anyone starting from the template instead of the AI Box
+overlay. `.env.example` now defaults `YOLO_BACKEND=cpu_lean` (with
+`YOLO_LEAN_POOL_SIZE=2` / `YOLO_LEAN_THREADS=2`, matching the AI Box
+profile) for exactly this reason.
+
+- **Single-camera / local dev** can still use plain `cpu` — there is no
+  contention to remove with only one concurrent stream — but `cpu_lean` is
+  safe there too (pool size 2 just means at most 2 sessions ever get used).
+- **Rollback:** set `YOLO_BACKEND=cpu` in `.env` (or in a compose overlay's
+  `environment:` block, for `docker-compose.aibox-hostdb.yml` specifically)
+  to revert to the single-shared-session path. No other change needed.
+- **Residual gap, out of scope for this task:** `config.py`'s hardcoded
+  fallback (`os.getenv("YOLO_BACKEND", "cpu")`, used only if `YOLO_BACKEND`
+  is entirely unset — no `.env`, no compose override) still resolves to
+  plain `cpu`. Any deployment following the documented `.env.example` /
+  compose-overlay setup is unaffected; only a from-scratch `docker run`
+  bypassing both would still land on plain `cpu`. Flagged here rather than
+  changed, since this task is scoped to documentation/default alignment,
+  not a code change.
+
+## QNN as an explicit promotion gate, not a judgment call (P1-5)
+
+QNN (`qnn_htp` / `qnn_gpu`) remains **opt-in only** — it is not, and is not
+becoming, the recommended default in this task. It stays gated behind a
+written, repeatable checklist instead of an implicit "QNN seems stable
+enough" call — see **"QNN Promotion Checklist"** in
+`working_pipeline/QNN_ROADMAP.md` for the exact smoke tests that must pass,
+per SoC/firmware combination, before recommending QNN as that hardware
+SKU's production default. The AI Box this repo currently deploys to has
+already been through that bring-up informally (see `QNN_ROADMAP.md`'s
+"Current status" — 3-4 cameras in production on `qnn_htp`); the checklist
+formalizes what was learned there into a gate for the *next* SoC/firmware
+combination, so promoting QNN elsewhere is a checklist, not a re-run of
+that trial-and-error.
 
 ## Additive binary/multipart transport for /infer (P1-4)
 

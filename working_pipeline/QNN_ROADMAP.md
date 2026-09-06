@@ -8,6 +8,72 @@ Offload `yolo26n` @ 640 INT8/QDQ to Hexagon HTP via ONNX Runtime QNN EP (QAIRT o
 
 Benchmark on box: `yolo26s` ~3× slower than `yolo26n` on 6×A55. Commercial path is **NPU for detect**, CPU for face/tracking.
 
+## QNN Promotion Checklist (P1-5)
+
+`cpu_lean` is the recommended **default** CPU backend for any AI Box
+deployment (see `working_pipeline/CPU_PRODUCTION_PROFILE.md` → "Recommended
+default backend: cpu_lean (P1-5)") — QNN is **opt-in**, promoted to a given
+hardware SKU's production default only after it passes every item below on
+that **exact SoC + firmware/QAIRT version combination**. This turns "QNN is
+fragile" from a vague risk into a concrete, repeatable gate instead of an
+implicit per-deployment judgment call — do not skip a step because "it
+worked on the other box"; QNN's own failure history in this file (NHWC
+layout bugs, all-zero QDQ confidences, `ADSP_LIBRARY_PATH` conflicts) is
+firmware/export-specific, not just SoC-specific.
+
+Run in order — each step gates the next; stop and fix at the first failure:
+
+1. **Platform validator.**
+   `qnn-platform-validator --backend dsp --testBackend` passes on the target
+   box. If this fails, no ONNX Runtime QNN work will succeed either — fix
+   the QAIRT/firmware install first (see `tools/qnn/install_qairt_aibox.sh`).
+2. **Native HTP smoke test.** `bash tools/qnn/native_htp_smoke.sh
+   <backbone_onnx>` completes without error and produces non-empty output
+   under `$WORKDIR/output` — proves the raw QNN toolchain (converter, model
+   lib generator, `qnn-net-run`) works on this box independent of ONNX
+   Runtime or the Python service entirely.
+3. **QDQ confidence sanity check.** `python tools/qnn/validate_qdq_detect.py`
+   against the exported QDQ model and a real calibration set from the
+   target deployment's own cameras — confidences must **not** be all-zero
+   (the exact failure mode hit with `yolo26n_qdq_synth.onnx` before it was
+   re-exported with real calibration frames; see "Current status" below).
+   Reject the export and re-run `tools/qnn/export_yolo26_qdq.py` with a
+   larger/more representative calibration set if this fails.
+4. **Coordinate-space confirmation (P1-3 dependency).** Run
+   `tools/qnn/benchmark_yolo_backend.py` and check the `box_coord_range`
+   line it prints — confirm real, camera-resolution-scale box coordinates,
+   not canvas-scale (≤640px) boxes on a larger source frame. Explicitly set
+   `END2END_COORD_SPACE=canvas` or `=frame` once confirmed rather than
+   relying on the `auto` heuristic long-term (see
+   `CPU_PRODUCTION_PROFILE.md` → "Lean/QNN NMS and letterbox coordinate
+   fixes (P1-3)").
+5. **A/B benchmark vs. `cpu_lean`.** Same plugin settings, same camera feed,
+   `tools/qnn/benchmark_yolo_backend.py` (or a live side-by-side using two
+   cameras pointed at the same scene) comparing `avg_infer_ms` for
+   `YOLO_BACKEND=cpu_lean` vs. the QNN backend under test. Only proceed if
+   QNN is *meaningfully* faster end-to-end (not just on the isolated
+   backbone) — HTP inference being fast on paper does not guarantee an
+   end-to-end win once TopK/NMS CPU fallback and session-pool constraints
+   (`YOLO_LEAN_POOL_SIZE=1` for `qnn_htp`, see "Current status") are
+   accounted for.
+6. **Soak test.** Minimum 24h continuous run on real camera traffic with
+   `docker compose ... up -d` (no manual restarts) — watch `/health`'s
+   `total_errors` / `error_rate` and `avg_infer_ms`/`p95_infer_ms` via
+   `tools/ops_aibox_check.py`. Zero unexplained errors and stable latency
+   (no drift/leak) required before recommending as a default.
+7. **Rollback rehearsal.** Confirm
+   `docker compose -f docker-compose.yml -f docker-compose.aibox-hostdb.yml
+   up -d --force-recreate analytics` (the `cpu_lean` profile) successfully
+   takes over serving cameras with no manual intervention beyond that one
+   command — QNN must never be a one-way door.
+
+Only after all seven steps pass for a given SoC/firmware combination should
+that hardware SKU's shipped default change from `cpu_lean` to a `qnn_*`
+backend — and that default change happens in that SKU's own compose overlay
+(e.g. a new `docker-compose.aibox-<sku>-qnn.yml`), never by changing the
+generic `.env.example` default, which stays `cpu_lean` for exactly this
+reason (it has no way to know which SoC/firmware it will run on).
+
 ## Steps
 
 1. **QAIRT oe-linux** on box (`/opt/qairt`) — `tools/qnn/install_qairt_aibox.sh`
