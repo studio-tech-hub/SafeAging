@@ -1,0 +1,219 @@
+name: CI
+
+# P1-7: Minimal CI pipeline (test gate + compose lint + secret scan + C++ build).
+#
+# Intentionally minimal by design (see working_pipeline/CPU_PRODUCTION_PROFILE.md
+# "CI pipeline (P1-7)"): four independent jobs, each individually disable-able
+# (comment it out / remove it) without touching the others if it ever produces
+# false positives. Expand incrementally from here rather than growing this into
+# a full release pipeline in one step.
+#
+# All four jobs were validated end-to-end locally (Docker Desktop, WSL) before
+# this file was added, specifically so day one is green, not red:
+#   - python-tests:  built the image, ran the full compose stack, ran
+#                     tests/unit + tests/integration -m integration for real.
+#   - compose-lint:  ran tools/check_compose_security.py and
+#                     tools/verify_compose_config.py directly.
+#   - secret-scan:   ran detect-secrets against the tracked tree and hand
+#                     audited every finding before writing .secrets.baseline.
+#   - build-plugin:  compiled + ran both dependency-free C++ unit test
+#                     binaries with g++.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same PR/branch so CI minutes aren't wasted on
+# a push that's already been replaced by a newer one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. Python unit + integration tests (Makefile's test-unit / test-integration,
+  #    reproduced here so they run on every PR instead of only manually).
+  # ─────────────────────────────────────────────────────────────────────────
+  python-tests:
+    name: Python tests (unit + integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # cpu_lean (the validated default backend, P1-5) needs a pre-exported
+      # .onnx — entrypoint.sh deliberately refuses to auto-download one (only
+      # .pt has an Ultralytics-hosted auto-download path). Cache the export
+      # so most runs skip this ~1-2 min step entirely.
+      - name: Cache exported YOLO26 ONNX model
+        id: onnx-cache
+        uses: actions/cache@v4
+        with:
+          path: models/yolo26n.onnx
+          key: yolo26n-onnx-v1-${{ hashFiles('tools/export_yolo26_onnx.py') }}
+
+      - name: Export YOLO26 -> ONNX (cache miss only)
+        if: steps.onnx-cache.outputs.cache-hit != 'true'
+        run: |
+          pip install --quiet "ultralytics>=8.4.0"
+          python tools/export_yolo26_onnx.py --out models/yolo26n.onnx
+
+      - name: Generate throwaway secrets for this run's .env
+        run: |
+          cp .env.example .env
+          python tools/generate_secrets.py --force
+          # This runner is the documented "isolated lab/dev" case (P0-2's
+          # ALLOW_INSECURE_NO_AUTH carve-out): single ephemeral test run,
+          # never internet-reachable, destroyed immediately after. Disable
+          # auth EXPLICITLY (not by relying on the missing-key escape hatch,
+          # which only forgives a *missing* key and stays enforced here since
+          # generate_secrets.py just made a real one) so the existing test
+          # suite -- written against an open target, see the total absence of
+          # X-API-Key handling in tests/integration/test_plugin_behavior.py --
+          # exercises the real /infer pipeline end-to-end. This has zero
+          # effect on shipped defaults: docker-compose.yml / .env.example
+          # still require API_KEY_REQUIRED=true unless an operator opts out.
+          sed -i 's/^API_KEY_REQUIRED=.*/API_KEY_REQUIRED=false/' .env
+
+      - name: Build analytics image
+        run: docker compose build analytics
+
+      - name: Start postgres + minio + analytics
+        run: docker compose up -d --no-build analytics postgres minio minio-init
+
+      - name: Wait for analytics /health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:18000/health | grep -q '"model_loaded":[ ]*true'; then
+              echo "Service healthy after ~$((i * 5))s"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Analytics service did not become healthy in time"
+          docker compose logs --tail=300
+          exit 1
+
+      - name: Run unit tests (tests/unit — no live service needed)
+        run: docker compose exec -T --workdir /app/python analytics python -m pytest tests/unit -v --tb=short
+
+      - name: Run integration tests (tests/integration — against the live stack)
+        run: docker compose exec -T --workdir /app/python -e SERVICE_URL=http://localhost:18000 analytics python -m pytest tests/integration -m integration -v --tb=short
+
+      - name: Dump service logs (on failure only)
+        if: failure()
+        run: docker compose logs --tail=500
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. Compose lint (P0-2/P0-3): no docker-compose*.yml may ship
+  #    API_KEY_REQUIRED=false or a weak default credential, and every
+  #    meaningful compose file combination must actually resolve once secrets
+  #    are populated.
+  # ─────────────────────────────────────────────────────────────────────────
+  compose-lint:
+    name: Compose security lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test runner
+        run: pip install --quiet pytest
+
+      - name: Unit tests for the lint tools themselves
+        run: python -m pytest tools/test_check_compose_security.py tools/test_generate_secrets.py -v
+
+      - name: Static lint — no insecure compose defaults
+        run: python tools/check_compose_security.py
+
+      - name: Dynamic check — compose config resolves correctly
+        run: python tools/verify_compose_config.py
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. Secret scanning (P0-1 regression guard): fail the build if a new,
+  #    unbaselined secret-looking string is committed anywhere in the tree.
+  # ─────────────────────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret scan (detect-secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install detect-secrets
+        run: pip install --quiet "detect-secrets==1.5.0"
+
+      # .secrets.baseline was generated with `detect-secrets scan` against
+      # this repo's tracked files and hand-audited (is_secret: false) entry
+      # by entry — every current finding is a documented placeholder/test
+      # fixture (.env.example, alembic templates, unit-test fake credentials),
+      # not a real leaked secret. Update it deliberately (never blindly
+      # regenerate-and-commit) if a genuinely new false positive shows up:
+      #   detect-secrets scan --baseline .secrets.baseline
+      #   detect-secrets audit .secrets.baseline
+      - name: Scan tracked files against the audited baseline
+        run: detect-secrets-hook --baseline .secrets.baseline $(git ls-files)
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. C++ build (plugin). The two standalone unit test binaries (no Nx SDK
+  #    needed) always run and must pass. The full plugin compile against the
+  #    real Nx Metadata SDK only runs if the team has provisioned the
+  #    NX_METADATA_SDK_URL secret, since the SDK is Network Optix's licensed,
+  #    non-redistributable property and cannot be vendored into this repo or
+  #    downloaded from a public URL -- see README.md "Building the Nx Witness
+  #    plugin" for exactly what that secret must point to.
+  # ─────────────────────────────────────────────────────────────────────────
+  build-plugin:
+    name: C++ build (plugin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile + run standalone C++ unit tests (no Nx SDK required)
+        working-directory: src/tests
+        run: |
+          g++ -std=c++17 -I../sample_company/vms_server_plugins/opencv_object_detection \
+              test_circuit_breaker.cpp -o test_circuit_breaker -pthread
+          ./test_circuit_breaker
+          g++ -std=c++17 -I../sample_company/vms_server_plugins/opencv_object_detection \
+              test_detection_box_normalizer.cpp -o test_detection_box_normalizer
+          ./test_detection_box_normalizer
+
+      - name: Full plugin compile check (requires Nx Metadata SDK)
+        env:
+          NX_METADATA_SDK_URL: ${{ secrets.NX_METADATA_SDK_URL }}
+        run: |
+          if [ -z "${NX_METADATA_SDK_URL:-}" ]; then
+            echo "::notice::NX_METADATA_SDK_URL secret not configured -- skipping the full plugin compile check (the proprietary Nx SDK isn't redistributable, so it can't be fetched from a public URL). The C++ unit tests above still ran and must pass. See README.md to enable this once the team provisions a private, pre-signed download URL for the SDK archive as that secret."
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build
+          pip install --quiet "conan<2"
+          conan profile new default --detect >/dev/null 2>&1 || true
+          conan profile update settings.compiler.libcxx=libstdc++11 default
+
+          curl -fsSL -o /tmp/metadata_sdk.tar.gz "$NX_METADATA_SDK_URL"
+          mkdir -p /tmp/metadata_sdk
+          tar xzf /tmp/metadata_sdk.tar.gz -C /tmp/metadata_sdk --strip-components=1
+
+          ./tools/build_plugin_linux.sh --sdk-dir /tmp/metadata_sdk

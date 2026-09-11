@@ -1,3 +1,11 @@
 # Shell scripts must use LF on Linux AI Box
 *.sh text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# P1-7: GitHub Actions workflow `run:` blocks are executed as bash scripts on
+# Linux runners — a CRLF-saved workflow file (common when authored/edited on
+# Windows, as this repo often is) breaks every multi-line `run:` step with
+# bash syntax errors like "syntax error near unexpected token $'do\r'". Force
+# LF so this can't silently reappear regardless of the editing OS.
+.github/**/*.yml text eol=lf
+.github/**/*.yaml text eol=lf

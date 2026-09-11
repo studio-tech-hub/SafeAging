@@ -37,6 +37,14 @@ def get_per_camera_config_sync(camera_id: str) -> Optional[dict]:
 
     Keys (all Optional):
         confidence_threshold, iou_threshold, frame_period, zone_ids, extra
+
+    `extra` is a free-form JSON dict (no schema migration needed to add new
+    overrides). Recognized keys today:
+        roi: dict — see apply_roi()'s roi_override parameter.
+        enable_face_recognition: bool — per-camera override of the global
+            ENABLE_FACE_RECOGNITION setting (P1-6). Absent/non-bool means
+            "inherit the global default"; only True/False force it on/off
+            for this camera. See api.py's _run_person_detection_pipeline.
     """
     now = time.monotonic()
     with _config_cache_lock:

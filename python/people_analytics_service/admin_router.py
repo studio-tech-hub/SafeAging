@@ -173,6 +173,16 @@ class EventOut(BaseModel):
 
 
 class CameraConfigUpsert(BaseModel):
+    """PUT payload only sets the fields provided (None fields are omitted, not
+    written) — EXCEPT `extra`, which fully replaces the stored extra dict when
+    provided. Callers that want to change one extra key (e.g. just
+    `enable_face_recognition`) must GET the current config first and merge
+    their change into its `extra` before PUT-ing, or they will silently wipe
+    other extra keys like `roi`. See static/index.html's Cameras tab.
+
+    Recognized `extra` keys: `roi` (dict), `enable_face_recognition` (bool,
+    P1-6 — per-camera override of the global ENABLE_FACE_RECOGNITION setting).
+    """
     confidence_threshold: Optional[float] = Field(None, ge=0.1, le=1.0)
     iou_threshold: Optional[float] = Field(None, ge=0.1, le=1.0)
     frame_period: Optional[int] = Field(None, ge=1, le=30)
@@ -641,6 +651,12 @@ async def admin_reset_all():
 @router.get("/camera-configs/{camera_id}", response_model=CameraConfigOut, summary="Get per-camera inference config")
 async def get_camera_config(camera_id: str):
     _require_db()
+    # /infer always looks up config by the *normalized* ({uuid}-braced) camera
+    # id (see api.py + config_engine.get_per_camera_config_sync), but callers
+    # of this admin endpoint (UI, tests, operators) may pass either form —
+    # normalize here so a config saved via this API is actually the one /infer
+    # reads back, regardless of which form was used at either call site.
+    camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
         cfg = await dal.get_camera_config(session, camera_id)
     if cfg is None:
@@ -655,6 +671,7 @@ async def get_camera_config(camera_id: str):
 )
 async def upsert_camera_config(camera_id: str, body: CameraConfigUpsert):
     _require_db()
+    camera_id = normalize_camera_id(camera_id)
     payload = {k: v for k, v in body.model_dump().items() if v is not None}
     async with get_session() as session:
         cfg = await dal.upsert_camera_config(session, camera_id=camera_id, **payload)
@@ -668,6 +685,7 @@ async def upsert_camera_config(camera_id: str, body: CameraConfigUpsert):
 @router.delete("/camera-configs/{camera_id}", status_code=204, summary="Delete per-camera inference config")
 async def delete_camera_config(camera_id: str):
     _require_db()
+    camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
         deleted = await dal.delete_camera_config(session, camera_id=camera_id)
     invalidate_config_cache(camera_id)
@@ -884,8 +902,18 @@ async def live_tracks(camera_id: Optional[str] = Query(None, description="Filter
     """
     from .tracking import camera_states, camera_states_lock
 
+    # Camera state is keyed by the normalized ``{uuid}`` form (see
+    # config.normalize_camera_id / api.py's /infer handler), but callers of this
+    # filter (tests, future UI code) may pass a plain id without braces — mirror
+    # the normalization used everywhere else this filtering happens (e.g. events
+    # query, zone_engine) so the filter isn't silently a no-op.
+    normalized_camera_id = normalize_camera_id(camera_id) if camera_id is not None else None
     with camera_states_lock:
-        items = [(cid, st) for cid, st in camera_states.items() if (camera_id is None or cid == camera_id)]
+        items = [
+            (cid, st)
+            for cid, st in camera_states.items()
+            if (normalized_camera_id is None or cid == normalized_camera_id)
+        ]
 
     cameras: Dict[str, Any] = {}
     for cid, state in items:

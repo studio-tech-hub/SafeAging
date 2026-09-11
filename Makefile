@@ -46,13 +46,32 @@ test-plugin-behavior:
 		tests/integration/test_plugin_behavior.py \
 		-m integration -v --tb=short
 
-# C++ circuit breaker unit tests (requires g++ in WSL or Linux)
+# C++ unit tests — circuit breaker + detection box normalizer (requires g++ in
+# WSL or Linux; no Nx SDK, no OpenCV). Mirrors .github/workflows/ci.yml's
+# build-plugin job so a local `make test-cpp` catches the same breakage a PR
+# would, without needing the (licensed, non-redistributable) Nx Metadata SDK.
 test-cpp:
 	cd src/tests && \
 		g++ -std=c++17 \
 		    -I../sample_company/vms_server_plugins/opencv_object_detection \
 		    test_circuit_breaker.cpp -o test_circuit_breaker -pthread && \
-		./test_circuit_breaker
+		./test_circuit_breaker && \
+		g++ -std=c++17 \
+		    -I../sample_company/vms_server_plugins/opencv_object_detection \
+		    test_detection_box_normalizer.cpp -o test_detection_box_normalizer && \
+		./test_detection_box_normalizer
+
+# Compose security lint (P0-2/P0-3) — static + dynamic checks, same as
+# .github/workflows/ci.yml's compose-lint job.
+test-compose-lint:
+	python -m pytest tools/test_check_compose_security.py tools/test_generate_secrets.py -v
+	python tools/check_compose_security.py
+	python tools/verify_compose_config.py
+
+# Secret scan (P0-1 regression guard) — same as .github/workflows/ci.yml's
+# secret-scan job. Requires: pip install detect-secrets==1.5.0
+test-secrets:
+	detect-secrets-hook --baseline .secrets.baseline $$(git ls-files)
 
 # Load tests — requires: make up
 test-load:
@@ -70,4 +89,5 @@ test:
 		$(SERVICE) python -m pytest tests/integration/ -m integration -v --tb=short
 
 .PHONY: up down rebuild rebuild-all logs migrate \
-        test-unit test-integration test-plugin-behavior test-cpp test-load test
+        test-unit test-integration test-plugin-behavior test-cpp test-load test \
+        test-compose-lint test-secrets

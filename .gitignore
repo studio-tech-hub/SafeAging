@@ -119,6 +119,16 @@ models/yolo26n_qnn_model/
 docker/wheels/*.whl
 calib_frames/
 
+# Local/edge SQLite runtime state (P1-7 hygiene) — these accumulate under
+# python/, python/runtime/, and runtime_test/ during local/edge-mode dev and
+# testing and were showing up as untracked clutter in `git status`; never
+# meant to be committed (each is a fresh, disposable local DB, and could
+# incidentally hold real snapshot/event data from a local run).
+*.db
+*.db-shm
+*.db-wal
+runtime_test/
+
 # One-off SSH session scripts — keep curated ops scripts only
 tools/_ssh_*.py
 !tools/_ssh_deploy_hetero.py

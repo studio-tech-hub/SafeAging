@@ -1,5 +1,7 @@
 # SafeAging
 
+[![CI](https://github.com/studio-tech-hub/SafeAging/actions/workflows/ci.yml/badge.svg)](https://github.com/studio-tech-hub/SafeAging/actions/workflows/ci.yml)
+
 **Human-centric AI video analytics for elder care, healthcare, and safety-critical
 environments — built on YOLO26, running at the edge, integrated directly into
 Nx Witness VMS.**
@@ -159,6 +161,15 @@ tools/build_plugin_windows.ps1 -NxMetadataSdkDir <path-to-metadata_sdk> -Package
 tools/build_plugin_linux.sh --sdk-dir /path/to/metadata_sdk --package
 ```
 
+**Enabling the full plugin compile check in CI:** the Nx Metadata SDK is
+Network Optix's licensed, non-redistributable property, so it can't be
+vendored into this repo or fetched from a public URL — `build-plugin`'s
+SDK-dependent step is a no-op (green, not red) until the team adds an
+`NX_METADATA_SDK_URL` repository secret (**Settings → Secrets and variables →
+Actions**) pointing at a private, pre-signed download URL for a
+`tar.gz` of the SDK. The two SDK-free C++ unit tests still run and must pass
+either way.
+
 See [`working_pipeline/CPU_PRODUCTION_PROFILE.md`](working_pipeline/CPU_PRODUCTION_PROFILE.md)
 and [`working_pipeline/DEPLOYMENT_AND_OPERATIONS.md`](working_pipeline/DEPLOYMENT_AND_OPERATIONS.md)
 for full build/deploy/plugin-configuration steps, including wiring the
@@ -186,10 +197,27 @@ alerting, monitoring, and secrets). Highlights:
 ```bash
 make test-unit          # unit tests — no running service needed
 make test-integration    # integration tests — requires: make up
-make test-cpp            # C++ circuit-breaker unit tests (requires g++)
-python tools/check_compose_security.py   # static lint: no compose file may ship a weak default
-python tools/verify_compose_config.py    # dynamic: docker compose config fails empty, succeeds populated
+make test-cpp            # C++ unit tests: circuit breaker + box normalizer (requires g++)
+make test-compose-lint    # static + dynamic compose secret-requirement checks
+make test-secrets         # secret scan against the audited .secrets.baseline
 ```
+
+### Continuous integration (P1-7)
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs four independent
+jobs on every pull request (each can be disabled individually if it ever
+produces a false positive, without touching the others):
+
+| Job | What it does | Local equivalent |
+|---|---|---|
+| `python-tests` | Builds the analytics image, brings up the real Postgres/MinIO/analytics stack, runs `tests/unit` + `tests/integration -m integration` against it | `make up && make test-unit && make test-integration` |
+| `compose-lint` | Static + dynamic checks that no compose file ships a weak default (P0-2/P0-3) | `make test-compose-lint` |
+| `secret-scan` | [detect-secrets](https://github.com/Yelp/detect-secrets) against every tracked file, gated on the hand-audited [`.secrets.baseline`](.secrets.baseline) — a P0-1-style hardcoded credential fails the build | `make test-secrets` |
+| `build-plugin` | Compiles + runs the two SDK-free C++ unit tests; also does a full plugin compile against the real Nx Metadata SDK if the (currently unset) `NX_METADATA_SDK_URL` repository secret is provisioned — see [Building the Nx Witness plugin](#building-the-nx-witness-plugin) | `make test-cpp` |
+
+Once this has been green for a while, enable it as a required status check
+under **Settings → Branches → Branch protection rules** for the default
+branch so a red CI run can no longer be merged.
 
 ## Documentation map
 

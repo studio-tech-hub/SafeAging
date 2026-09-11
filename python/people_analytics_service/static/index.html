@@ -78,6 +78,7 @@
   <section id="tab-persons" class="hidden"></section>
   <section id="tab-events" class="hidden"></section>
   <section id="tab-zones" class="hidden"></section>
+  <section id="tab-cameras" class="hidden"></section>
 </main>
 
 <dialog id="enrollDlg">
@@ -108,6 +109,7 @@ const ALL_TABS = [
   ["persons","People"],
   ["events","Events"],
   ["zones","Zones"],
+  ["cameras","Cameras"],
 ];
 const HIDDEN_TABS = new Set(["dashboard","live","events"]);
 const TABS = ALL_TABS.filter(([id]) => !HIDDEN_TABS.has(id));
@@ -190,6 +192,7 @@ async function render(){
     if(current==="persons") await renderPersons();
     if(current==="events") await renderEvents();
     if(current==="zones") await renderZones();
+    if(current==="cameras") await renderCameras();
   } catch(e){ toast("Error: "+e.message); }
 }
 
@@ -454,6 +457,76 @@ async function addZone(){
 }
 async function delZone(id){ if(!confirm("Remove this zone permanently?"))return;
   try{ await api(`/admin/zones/${id}`,{method:"DELETE"}); toast("Zone removed"); render(); }catch(e){ toast(e.message); } }
+
+// ── Per-camera config overrides (P1-6: face-recognition toggle) ────────────────
+// `extra` is a free-form JSON dict stored as-is on PUT (full replace, not a
+// merge) — _camCfgExtra holds whatever was already there (e.g. an existing
+// `roi` override from another tool) so Save only changes enable_face_recognition
+// and never silently drops other keys. See admin_router.CameraConfigUpsert.
+let _camCfgExtra = {};
+
+async function renderCameras(){
+  const el=document.getElementById("tab-cameras");
+  el.innerHTML=`<div class="card"><h3>Per-camera face recognition</h3>
+    <p class="muted">Override the global face-recognition setting for one camera — e.g. disable it on an
+    outdoor/perimeter camera that only needs fall/zone detection, not identification. Disabling it here skips
+    face detection and recognition entirely for this camera (not just the result), freeing up CPU for other
+    cameras. Leave as <b>Use global default</b> to inherit the service-wide setting.</p>
+    <div class="row">
+      <input id="camCfgId" placeholder="{uuid} e.g. {a3d57074-...}" style="flex:1;min-width:260px">
+      <button class="secondary" onclick="loadCameraConfig()">Load</button>
+    </div>
+    <div class="field" style="margin-top:10px;max-width:260px">
+      <label>Face recognition</label>
+      <select id="camCfgFaceRecog">
+        <option value="">Use global default</option>
+        <option value="true">Enabled</option>
+        <option value="false">Disabled</option>
+      </select>
+    </div>
+    <div class="row">
+      <button onclick="saveCameraConfig()">Save</button>
+      <span class="muted" id="camCfgStatus"></span>
+    </div>
+  </div>`;
+}
+
+async function loadCameraConfig(){
+  const camEl=document.getElementById("camCfgId");
+  camEl.value=normalizeCameraId(camEl.value);
+  const cid=camEl.value.trim();
+  const statusEl=document.getElementById("camCfgStatus");
+  if(!cid){ toast("Enter a camera ID"); return; }
+  _camCfgExtra={};
+  document.getElementById("camCfgFaceRecog").value="";
+  try{
+    const cfg=await api(`/admin/camera-configs/${encodeURIComponent(cid)}`);
+    _camCfgExtra=(cfg && cfg.extra) || {};
+    const v=_camCfgExtra.enable_face_recognition;
+    document.getElementById("camCfgFaceRecog").value = v===true?"true":v===false?"false":"";
+    statusEl.textContent="Loaded existing config.";
+  }catch(e){
+    statusEl.textContent="No saved config yet for this camera (Save will create one).";
+  }
+}
+
+async function saveCameraConfig(){
+  const camEl=document.getElementById("camCfgId");
+  camEl.value=normalizeCameraId(camEl.value);
+  const cid=camEl.value.trim();
+  if(!cid){ toast("Enter a camera ID"); return; }
+  const sel=document.getElementById("camCfgFaceRecog").value;
+  const extra={..._camCfgExtra};
+  if(sel==="true") extra.enable_face_recognition=true;
+  else if(sel==="false") extra.enable_face_recognition=false;
+  else delete extra.enable_face_recognition;
+  try{
+    await api(`/admin/camera-configs/${encodeURIComponent(cid)}`,{method:"PUT",body:{extra}});
+    _camCfgExtra=extra;
+    toast("Saved");
+    document.getElementById("camCfgStatus").textContent="Saved.";
+  }catch(e){ toast("Save failed: "+e.message); }
+}
 
 render();
 wireDateInput(document.getElementById("enrollDob"));

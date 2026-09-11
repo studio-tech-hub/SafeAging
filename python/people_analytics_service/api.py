@@ -937,6 +937,16 @@ def _run_person_detection_pipeline(
         _iou_threshold = (cam_cfg["iou_threshold"] if cam_cfg and cam_cfg.get("iou_threshold") is not None
                           else IOU_THRESHOLD)
 
+        # Per-camera face-recognition toggle (P1-6). Lives under extra.enable_face_recognition
+        # (a bool) so it needs no schema migration, same as the roi override above. Absence
+        # (None/missing/non-bool) means "inherit the global ENABLE_FACE_RECOGNITION setting" —
+        # existing deployments that never set this are completely unaffected.
+        _enable_face_recognition = ENABLE_FACE_RECOGNITION
+        if cam_cfg and isinstance(cam_cfg.get("extra"), dict):
+            _face_recog_override = cam_cfg["extra"].get("enable_face_recognition")
+            if isinstance(_face_recog_override, bool):
+                _enable_face_recognition = _face_recog_override
+
         # ============================================
         # 2) Run YOLO inference (person class only)
         # ============================================
@@ -1460,8 +1470,13 @@ def _run_person_detection_pipeline(
         # 3.6) Face recognition — real-time identity on the bounding box
         # Runs after remap so crop coords match the snapshot frame space.
         # Throttled per track; identity cached for stable labels.
+        # _enable_face_recognition (global default, per-camera-overridable —
+        # see 1.7 above) gates the *entire* call, not just the recognition
+        # attempt inside it: a camera with the override off never runs face
+        # detection/bbox-refinement or queues an async recognition job for
+        # this frame, not merely "skips using the result" (P1-6).
         # ============================================
-        if ENABLE_FACE_RECOGNITION and detections:
+        if _enable_face_recognition and detections:
             try:
                 _apply_face_identity(
                     camera_id=camera_id,
@@ -1947,7 +1962,12 @@ async def get_camera_config_endpoint(camera_id: str, request: Request):
     from .db import get_session
     from .db.dal import get_camera_config, list_zones
     from .config import CONFIDENCE_THRESHOLD as _DEFAULT_CONF, IOU_THRESHOLD as _DEFAULT_IOU
+    from .config import normalize_camera_id
 
+    # Mirror /infer's own normalization so a config saved (with either braced
+    # or unbraced camera_id) via the admin API is the same row the plugin
+    # reads back here, regardless of which form it queries with.
+    camera_id = normalize_camera_id(camera_id)
     cfg = None
     zones_summary: list = []
     if request.app.state.__dict__.get("db_ok", True):

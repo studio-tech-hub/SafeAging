@@ -51,6 +51,20 @@ class FaceMatch:
     score: float
 
 
+# insightface's buffalo_s/buffalo_l packs bundle 5 ONNX models: detection,
+# recognition (ArcFace embedding — what extract_embedding()/recognize_crop()
+# actually use), and three we never read: genderage (face.gender/face.age —
+# this codebase uses the DB-stored date_of_birth/gender instead, see
+# person_age.effective_age()), landmark_3d_68, and landmark_2d_106 (extra
+# high-res landmark sets; alignment for the recognition model uses face.kps,
+# which comes from the *detection* model's own output, not these). Loading
+# and running 3 unused ONNX models on every single face costs real CPU for
+# zero benefit -- confirmed empirically during P1-6: restricting to just the
+# two tasks actually consumed cut per-call latency ~5-8x on a CPU benchmark
+# (see CPU_PRODUCTION_PROFILE.md's P1-6 section for the measured numbers).
+_REQUIRED_FACE_TASKS: tuple[str, ...] = ("detection", "recognition")
+
+
 def _build_app():
     """Create and prepare an insightface FaceAnalysis app. Returns None on failure."""
     from .config import FACE_DET_SIZE, FACE_MODEL_PACK
@@ -66,24 +80,33 @@ def _build_app():
     ctx_id = -1
 
     try:
-        kwargs: dict = {"name": FACE_MODEL_PACK, "providers": providers}
+        kwargs: dict = {
+            "name": FACE_MODEL_PACK,
+            "providers": providers,
+            "allowed_modules": list(_REQUIRED_FACE_TASKS),
+        }
         if provider_options is not None:
             kwargs["provider_options"] = provider_options
         app = FaceAnalysis(**kwargs)
         app.prepare(ctx_id=ctx_id, det_size=(FACE_DET_SIZE, FACE_DET_SIZE))
         logger.info(
-            "[face] insightface '%s' ready backend=%s providers=%s det_size=%d",
+            "[face] insightface '%s' ready backend=%s providers=%s det_size=%d tasks=%s",
             FACE_MODEL_PACK,
             backend_label,
             providers,
             FACE_DET_SIZE,
+            list(app.models.keys()),
         )
         return app
     except Exception as exc:
         if backend_label == "qnn_gpu":
             logger.warning("[face] QNN GPU load failed (%s); retrying CPU", exc)
             try:
-                app = FaceAnalysis(name=FACE_MODEL_PACK, providers=["CPUExecutionProvider"])
+                app = FaceAnalysis(
+                    name=FACE_MODEL_PACK,
+                    providers=["CPUExecutionProvider"],
+                    allowed_modules=list(_REQUIRED_FACE_TASKS),
+                )
                 app.prepare(ctx_id=-1, det_size=(FACE_DET_SIZE, FACE_DET_SIZE))
                 logger.info("[face] insightface '%s' ready backend=cpu (fallback)", FACE_MODEL_PACK)
                 return app
@@ -104,6 +127,98 @@ def _get_app():
             if _app is None:
                 _model_load_failed = True
     return _app
+
+
+# ── adaptive detector input size (P1-6) ──────────────────────────────────────
+# SCRFD's own detect() already accepts a per-call `input_size` override (see
+# insightface.model_zoo.scrfd.SCRFD.detect) -- insightface's FaceAnalysis.get()
+# just never passes one, always falling back to the app's fixed prepare()-time
+# det_size (FACE_DET_SIZE, 640 by default). Running that full-size canvas on an
+# already-tight, already-small person-head crop wastes compute the same way
+# running YOLO at 1280px on a postage-stamp image would: a detector's conv-layer
+# cost is driven by canvas size, not by how much of that canvas the actual face
+# occupies. Small crops get a smaller canvas instead. Recognition/embedding is
+# a separate, fixed-112x112 ONNX model (ArcFaceONNX.get(), see
+# tools/_insightface_src for the vendored reference source used to verify this
+# during P1-6) and is completely unaffected either way.
+_DET_SIZE_BUCKETS: tuple[int, ...] = (320, 480)
+
+
+def select_det_size(crop_w: int, crop_h: int, ceiling: Optional[int] = None) -> int:
+    """Pick the smallest SCRFD detector input size that comfortably fits a
+    crop of this size, never exceeding `ceiling` (defaults to the configured
+    FACE_DET_SIZE).
+
+    The buckets below the ceiling are a pure efficiency optimization for crops
+    that are already small (e.g. a distant/small person on a wide-angle
+    camera); a crop at or beyond the ceiling's own scale still gets the full
+    configured size, exactly like before this change. Pure function of crop
+    dimensions — no model/config access needed when `ceiling` is passed
+    explicitly, so it is trivially unit-testable.
+    """
+    if ceiling is None:
+        from .config import FACE_DET_SIZE
+
+        ceiling = FACE_DET_SIZE
+    long_side = max(int(crop_w), int(crop_h), 1)
+    for bucket in _DET_SIZE_BUCKETS:
+        if bucket >= ceiling:
+            break
+        if long_side <= bucket:
+            return bucket
+    return ceiling
+
+
+def _detect_faces_with_size(app, bgr_crop: np.ndarray, det_size: int) -> list:
+    """Equivalent of FaceAnalysis.get(img), but with an explicit per-call
+    detector input size instead of the app's fixed prepare()-time size.
+
+    Deliberately does NOT mutate `app.det_model.input_size` (the obvious
+    one-line alternative): that attribute lives on the single shared `_app`
+    singleton used by every caller in this process, including concurrent
+    /infer request threads (FastAPI's sync-endpoint thread pool) and
+    face_worker's own worker-thread pool -- two threads racing to set
+    different sizes on the same shared object before either calls detect()
+    would silently use the wrong size for one of them. Passing `input_size`
+    straight into SCRFD.detect()'s already-supported parameter keeps each
+    call's chosen size a local value, so concurrent calls never interfere.
+    """
+    from insightface.app.common import Face
+
+    bboxes, kpss = app.det_model.detect(
+        bgr_crop, input_size=(det_size, det_size), max_num=0, metric="default"
+    )
+    if bboxes.shape[0] == 0:
+        return []
+    faces = []
+    for i in range(bboxes.shape[0]):
+        bbox = bboxes[i, 0:4]
+        det_score = bboxes[i, 4]
+        kps = kpss[i] if kpss is not None else None
+        face = Face(bbox=bbox, kps=kps, det_score=det_score)
+        for taskname, model in app.models.items():
+            if taskname == "detection":
+                continue
+            model.get(bgr_crop, face)
+        faces.append(face)
+    return faces
+
+
+def _detect_faces(app, bgr_crop: np.ndarray, det_size: int) -> list:
+    """_detect_faces_with_size(), falling back to the app's own app.get() (the
+    original, fixed-size behavior) if anything about the adaptive-size path
+    fails -- e.g. a future insightface upgrade changes these internals. Never
+    lets an internal-API mismatch turn into a lost detection.
+    """
+    try:
+        return _detect_faces_with_size(app, bgr_crop, det_size)
+    except Exception as exc:
+        logger.debug(
+            "[face] adaptive det_size=%d path failed (%s); falling back to app.get()",
+            det_size,
+            exc,
+        )
+        return app.get(bgr_crop)
 
 
 def available() -> bool:
@@ -152,9 +267,11 @@ def extract_embedding(bgr_crop: np.ndarray) -> Optional[np.ndarray]:
             (int(round(w * scale)), int(round(h * scale))),
             interpolation=cv2.INTER_LINEAR,
         )
+        h, w = bgr_crop.shape[:2]
 
+    det_size = select_det_size(w, h)
     try:
-        faces = app.get(bgr_crop)
+        faces = _detect_faces(app, bgr_crop, det_size)
     except Exception as exc:
         logger.debug("[face] detection error: %s", exc)
         return None
@@ -201,8 +318,10 @@ def detect_face_bbox(bgr_crop: np.ndarray) -> Optional[tuple[float, float, float
             interpolation=cv2.INTER_LINEAR,
         )
 
+    work_h, work_w = work.shape[:2]
+    det_size = select_det_size(work_w, work_h)
     try:
-        faces = app.get(work)
+        faces = _detect_faces(app, work, det_size)
     except Exception as exc:
         logger.debug("[face] bbox detection error: %s", exc)
         return None
