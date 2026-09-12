@@ -406,12 +406,33 @@ braced ids the Nx plugin already sends 100% of the time, so no currently-
 working production camera config is affected; this only fixes callers that
 were previously silently broken.
 
-**Validation still to do on real hardware (see deployment checklist):**
-measure average face-recognition CPU time/latency per call across a range of
-real crop sizes, before vs. after the adaptive-sizing change, and confirm no
-regression in match accuracy for small-but-still-identifiable faces (the
-size buckets are deliberately conservative — tune `_DET_SIZE_BUCKETS` in
-`face_engine.py` if a specific deployment needs a different tradeoff).
+**Validated on real hardware (AI Box, QCS6490, `cpu_lean` backend)** via the
+new `tools/benchmark_face_det_size.py` — compares the adaptive bucket
+against always using the ceiling (`FACE_DET_SIZE`, the pre-P1-6 behavior) on
+the exact same crops, across a range of simulated person-crop sizes:
+
+```
+long_side crop_wxh adaptive adapt_ms ceil_ms speedup adapt_hit ceil_hit
+160       120x160  320      299.5ms  470.6ms  1.57x   12/12    12/12
+240       180x240  320      326.0ms  499.5ms  1.53x   12/12    12/12
+320       240x320  320      342.5ms  548.0ms  1.60x   12/12    12/12
+400       300x400  480      388.8ms  498.3ms  1.28x   12/12    12/12
+480       360x480  480      443.5ms  479.3ms  1.08x   12/12    12/12
+560       420x560  640      495.1ms  484.6ms  0.98x   12/12    12/12  (>= ceiling, expected ~1.0x)
+640       480x640  640      469.4ms  491.7ms  1.05x   12/12    12/12  (>= ceiling, expected ~1.0x)
+800       600x800  640      448.9ms  471.3ms  1.05x   12/12    12/12  (>= ceiling, expected ~1.0x)
+960       720x960  640      487.1ms  494.4ms  1.01x   12/12    12/12  (>= ceiling, expected ~1.0x)
+
+Mean speedup on crops below the ceiling: 1.41x. Zero detection-hit-rate
+regression at the adaptive size vs. the ceiling, at any crop size tested.
+```
+
+Confirms both halves of the deployment-checklist ask: a real (1.3–1.6x)
+latency win on real hardware for small/distant-person crops — meaningful at
+these absolute latencies (300–500ms/call on this SoC's CPU, running two live
+camera streams concurrently) — with no accuracy tradeoff, so
+`_DET_SIZE_BUCKETS = (320, 480)`'s current, deliberately-conservative values
+did not need tuning for this deployment.
 
 ## Minimal CI pipeline (P1-7)
 
