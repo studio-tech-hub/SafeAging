@@ -82,6 +82,13 @@ Thumbs.db
 *.map
 *.asm
 
+# Compiled C++ unit-test binaries (built fresh by `make test-cpp` / CI's
+# build-plugin job from the .cpp sources every run — never meant to be
+# committed; test_circuit_breaker slipped in as a tracked binary once, see
+# repo-cleanup pass before P2).
+src/tests/test_circuit_breaker
+src/tests/test_detection_box_normalizer
+
 # ==========================================
 # CONAN PACKAGE MANAGER
 # ==========================================
