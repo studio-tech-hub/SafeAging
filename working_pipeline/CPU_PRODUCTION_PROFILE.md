@@ -448,16 +448,43 @@ specifically to avoid shipping a pipeline that's red on day one:
   test failures unrelated to P1-7:
   `TestFallPostureAspectRatioFilter::test_confirmed_track_survives_wide_posture_transition`,
   `TestAdminEvents::test_events_persisted_after_infer`, and
-  `TestMetadataConsistency::test_events_unique_per_camera_after_reset`. Rather
-  than hide them or block CI on unrelated pre-existing bugs, they're marked
-  `@pytest.mark.xfail(strict=False, reason=...)` with the specific mechanism
-  suspected for each (see the reason text in `tests/integration/test_api.py`
-  and `test_plugin_behavior.py`) — they still show up as `xfailed` in every
-  CI run (not silently skipped), and an unexpected pass (`XPASS`) is visible
-  but non-fatal. **Follow-up task recommended:** investigate and fix these
-  three for real (tracker association under geometric distortion, outbox
-  worker flush timing, and the per-camera cache warm-up race respectively)
-  and remove the `xfail` markers once fixed.
+  `TestMetadataConsistency::test_events_unique_per_camera_after_reset`. They
+  were initially marked `@pytest.mark.xfail(strict=False, reason=...)`
+  rather than hidden or allowed to block CI on unrelated pre-existing bugs.
+
+  **Follow-up landed (post-P1-7):** all three were root-caused for real and
+  the `xfail` markers removed — they now pass unconditionally:
+    - `test_events_persisted_after_infer` and
+      `test_events_unique_per_camera_after_reset` were **not** actually async
+      timing races (the originally-suspected cache-warm-up/flush-timing
+      mechanism was wrong). The real bug: `/infer` always stores/looks up
+      `camera_id` in its normalized `{uuid}`-braced form, but
+      `admin_reset_camera()` and `list_events()` (and, found by the same
+      audit, `get_person_history()` and `list_zones()`) compared against the
+      *raw, caller-supplied* form — an exact-match filter that could never
+      hit for an unbraced id, at any wait length. Same bug class as the
+      `live_tracks()`/camera-configs normalization fix from P1-6. Fixed by
+      normalizing `camera_id` at the top of each of those four
+      `admin_router.py` endpoints (deterministic fix; the bounded-retry-poll
+      that replaced each test's old fixed `time.sleep()` is kept only as
+      defense-in-depth, not as the actual fix).
+    - `test_confirmed_track_survives_wide_posture_transition` **was** a
+      genuine test-design issue, exactly as originally suspected: warping the
+      *entire frame* 2.2x/0.65x moves every object to new coordinates, so an
+      IoU-based tracker cannot plausibly re-associate the old confirmed box
+      with the new one — that was exercising tracker continuity under an
+      unrealistic full-scene distortion, not the `PERSON_MIN_HW_RATIO` gate
+      the test targets (which already has thorough, passing, isolated unit
+      coverage in `TestOverlapsConfirmedTrack`,
+      `python/tests/unit/test_tracking.py`). Fixed by changing the test to
+      squash only the confirmed detection's own bbox region in place (same
+      center point, same untouched rest-of-frame) instead of resizing the
+      whole image — a more faithful simulation of "the same person is now
+      lying down" that a same-camera confirmed track can plausibly still be
+      matched against by IoU.
+  Re-validated end-to-end the same way as the original P1-7 pass: full local
+  Docker stack, `docker compose exec ... pytest tests/integration -m
+  integration` — 77 passed, 4 skipped (auth-mode skips, unrelated), 0 xfail.
 - `compose-lint`/`secret-scan`: ran the exact commands the CI job runs,
   directly, against this repo.
 - `build-plugin`: compiled and ran both C++ test binaries with g++ in WSL.

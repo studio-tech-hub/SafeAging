@@ -382,21 +382,62 @@ class TestFallPostureAspectRatioFilter:
         assert ok, "cv2.imencode failed while widening test frame"
         return base64.b64encode(buf).decode()
 
-    @pytest.mark.xfail(
-        reason=(
-            "P1-7: pre-existing, reproduced independently on both native-Windows and "
-            "Docker/cpu_lean CI-like runs. Warping the same real photo 2.2x/0.65x to force "
-            "a low h/w ratio also moves/reshapes the detection enough that IoU-based track "
-            "association assigns brand-new track_ids (5,6,7) instead of continuing "
-            "confirmed ones (1,2,3,4) -- i.e. this currently exercises tracker "
-            "association-under-geometric-distortion rather than isolating the "
-            "PERSON_MIN_HW_RATIO gate the test name/assertion targets. Needs a follow-up "
-            "task to either stabilize track continuity under this transform or rework the "
-            "test to isolate the gate directly (e.g. unit-test the gate function instead of "
-            "relying on YOLO+tracker behavior on a warped image). Not a P1-7 (CI) concern."
-        ),
-        strict=False,
-    )
+    @staticmethod
+    def _squash_person_in_place(
+        frame_b64: str, det: dict, x_scale: float = 1.8, y_scale: float = 0.55
+    ) -> str:
+        """Warp only the confirmed track's own bbox region to a wide/short shape,
+        in place, keeping the rest of the frame (and the box's center point)
+        unchanged.
+
+        Follow-up fix for the P1-7 xfail: a *whole-frame* resize (see
+        `_widen_b64` above) moves every object to new coordinates, so a
+        confirmed track's box no longer overlaps its old position enough for
+        IoU-based tracking to re-associate it -- that was testing tracker
+        continuity under an unrealistic full-scene distortion, not the
+        PERSON_MIN_HW_RATIO gate the test name/assertion targets. A real fall
+        keeps the camera and scene fixed and only changes that one person's
+        silhouette, so squashing just their own crop in place (same center
+        point, same rest-of-frame) is both a more faithful simulation and one
+        that a same-camera confirmed track can plausibly still be associated
+        against by IoU, isolating the gate's actual behavior end-to-end.
+        """
+        import cv2
+        import numpy as np
+        raw = base64.b64decode(frame_b64)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        H, W = img.shape[:2]
+
+        x, y, w, h = det["x"], det["y"], det["w"], det["h"]
+        cx, cy = x + w / 2.0, y + h / 2.0
+
+        # Crop with a little padding so the resized patch has real pixels to
+        # sample instead of butting straight against the detection edge.
+        pad = 0.15
+        x0 = max(0, int(x - w * pad))
+        y0 = max(0, int(y - h * pad))
+        x1 = min(W, int(x + w * (1 + pad)))
+        y1 = min(H, int(y + h * (1 + pad)))
+        crop = img[y0:y1, x0:x1]
+        assert crop.size > 0, "empty crop while squashing person bbox"
+
+        new_w = max(1, int((x1 - x0) * x_scale))
+        new_h = max(1, int((y1 - y0) * y_scale))
+        squashed = cv2.resize(crop, (new_w, new_h))
+
+        # Paste centered at the same center point as the original box, so the
+        # new (wide/short) region overlaps the old (confirmed) box location.
+        out = img.copy()
+        paste_w, paste_h = min(new_w, W), min(new_h, H)
+        px0 = max(0, min(int(cx - new_w / 2.0), W - paste_w))
+        py0 = max(0, min(int(cy - new_h / 2.0), H - paste_h))
+        out[py0 : py0 + paste_h, px0 : px0 + paste_w] = squashed[:paste_h, :paste_w]
+
+        ok, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        assert ok, "cv2.imencode failed while squashing test frame"
+        return base64.b64encode(buf).decode()
+
     def test_confirmed_track_survives_wide_posture_transition(self, real_frame_b64):
         cam = _camera()
 
@@ -406,17 +447,20 @@ class TestFallPostureAspectRatioFilter:
             r = _infer(real_frame_b64, cam)
             assert r.status_code == 200
             last_dets = r.json()
-        confirmed_ids_before = {d["track_id"] for d in last_dets if d.get("stable")}
-        if not confirmed_ids_before:
+        confirmed_before = [d for d in last_dets if d.get("stable")]
+        if not confirmed_before:
             pytest.skip(
                 "No stable/confirmed track established on the unmodified real photo; "
                 "cannot exercise the mid-track wide-posture transition"
             )
+        confirmed_ids_before = {d["track_id"] for d in confirmed_before}
 
-        # Now force a low h/w ratio (stretch wide, squash short) on the same
-        # camera_id so any surviving detection is treated as the same track,
-        # never a brand-new candidate.
-        wide_b64 = self._widen_b64(real_frame_b64)
+        # Squash the (largest) confirmed detection's own bbox region wide/short,
+        # in place -- same camera_id, same rest-of-frame, so any surviving
+        # detection near that location is plausibly the same track, not a
+        # brand-new candidate forced by an unrelated full-frame distortion.
+        target_det = max(confirmed_before, key=lambda d: d["w"] * d["h"])
+        wide_b64 = self._squash_person_in_place(real_frame_b64, target_det)
         wide_dets: list = []
         for _ in range(3):
             r = _infer(wide_b64, cam)
@@ -425,7 +469,7 @@ class TestFallPostureAspectRatioFilter:
 
         if not wide_dets:
             pytest.skip(
-                "YOLO produced no detections at all on the warped frame (model-dependent); "
+                "YOLO produced no detections at all on the squashed frame (model-dependent); "
                 "cannot isolate the aspect-ratio filter's effect without a baseline detection"
             )
 
@@ -676,31 +720,42 @@ class TestAdminEvents:
         assert r.status_code == 200
         assert isinstance(r.json(), list)
 
-    @pytest.mark.xfail(
-        reason=(
-            "P1-7: pre-existing, reproduced independently on both native-Windows and "
-            "Docker/cpu_lean CI-like runs. A 'detection' event is only enqueued once, on a "
-            "track's first appearance in new_outbox_ids (api.py), then persisted "
-            "asynchronously by outbox_worker -- the 4s wait here is sometimes not enough "
-            "for that enqueue+flush to land before /admin/events is queried, independent "
-            "of YOLO_BACKEND or host. Needs a follow-up task to either poll with a bounded "
-            "retry instead of a fixed sleep, or confirm/tune the outbox worker's actual "
-            "flush interval. Not a P1-7 (CI) concern."
-        ),
-        strict=False,
-    )
     def test_events_persisted_after_infer(self, real_frame_b64):
+        """A 'detection' event is enqueued once, on a track's first appearance
+        in new_outbox_ids (api.py), then persisted asynchronously by
+        outbox_worker. Poll with a bounded retry instead of a fixed sleep,
+        since the worker's flush timing is not itself under test here.
+
+        Follow-up fix for the P1-7 xfail: root cause was NOT actually flush
+        timing -- /admin/events matched camera_id with an exact, unnormalized
+        string compare while outbox events are always persisted with the
+        normalized ({uuid}-braced) camera_id (see api.py's /infer handler),
+        so an unbraced query camera_id could never match, at any wait length.
+        Fixed in admin_router.py's list_events(); this poll loop remains as
+        defense-in-depth against genuine async timing, not as the real fix.
+        """
         cam = _camera()
         # Warm up with real image (bus.jpg) so YOLO finds people, tracks confirm
         for _ in range(6):
             _infer(real_frame_b64, cam)
-        time.sleep(4.0)  # wait for async outbox worker to drain
 
-        r = requests.get(_svc(f"/admin/events?camera_id={cam}&limit=20"), timeout=5)
-        assert r.status_code == 200
-        events = r.json()
+        # Events are persisted with the normalized ({uuid}-braced) camera_id
+        # (see api.py's /infer handler) regardless of which form was sent —
+        # mirror that here so the assertion isn't comparing the wrong form.
+        normalized_cam = "{" + cam + "}"
+
+        deadline = time.monotonic() + 10.0
+        events: list = []
+        while time.monotonic() < deadline:
+            r = requests.get(_svc(f"/admin/events?camera_id={cam}&limit=20"), timeout=5)
+            assert r.status_code == 200
+            events = r.json()
+            if any(e["camera_id"] == normalized_cam for e in events):
+                break
+            time.sleep(0.5)
+
         # At least one detection event should be persisted for this camera
-        assert any(e["camera_id"] == cam for e in events), \
+        assert any(e["camera_id"] == normalized_cam for e in events), \
             f"No events for camera {cam}. All events: {[e['camera_id'] for e in events]}"
 
 

@@ -419,6 +419,8 @@ async def get_person_history(
     or manually via POST /admin/events/{event_uuid}/link-person.
     """
     _require_db()
+    if camera_id is not None:
+        camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
         person = await dal.get_person(session, person_id)
         if person is None:
@@ -444,6 +446,11 @@ async def list_zones(
     active_only: bool = Query(True),
 ):
     _require_db()
+    # Zones are always stored with the normalized camera_id (create_zone()
+    # below normalizes before insert) — normalize the filter too, same as
+    # list_events()/live_tracks(), so an unbraced query still matches.
+    if camera_id is not None:
+        camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
         zones = await dal.list_zones(session, camera_id=camera_id, active_only=active_only)
     return [ZoneOut.model_validate(z) for z in zones]
@@ -518,6 +525,13 @@ async def list_events(
     offset: int = Query(0, ge=0),
 ):
     _require_db()
+    # Events are always persisted with the normalized ({uuid}-braced) camera_id
+    # (see api.py's /infer handler and outbox_worker's OutboxEvent), but callers
+    # of this endpoint (UI, tests, operators) may pass either form — normalize
+    # here so an exact-match filter isn't silently a no-op for the unbraced form
+    # (same bug class as live_tracks()/admin_reset_camera()).
+    if camera_id is not None:
+        camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
         events = await dal.list_events(
             session,
@@ -585,6 +599,14 @@ async def admin_reset_camera(camera_id: str):
     and provides a consistent JSON response. DB records are preserved.
     """
     from .tracking import camera_states, camera_states_lock
+
+    # camera_states is always keyed by the normalized ({uuid}-braced) form (see
+    # api.py's /infer handler), but callers of this admin endpoint (UI, tests,
+    # operators) may pass either form — normalize here so this doesn't silently
+    # 404 with "not yet initialised" for a camera that is, in fact, live (this
+    # was previously mistaken for an async cache-warm-up race; it is actually a
+    # deterministic normalization mismatch, same bug class as live_tracks()).
+    camera_id = normalize_camera_id(camera_id)
 
     with camera_states_lock:
         state = camera_states.get(camera_id)
@@ -1013,7 +1035,11 @@ async def enroll_from_track(body: EnrollFromTrackBody):
             detail="Provide either person_id (existing) or name (to create a new person)",
         )
 
-    crop = _get_recent_track_crop(body.camera_id, body.track_id)
+    # camera_states is keyed by the normalized ({uuid}-braced) form — normalize
+    # here too so this doesn't silently 404 for an unbraced camera_id, same bug
+    # class as admin_reset_camera()/live_tracks().
+    normalized_cam_id = normalize_camera_id(body.camera_id)
+    crop = _get_recent_track_crop(normalized_cam_id, body.track_id)
     if crop is None:
         raise HTTPException(
             status_code=404,
