@@ -6,7 +6,7 @@ import struct
 import threading
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -21,63 +21,31 @@ from .config import (
     API_KEY_REQUIRED,
     ALLOW_INSECURE_NO_AUTH,
     AUTH_EFFECTIVELY_DISABLED,
-    BBOX_SMOOTHING,
     CONFIDENCE_THRESHOLD,
     CORS_ALLOW_ORIGINS,
     DEVICE,
-    ENABLE_CLAHE,
     ENABLE_FACE_RECOGNITION,
     ENABLE_FACE_ASYNC,
     ENABLE_FALL_DETECTION,
-    ENABLE_FRAME_ENHANCEMENT,
-    ENABLE_HISTORY_REMATCH,
-    ENABLE_MULTI_SCALE,
     FACE_RECOG_INTERVAL_FRAMES,
     FACE_RECOG_UNKNOWN_RETRY_SEC,
     FACE_RECOG_USE_TIME_SCHEDULER,
-    ENABLE_INPUT_UPSCALE,
-    ENABLE_POSE_FALL,
-    ENABLE_POST_NMS,
-    ENABLE_ROI,
     ENABLE_UNDISTORT,
-    FLICKER_REUSE_TIME,
-    HOLD_SUPPRESS_IOU,
     IOU_THRESHOLD,
-    MATCH_IOU_THRESHOLD,
-    MIN_DETECTION_AREA,
-    MIN_INPUT_RESOLUTION,
-    METRICS_LOG_INTERVAL,
     METRICS_WINDOW_SIZE,
     MODEL_PATH,
-    NEW_TRACK_MIN_CONFIDENCE,
-    OUTPUT_DEDUPE_IOU,
-    OUTPUT_TENTATIVE_TRACKS,
-    POSE_INTERVAL_FRAMES,
-    POSE_KEYPOINT_CONF,
-    POSE_IMGSZ,
-    PERSON_MIN_HW_RATIO,
-    POST_NMS_IOU,
     RATE_LIMIT_ENABLED,
     RATE_LIMIT_MAX_PER_CAMERA,
     RATE_LIMIT_MAX_PER_IP,
     RATE_LIMIT_SKIP_LOOPBACK,
     RATE_LIMIT_WINDOW_SECONDS,
     REQUIRE_HTTPS,
-    SAVE_DEBUG_SAMPLES,
     CALIB_CAPTURE_DIR,
     CALIB_CAPTURE_MAX,
     SERVICE_HOST,
     SERVICE_PORT,
     TLS_CERT_FILE,
     TLS_KEY_FILE,
-    TRACK_DUPLICATE_IOU,
-    TRACK_MAX_MISSES,
-    TRACK_MIN_HITS,
-    TRACK_OUTPUT_HOLD_TIME,
-    TRACK_TTL,
-    TENTATIVE_MAX_MISSES,
-    UNIQUE_COUNT_MIN_HITS,
-    USE_HALF,
     YOLO_IMGSZ,
     log_config_summary,
     logger,
@@ -86,56 +54,26 @@ from .db import dispose_engine, init_engine
 from .health import compute_status, dependency_snapshot, refresh_probes
 from .admin_router import router as admin_router
 from . import outbox_worker
-from .outbox_worker import OutboxEvent
 from .metrics import (
-    ACTIVE_TRACKS,
-    DECODE_LATENCY,
-    DETECTIONS_PER_FRAME,
     INFER_ERRORS,
-    INFER_LATENCY,
     INFER_REQUESTS,
-    PREPROCESS_LATENCY,
     SERVICE_INFO,
-    YOLO_LATENCY,
 )
 from .model import load_model
 from . import yolo_backend
 from . import face_engine
 from . import face_worker
 from .face_identity import apply_cached_identity_to_det, commit_face_match, commit_face_miss
-from . import pose_backend
-from .zone_engine import check_zones, get_zones_for_camera_sync
-from .config_engine import get_per_camera_config_sync
-from .preprocess import (
-    apply_roi,
-    auto_adjust_brightness,
-    ensure_min_input_side,
-    load_calibration,
-    multi_scale_inference_smart,
-    preprocess_frame,
-    remap_detections_to_input_space,
-    undistort_frame,
-)
+from .preprocess import auto_adjust_brightness, load_calibration
 from .tracking import (
-    appearance_distance,
     camera_states,
     camera_states_lock,
-    dedupe_output_tracks,
     get_camera_metrics_snapshot,
     get_camera_state,
-    global_track_assignment,
-    has_duplicate_track_overlap,
     increment_camera_error,
     increment_camera_request,
-    iou,
-    overlaps_confirmed_track,
-    post_nms_dedupe,
-    record_camera_metrics,
-    select_output_bbox,
-    smooth_bbox,
-    suppress_overlapping_holds,
-    update_track_motion,
 )
+from .pipeline import InferContext, PIPELINE_STAGES
 
 
 _calib_capture_lock = threading.Lock()
@@ -839,885 +777,40 @@ def _run_person_detection_pipeline(
     camera_request_count and cam_seq are the same per-camera sequence number;
     this function uses cam_seq for both roles (matches the pre-P1-4 code,
     which aliased them under two names within a single function).
+
+    P2-1: this function is now a thin orchestrator over an ordered list of
+    Stage objects (PreprocessStage, DetectStage, TrackStage, FallStage,
+    FaceStage, ZoneStage, PersistStage — see the `pipeline` package)
+    operating on a shared InferContext, replacing what used to be ~900
+    lines of inline code sharing ~50 loose local variables. DecodeStage is
+    not one of them: the already-decoded `frame` + transport metadata this
+    function receives IS that stage's output, produced by the
+    route-handler-level _decode_current_transport_image /
+    _decode_binary_transport_image (P1-4).
+
+    Behaviour is unchanged from before this refactor — every stage was
+    extracted verbatim from this function's former body, one at a time,
+    gated by python/tests/unit/test_infer_golden.py (the characterization
+    test that must stay green, unmodified, through the whole decomposition).
     """
-    camera_request_count = cam_seq
-    preprocess_time_ms = 0.0
-    yolo_time_ms = 0.0
-
+    ctx = InferContext(
+        frame=frame,
+        camera_id=camera_id,
+        state=state,
+        cam_seq=cam_seq,
+        request_started_at=request_started_at,
+        transport_name=transport_name,
+        transport_encoded_bytes=transport_encoded_bytes,
+        transport_raw_bytes=transport_raw_bytes,
+        decode_time_ms=decode_time_ms,
+        route_label=route_label,
+    )
     try:
-        H, W = frame.shape[:2]
-        _maybe_capture_calib_frame(camera_id, frame, cam_seq)
-
-        # Keep a reference to the originally decoded full frame for event snapshots.
-        # Detection coords are later remapped back to this input space, so snapshots
-        # stored for review/enrollment match the bbox coordinates we persist.
-        snapshot_source_frame = frame
-
-        # Debug: Check if frame is mostly empty/dark
-        mean_bgr = cv2.mean(frame)
-        frame_mean = float((mean_bgr[0] + mean_bgr[1] + mean_bgr[2]) / 3.0)
-        gray_for_stats = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
-        frame_min_val, frame_max_val, _, _ = cv2.minMaxLoc(gray_for_stats)
-        frame_max = int(frame_max_val)
-        frame_min = int(frame_min_val)
-        if cam_seq % 20 == 0:
-            logger.debug(f"[{camera_id}] Frame: {W}x{H}, mean={frame_mean:.1f}, min={frame_min}, max={frame_max}")
-            logger.debug(
-                f"[{camera_id}] Transport: {transport_name}, "
-                f"encoded_bytes={transport_encoded_bytes}, raw_bytes={transport_raw_bytes}"
-            )
-            if SAVE_DEBUG_SAMPLES:
-                try:
-                    import os
-                    os.makedirs('frame_samples', exist_ok=True)
-                    sample_path = f'frame_samples/{camera_id}_{cam_seq:06d}.jpg'
-                    cv2.imwrite(sample_path, frame)
-                    logger.debug(f"[{camera_id}] Saved frame sample to {sample_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to save frame sample: {e}")
-        logger.debug(f"[{camera_id}] Frame size: {W}x{H}")
-
-        # Store transform metadata for coordinate mapping (before undistort/ROI)
-        undistort_crop_offset = (0, 0)
-        
-        # ============================================
-        # 1.4) Undistortion (for wide-angle/fisheye cameras)
-        # ============================================
-        if ENABLE_UNDISTORT:
-            undistort_start = time.perf_counter()
-            frame, undistort_crop_offset = undistort_frame(frame)
-            undistort_time_ms = (time.perf_counter() - undistort_start) * 1000.0
-            preprocess_time_ms += undistort_time_ms
-            if cam_seq % 20 == 0:
-                logger.debug(f"[{camera_id}] Undistortion: {undistort_time_ms:.1f}ms")
-        pre_roi_shape = frame.shape
-
-        cam_cfg = get_per_camera_config_sync(camera_id)
-        roi_override = None
-        if cam_cfg and isinstance(cam_cfg.get("extra"), dict):
-            roi_override = cam_cfg["extra"].get("roi")
-
-        # ============================================
-        # 1.5) ROI Crop (Region of Interest)
-        # ============================================
-        roi_box = None
-        roi_type = None
-        if ENABLE_ROI:
-            roi_start = time.perf_counter()
-            frame, roi_box, roi_type = apply_roi(frame, roi_override=roi_override)
-            roi_time_ms = (time.perf_counter() - roi_start) * 1000.0
-            preprocess_time_ms += roi_time_ms
-            H_roi, W_roi = frame.shape[:2]
-            if cam_seq % 20 == 0:
-                logger.debug(f"[{camera_id}] ROI ({roi_type}): {H_roi}x{W_roi}, time={roi_time_ms:.1f}ms")
-        else:
-            roi_box = (0, 0, frame.shape[1], frame.shape[0])
-
-        H, W = frame.shape[:2]
-
-        # ============================================
-        # 1.6) Preprocess frame for wide-angle optimization
-        # ============================================
-        if ENABLE_CLAHE or ENABLE_FRAME_ENHANCEMENT:
-            preprocess_start = time.perf_counter()
-            frame = preprocess_frame(frame)
-            preprocess_step_ms = (time.perf_counter() - preprocess_start) * 1000.0
-            preprocess_time_ms += preprocess_step_ms
-            if cam_seq % 20 == 0:
-                logger.debug(
-                    f"[{camera_id}] Frame preprocessing: {preprocess_step_ms:.1f}ms "
-                    f"(CLAHE={ENABLE_CLAHE}, Enhancement={ENABLE_FRAME_ENHANCEMENT})"
-                )
-
-        # ============================================
-        # 1.7) Per-camera config override (P2.2)
-        # ============================================
-        _conf_threshold = (cam_cfg["confidence_threshold"] if cam_cfg and cam_cfg.get("confidence_threshold") is not None
-                           else CONFIDENCE_THRESHOLD)
-        _iou_threshold = (cam_cfg["iou_threshold"] if cam_cfg and cam_cfg.get("iou_threshold") is not None
-                          else IOU_THRESHOLD)
-
-        # Per-camera face-recognition toggle (P1-6). Lives under extra.enable_face_recognition
-        # (a bool) so it needs no schema migration, same as the roi override above. Absence
-        # (None/missing/non-bool) means "inherit the global ENABLE_FACE_RECOGNITION setting" —
-        # existing deployments that never set this are completely unaffected.
-        _enable_face_recognition = ENABLE_FACE_RECOGNITION
-        if cam_cfg and isinstance(cam_cfg.get("extra"), dict):
-            _face_recog_override = cam_cfg["extra"].get("enable_face_recognition")
-            if isinstance(_face_recog_override, bool):
-                _enable_face_recognition = _face_recog_override
-
-        # ============================================
-        # 2) Run YOLO inference (person class only)
-        # ============================================
-        try:
-            # Startup preloads the model; keep this as a defensive fallback.
-            yolo_model = load_model()
-
-            # Save pre-inference frame (after ROI crop) - every 200 frames
-            if SAVE_DEBUG_SAMPLES and cam_seq % 200 == 0:
-                try:
-                    import os
-                    os.makedirs('frame_samples', exist_ok=True)
-                    sample_pre = f'frame_samples/{camera_id}_{cam_seq:06d}_pre_yolo.jpg'
-                    cv2.imwrite(sample_pre, frame)
-                except Exception as e:
-                    logger.debug(f"Failed to save pre-YOLO frame: {e}")
-            
-            yolo_start = time.perf_counter()
-
-            yolo_frame = frame
-            yolo_inv_scale = 1.0
-            if ENABLE_INPUT_UPSCALE:
-                yolo_frame, yolo_scale = ensure_min_input_side(frame, MIN_INPUT_RESOLUTION)
-                if yolo_scale != 1.0:
-                    yolo_inv_scale = 1.0 / yolo_scale
-            
-            # Choose inference strategy
-            if ENABLE_MULTI_SCALE:
-                # Smart multi-scale detection: only retry at larger scale if no detections
-                r = multi_scale_inference_smart(yolo_model, yolo_frame, H, W)
-            else:
-                # Standard single-scale inference - PRODUCTION MODE
-                r = yolo_backend.predict_yolo(
-                    yolo_model,
-                    yolo_frame,
-                    conf=_conf_threshold,
-                    iou=_iou_threshold,
-                    classes=[0],  # person only
-                    imgsz=YOLO_IMGSZ,
-                    verbose=False,
-                    augment=False,
-                )
-            
-            yolo_time_ms = (time.perf_counter() - yolo_start) * 1000.0
-            
-            # Save post-inference frame with detections - every 200 frames
-            if SAVE_DEBUG_SAMPLES and cam_seq % 200 == 0:
-                try:
-                    import os
-                    os.makedirs('frame_samples', exist_ok=True)
-                    frame_with_boxes = frame.copy()
-                    if r.boxes is not None and len(r.boxes) > 0:
-                        for box in r.boxes:
-                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            cv2.rectangle(frame_with_boxes, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    sample_post = f'frame_samples/{camera_id}_{cam_seq:06d}_post_yolo.jpg'
-                    cv2.imwrite(sample_post, frame_with_boxes)
-                except Exception as e:
-                    logger.debug(f"Failed to save post-YOLO frame: {e}")
-            
-            # Log detection details for debugging
-            boxes_for_log = r.boxes if r.boxes is not None else []
-            num_boxes = len(boxes_for_log)
-            if cam_seq % 20 == 0:
-                logger.debug(
-                    f"[{camera_id}] YOLO: {num_boxes} objects "
-                    f"(conf={_conf_threshold:.2f}, iou={_iou_threshold:.2f}, inference={yolo_time_ms:.1f}ms)"
-                )
-                if num_boxes > 0:
-                    for i, box in enumerate(boxes_for_log[:3]):  # Show first 3
-                        logger.debug(f"  Box {i}: cls={int(box.cls[0].item())}, conf={float(box.conf[0].item()):.2f}")
-        except Exception as e:
-            error_message = f"YOLO inference error: {type(e).__name__}: {e}"
-            _record_camera_infer_error(state, error_message)
-            logger.error(f"[{camera_id}] {error_message}")
-            return []
-
-        now = time.time()
-        camera_lock = state["lock"]
-        with camera_lock:
-            state["frame_idx"] = int(state.get("frame_idx", 0)) + 1
-            camera_frame_idx = state["frame_idx"]
-            tracks = [dict(tr) for tr in state["tracks"]]
-            track_history_snapshot = [dict(tr) for tr in state["track_history"]]
-            next_id = state["next_id"]
-            fall_detector = state["fall_detector"]
-
-        detections: List[Detection] = []
-
-        # ============================================
-        # 3) Process YOLO outputs with tracking
-        # ============================================
-        # Track state (persistent) — built *before* raw-detection filtering so the
-        # aspect-ratio filter below can be track-state-aware (P1-2): it needs to
-        # know which confirmed tracks already exist to decide whether a wide box
-        # is furniture (new candidate) or a person who has fallen (existing track).
-        track_by_id = {tr["id"]: tr for tr in tracks}
-        for tr in track_by_id.values():
-            tr.setdefault("status", "confirmed")
-            tr.setdefault("hits", TRACK_MIN_HITS)
-            tr.setdefault("misses", 0)
-            tr.setdefault("vx", 0.0)
-            tr.setdefault("vy", 0.0)
-            tr.setdefault("vw", 0.0)
-            tr.setdefault("vh", 0.0)
-            tr.setdefault("measurement_bbox", tr.get("bbox"))
-
-        # Build raw detections first (for optional extra NMS)
-        raw_dets: List[Dict[str, Any]] = []
-        boxes_iter = r.boxes if r.boxes is not None else []
-        for box in boxes_iter:
-            try:
-                cls_id = int(box.cls[0].item())
-                if cls_id != 0:  # Only person
-                    continue
-
-                score = float(box.conf[0].item())
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                if yolo_inv_scale != 1.0:
-                    x1 *= yolo_inv_scale
-                    y1 *= yolo_inv_scale
-                    x2 *= yolo_inv_scale
-                    y2 *= yolo_inv_scale
-
-                # Clamp to frame boundaries
-                x1 = max(0.0, min(x1, W - 1.0))
-                y1 = max(0.0, min(y1, H - 1.0))
-                x2 = max(0.0, min(x2, W - 1.0))
-                y2 = max(0.0, min(y2, H - 1.0))
-
-                w_box = x2 - x1
-                h_box = y2 - y1
-                area = w_box * h_box
-                hw_ratio = h_box / max(1.0, w_box)
-
-                # Filter by minimum area
-                if w_box <= 1.0 or h_box <= 1.0 or area < MIN_DETECTION_AREA:
-                    logger.debug(f"[{camera_id}] Skipping small detection: {w_box:.1f}x{h_box:.1f} (area={area:.0f} < {MIN_DETECTION_AREA})")
-                    continue
-
-                det_box = (x1, y1, x2, y2)
-
-                # Reject furniture-like wide boxes that YOLO occasionally confuses as
-                # people — but only for brand-new track candidates. A wide box that
-                # overlaps an already-confirmed track is far more likely that same
-                # person now lying down (a fall) than furniture, so the filter must
-                # never drop a person mid-track (P1-2: this used to run before track
-                # association and blanket-rejected fall postures, directly
-                # undermining fall detection).
-                if hw_ratio < PERSON_MIN_HW_RATIO:
-                    if not overlaps_confirmed_track(det_box, track_by_id, MATCH_IOU_THRESHOLD):
-                        logger.debug(
-                            f"[{camera_id}] Skipping wide person-like detection: "
-                            f"{w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f} < {PERSON_MIN_HW_RATIO:.2f}"
-                        )
-                        continue
-                    logger.debug(
-                        f"[{camera_id}] Wide box kept — overlaps a confirmed track "
-                        f"(possible fall posture): {w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f}"
-                    )
-
-                raw_dets.append({"bbox": det_box, "score": score})
-            except Exception as e:
-                logger.warning(f"[{camera_id}] Error parsing box: {type(e).__name__}: {e}")
-                continue
-
-        # Extra dedupe to avoid overlapping boxes for the same person
-        if ENABLE_POST_NMS and len(raw_dets) > 1:
-            raw_dets = post_nms_dedupe(raw_dets, POST_NMS_IOU)
-
-        matched_ids = set()
-        output_track_ids = set()
-
-        # Global optimal 1-1 matching (Hungarian) over gated det-track pairs.
-        det_to_track, det_appearances = global_track_assignment(raw_dets, track_by_id, frame, now)
-
-        for det_idx, track_id in det_to_track.items():
-            det = raw_dets[det_idx]
-            det_box = det["bbox"]
-            score = det["score"]
-            det_appearance = det_appearances[det_idx]
-
-            tr = track_by_id.get(track_id)
-            if not tr:
-                continue
-
-            prev_bbox = tr.get("bbox", det_box)
-            prev_measurement_bbox = tr.get("measurement_bbox", prev_bbox)
-            if BBOX_SMOOTHING > 0.0 and tr.get("bbox"):
-                tr["bbox"] = smooth_bbox(prev_bbox, det_box, BBOX_SMOOTHING)
-            else:
-                tr["bbox"] = det_box
-
-            update_track_motion(
-                tr,
-                prev_bbox=prev_measurement_bbox,
-                new_bbox=det_box,
-                now_ts=now
-            )
-            tr["last_seen"] = now
-            tr["appearance"] = det_appearance
-            tr["measurement_bbox"] = det_box
-            tr["score"] = score
-            tr["misses"] = 0
-            tr["hits"] = int(tr.get("hits", 0)) + 1
-            if tr["status"] != "confirmed" and tr["hits"] >= TRACK_MIN_HITS:
-                tr["status"] = "confirmed"
-            elif tr["status"] == "lost":
-                tr["status"] = "confirmed"
-
-            track_by_id[track_id] = tr
-            matched_ids.add(track_id)
-
-        for tr in track_by_id.values():
-            if tr["id"] in matched_ids:
-                continue
-            tr["misses"] = int(tr.get("misses", 0)) + 1
-            if tr.get("status") == "tentative":
-                if tr["misses"] > TENTATIVE_MAX_MISSES:
-                    tr["status"] = "deleted"
-            else:
-                tr["status"] = "lost"
-
-        unmatched_det_idxs = [idx for idx in range(len(raw_dets)) if idx not in det_to_track]
-        for det_idx in unmatched_det_idxs:
-            try:
-                det = raw_dets[det_idx]
-                det_box = det["bbox"]
-                score = det["score"]
-                det_appearance = det_appearances[det_idx]
-                track_id = None
-
-                # Optional history rematch: appearance-only for returning person.
-                if ENABLE_HISTORY_REMATCH and track_history_snapshot and det_appearance.get("color_hist") is not None:
-                    best_hist_score = -1.0
-                    best_hist = None
-                    for hist_tr in track_history_snapshot:
-                        if hist_tr.get("id") in matched_ids:
-                            continue
-                        if hist_tr.get("appearance") and hist_tr["appearance"].get("color_hist") is not None:
-                            app_dist = appearance_distance(hist_tr["appearance"]["color_hist"], det_appearance["color_hist"])
-                            if app_dist < 0.4:
-                                hist_score = 1.0 - app_dist
-                                if hist_score > best_hist_score:
-                                    best_hist_score = hist_score
-                                    best_hist = hist_tr
-                    if best_hist is not None:
-                        track_id = int(best_hist["id"])
-                        track_by_id[track_id] = {
-                            "id": track_id,
-                            "bbox": det_box,
-                            "measurement_bbox": det_box,
-                            "last_seen": now,
-                            "created_at": best_hist.get("created_at", now),
-                            "appearance": det_appearance,
-                            "score": score,
-                            "status": "confirmed",
-                            "hits": max(TRACK_MIN_HITS, int(best_hist.get("hits", TRACK_MIN_HITS))),
-                            "misses": 0,
-                            "vx": 0.0,
-                            "vy": 0.0,
-                            "vw": 0.0,
-                            "vh": 0.0,
-                        }
-                        logger.debug(f"[{camera_id}] Re-matched track ID={track_id} from history")
-
-                if track_id is None:
-                    if score < NEW_TRACK_MIN_CONFIDENCE:
-                        continue
-
-                    if has_duplicate_track_overlap(
-                        det_box=det_box,
-                        track_by_id=track_by_id,
-                        now_ts=now,
-                        overlap_iou=TRACK_DUPLICATE_IOU,
-                        recent_only_sec=max(TRACK_OUTPUT_HOLD_TIME, 0.5),
-                    ):
-                        continue
-
-                    track_id = next_id
-                    next_id += 1
-                    initial_hits = 1
-                    track_by_id[track_id] = {
-                        "id": track_id,
-                        "bbox": det_box,
-                        "measurement_bbox": det_box,
-                        "last_seen": now,
-                        "created_at": now,
-                        "appearance": det_appearance,
-                        "score": score,
-                        "status": "confirmed" if initial_hits >= TRACK_MIN_HITS else "tentative",
-                        "hits": initial_hits,
-                        "misses": 0,
-                        "vx": 0.0,
-                        "vy": 0.0,
-                        "vw": 0.0,
-                        "vh": 0.0,
-                    }
-
-                matched_ids.add(track_id)
-            except Exception as e:
-                logger.warning(f"[{camera_id}] Error processing unmatched detection: {type(e).__name__}: {e}")
-                continue
-
-        # Output selection: confirmed tracks by default; optional tentative output via config.
-        for tr in track_by_id.values():
-            if tr.get("status") == "deleted":
-                continue
-
-            is_confirmed = tr.get("status") == "confirmed"
-            is_tentative = tr.get("status") == "tentative"
-
-            if tr["id"] in matched_ids:
-                if is_confirmed or (OUTPUT_TENTATIVE_TRACKS and is_tentative):
-                    output_track_ids.add(tr["id"])
-                continue
-
-            if not is_confirmed:
-                continue
-            if int(tr.get("misses", 0)) > TRACK_MAX_MISSES:
-                continue
-            if now - tr.get("last_seen", 0.0) > TRACK_OUTPUT_HOLD_TIME:
-                continue
-            if suppress_overlapping_holds(tr, output_track_ids, track_by_id, HOLD_SUPPRESS_IOU):
-                continue
-            output_track_ids.add(tr["id"])
-
-        # Build final detections from stable track state (one bbox per track_id).
-        detections = []
-        for track_id in sorted(output_track_ids):
-            tr = track_by_id.get(track_id)
-            if not tr:
-                continue
-            is_confirmed = tr.get("status") == "confirmed"
-            # P1-1: render the smoothed track box — see select_output_bbox() docstring.
-            # measurement_bbox remains the source of truth fed to fall detection below,
-            # which needs true measurements, not the smoothed/lagged box.
-            bbox_out = select_output_bbox(tr)
-            x1, y1, x2, y2 = bbox_out
-            w_box = max(0.0, x2 - x1)
-            h_box = max(0.0, y2 - y1)
-            if w_box <= 1.0 or h_box <= 1.0:
-                continue
-            detections.append(Detection(
-                cls="person",
-                score=float(tr.get("score", 0.0)),
-                x=float(x1),
-                y=float(y1),
-                w=float(w_box),
-                h=float(h_box),
-                track_id=int(track_id),
-                stable=bool(is_confirmed),
-                degraded=False,
-            ))
-
-        detections = dedupe_output_tracks(detections, OUTPUT_DEDUPE_IOU)
-
-        if raw_dets and not detections:
-            best_score = max(det["score"] for det in raw_dets)
-            logger.warning(
-                f"[{camera_id}] YOLO raw persons={len(raw_dets)} but output detections=0 "
-                f"(best_score={best_score:.2f}, track_min_hits={TRACK_MIN_HITS}, "
-                f"output_tentative={OUTPUT_TENTATIVE_TRACKS}, "
-                f"new_track_min_confidence={NEW_TRACK_MIN_CONFIDENCE:.2f})"
-            )
-
-            # Degraded mode: if stable service-side tracking filters everything out but YOLO still
-            # sees a person, fall back to raw YOLO boxes so Nx can still render a bbox. The plugin
-            # must treat these as render-only detections, not lifecycle events.
-            fallback_detections: List[Detection] = []
-            used_track_ids: set[int] = set()
-            reuse_window_sec = max(TRACK_OUTPUT_HOLD_TIME, 0.5)
-
-            for det in sorted(raw_dets, key=lambda item: item["score"], reverse=True):
-                det_box = det["bbox"]
-                best_track_id = None
-                best_iou_score = 0.0
-
-                for tr in track_by_id.values():
-                    if tr["id"] in used_track_ids:
-                        continue
-                    if now - tr.get("last_seen", 0.0) > reuse_window_sec:
-                        continue
-
-                    overlap = iou(det_box, tr["bbox"])
-                    if overlap > best_iou_score:
-                        best_iou_score = overlap
-                        best_track_id = int(tr["id"])
-
-                if best_track_id is None or best_iou_score < 0.10:
-                    best_track_id = next_id
-                    next_id += 1
-                    track_by_id[best_track_id] = {
-                        "id": best_track_id,
-                        "bbox": det_box,
-                        "measurement_bbox": det_box,
-                        "last_seen": now,
-                        "created_at": now,
-                        "appearance": None,
-                        "score": det["score"],
-                        "status": "tentative",
-                        "hits": 1,
-                        "misses": 0,
-                        "vx": 0.0,
-                        "vy": 0.0,
-                        "vw": 0.0,
-                        "vh": 0.0,
-                    }
-                else:
-                    tr = track_by_id[best_track_id]
-                    tr["bbox"] = det_box
-                    tr["measurement_bbox"] = det_box
-                    tr["last_seen"] = now
-                    tr["score"] = det["score"]
-                    tr["misses"] = 0
-                    if tr.get("status") == "lost":
-                        tr["status"] = "tentative"
-                    track_by_id[best_track_id] = tr
-
-                used_track_ids.add(best_track_id)
-
-                x1, y1, x2, y2 = det_box
-                fallback_detections.append(Detection(
-                    cls="person",
-                    score=float(det["score"]),
-                    x=float(x1),
-                    y=float(y1),
-                    w=float(max(0.0, x2 - x1)),
-                    h=float(max(0.0, y2 - y1)),
-                    track_id=int(best_track_id),
-                    stable=False,
-                    degraded=True,
-                ))
-
-            if fallback_detections:
-                detections = fallback_detections
-                logger.warning(
-                    f"[{camera_id}] Fallback to raw YOLO detections for plugin continuity: "
-                    f"{len(detections)} person(s)"
-                )
-
-        # ============================================
-        # 3.2) Fall Detection (NEW)
-        # ============================================
-        if ENABLE_FALL_DETECTION and fall_detector:
-            try:
-                # Prepare detection data for fall detection
-                fall_input_detections = []
-                for det in detections:
-                    if not det.stable or det.degraded:
-                        continue
-                    # P1-1: use the raw YOLO measurement (measurement_bbox), not the
-                    # rendered detection box — det.x/y/w/h now reflect the smoothed
-                    # track box (see output-selection fix above), and fall-detection's
-                    # velocity/aspect-ratio math needs true measurements so smoothing
-                    # doesn't damp or lag the real fall signal.
-                    tr = track_by_id.get(det.track_id)
-                    raw_bbox = tr.get("measurement_bbox") if tr else None
-                    bbox = raw_bbox or (det.x, det.y, det.x + det.w, det.y + det.h)
-                    fall_input_detections.append({
-                        'track_id': det.track_id,
-                        'bbox': bbox,
-                        'confidence': det.score,
-                    })
-                
-                # Tier 1: bbox fall every frame
-                with camera_lock:
-                    fall_results = fall_detector.update(
-                        fall_input_detections,
-                        camera_frame_idx,
-                        pose_hints=None,
-                    )
-                    fall_stats = fall_detector.get_stats()
-
-                # Tier 2: pose on person crop only when bbox signals pending fall
-                if ENABLE_POSE_FALL and fall_input_detections:
-                    pose_candidates = fall_detector.get_pose_candidate_track_ids()
-                    if pose_candidates:
-                        pose_hints = pose_backend.match_pose_to_crops(
-                            yolo_frame,
-                            fall_input_detections,
-                            pose_candidates,
-                            conf=POSE_KEYPOINT_CONF,
-                            imgsz=POSE_IMGSZ,
-                        )
-                        if pose_hints:
-                            with camera_lock:
-                                refined = fall_detector.apply_pose_hints(pose_hints)
-                                for tid, fell in refined.items():
-                                    if fell:
-                                        fall_results[tid] = True
-                                fall_stats = fall_detector.get_stats()
-                
-                # Mark detections with fall status
-                for det in detections:
-                    det.fall_detected = fall_results.get(det.track_id, False)
-                    if det.fall_detected:
-                        logger.warning(f"[{camera_id}] FALL DETECTED: Person {det.track_id} (score={det.score:.2f})")
-
-                if fall_stats['total_fallen'] > 0:
-                    logger.info(f"[{camera_id}] Fall Status: {fall_stats['total_fallen']} person(s) fallen out of {fall_stats['total_tracked']} tracked")
-                    
-            except Exception as e:
-                error_message = f"Fall detection error: {type(e).__name__}: {e}"
-                _record_camera_infer_error(state, error_message)
-                logger.error(f"[{camera_id}] {error_message}")
-                # Fall detection errors don't stop inference, just log and continue
-
-        # ============================================
-        # 3.5) Map detections back to input frame coordinates
-        # ============================================
-        remap_detections_to_input_space(
-            detections=detections,
-            roi_box=roi_box,
-            roi_type=roi_type,
-            pre_roi_shape=pre_roi_shape,
-            undistort_crop_offset=undistort_crop_offset,
-        )
-
-        # ============================================
-        # 3.6) Face recognition — real-time identity on the bounding box
-        # Runs after remap so crop coords match the snapshot frame space.
-        # Throttled per track; identity cached for stable labels.
-        # _enable_face_recognition (global default, per-camera-overridable —
-        # see 1.7 above) gates the *entire* call, not just the recognition
-        # attempt inside it: a camera with the override off never runs face
-        # detection/bbox-refinement or queues an async recognition job for
-        # this frame, not merely "skips using the result" (P1-6).
-        # ============================================
-        if _enable_face_recognition and detections:
-            try:
-                _apply_face_identity(
-                    camera_id=camera_id,
-                    state=state,
-                    detections=detections,
-                    frame=snapshot_source_frame,
-                    camera_frame_idx=camera_frame_idx,
-                    camera_lock=camera_lock,
-                )
-            except Exception as _fe:
-                logger.warning("[%s] Face recognition error: %s", camera_id, _fe)
-
-        # ============================================
-        # 3.7) Zone check (P2.2)
-        # Runs after remap so zone geometry and detection coords
-        # are both in the full input-frame pixel space.
-        # ============================================
-        zone_violations_this_frame: list = []
-        if detections:
-            try:
-                active_zones = get_zones_for_camera_sync(camera_id)
-                if active_zones:
-                    zone_violations_this_frame = check_zones(detections, active_zones, camera_id)
-            except Exception as _ze:
-                logger.warning("[%s] Zone check error: %s", camera_id, _ze)
-
-        # ============================================
-        # 4) Anti-flicker: reuse last output if empty
-        # ============================================
-        with camera_lock:
-            if not detections and state["last_output"]:
-                time_since_last = now - state["last_time"]
-                if time_since_last < FLICKER_REUSE_TIME:
-                    logger.debug(f"[{camera_id}] Reusing last output (anti-flicker, {time_since_last*1000:.0f}ms)")
-                    detections = state["last_output"]
-            else:
-                state["last_output"] = detections
-                state["last_time"] = now
-
-            # ============================================
-            # 5) Track TTL cleanup with history buffer
-            # ============================================
-            old_count = len(state["tracks"])
-
-            active_tracks = []
-            expired_tracks = []
-            for tr in track_by_id.values():
-                if tr.get("status") == "deleted":
-                    expired_tracks.append(tr)
-                    continue
-
-                if tr.get("status") == "tentative" and int(tr.get("misses", 0)) > TENTATIVE_MAX_MISSES:
-                    tr["status"] = "deleted"
-                    expired_tracks.append(tr)
-                    continue
-
-                if now - tr.get("last_seen", 0.0) <= TRACK_TTL:
-                    active_tracks.append(tr)
-                else:
-                    expired_tracks.append(tr)
-
-            if ENABLE_HISTORY_REMATCH:
-                state["track_history"] = [tr for tr in state["track_history"] if now - tr.get("last_seen", now) <= 30.0]
-                history_candidates = [
-                    tr for tr in expired_tracks
-                    if tr.get("status") in {"confirmed", "lost"} and tr.get("appearance")
-                ]
-                state["track_history"].extend(history_candidates)
-            else:
-                state["track_history"] = []
-
-            state["tracks"] = active_tracks
-            removed = old_count - len(state["tracks"])
-            if removed > 0:
-                logger.debug(f"[{camera_id}] Removed {removed} stale tracks from active state")
-
-            state["next_id"] = next_id
-
-            # Purge cached face identity / crops for tracks that are no longer active
-            active_track_ids = {tr["id"] for tr in active_tracks}
-            identity_cache = state.get("identity")
-            if identity_cache:
-                for dead_tid in [t for t in identity_cache if t not in active_track_ids]:
-                    identity_cache.pop(dead_tid, None)
-            recent_crops_cache = state.get("recent_crops")
-            if recent_crops_cache:
-                for dead_tid in [t for t in recent_crops_cache if t not in active_track_ids]:
-                    recent_crops_cache.pop(dead_tid, None)
-
-            # ============================================
-            # 6) Count tracking with proper ID deduplication
-            # ============================================
-            # Track IDs with their last_seen timestamp to properly age out old IDs
-            if "seen_ids_with_time" not in state:
-                state["seen_ids_with_time"] = {}  # {track_id: last_seen_timestamp}
-            
-            # Add confirmed tracks with enough hits
-            stable_unique_ids = {
-                int(track_id)
-                for track_id in output_track_ids
-                if track_id in track_by_id
-                and track_by_id[track_id].get("status") == "confirmed"
-                and int(track_by_id[track_id].get("hits", 0)) >= UNIQUE_COUNT_MIN_HITS
-            }
-            
-            # Update timestamps for currently-active confirmed tracks
-            for track_id in stable_unique_ids:
-                state["seen_ids_with_time"][track_id] = now
-            
-            # Expire old IDs that haven't been seen recently (older than TRACK_TTL + grace period)
-            # Grace period allows re-detection of same person after brief exit
-            id_expiry_threshold = TRACK_TTL + 30.0  # Keep IDs for up to 45s after last detection
-            expired_ids = [
-                vid for vid, last_seen in state["seen_ids_with_time"].items()
-                if now - last_seen > id_expiry_threshold
-            ]
-            for vid in expired_ids:
-                del state["seen_ids_with_time"][vid]
-            
-            # Maintain backward compatibility with seen_ids set for any external code
-            state["seen_ids"] = set(state["seen_ids_with_time"].keys())
-
-            # S P1.3: track which IDs have already been reported to the outbox
-            _reported_ids: set = state.setdefault("outbox_reported_ids", set())
-            new_outbox_ids: set = stable_unique_ids - _reported_ids
-            _reported_ids.update(stable_unique_ids)
-
-            tracks_count = len(state["tracks"])
-            unique_count = len(state["seen_ids"])
-
-        total_infer_ms = (time.perf_counter() - request_started_at) * 1000.0
-        metrics_snapshot = record_camera_metrics(
-            state,
-            infer_ms=total_infer_ms,
-            decode_ms=decode_time_ms,
-            preprocess_ms=preprocess_time_ms,
-            yolo_ms=yolo_time_ms,
-            track_count=tracks_count,
-        )
-
-        # Prometheus observations (success path)
-        INFER_REQUESTS.labels(camera_id=camera_id, status="success").inc()
-        INFER_LATENCY.labels(camera_id=camera_id).observe(total_infer_ms / 1000.0)
-        DECODE_LATENCY.labels(camera_id=camera_id).observe(decode_time_ms / 1000.0)
-        PREPROCESS_LATENCY.labels(camera_id=camera_id).observe(preprocess_time_ms / 1000.0)
-        YOLO_LATENCY.labels(camera_id=camera_id).observe(yolo_time_ms / 1000.0)
-        DETECTIONS_PER_FRAME.labels(camera_id=camera_id).observe(float(len(detections)))
-        ACTIVE_TRACKS.labels(camera_id=camera_id).set(float(tracks_count))
-
-        if camera_request_count == 1 or camera_request_count % METRICS_LOG_INTERVAL == 0:
-            logger.info(
-                f"[{camera_id}] Summary: detections={len(detections)} "
-                f"tracks={tracks_count} unique={unique_count} "
-                f"infer_ms={total_infer_ms:.1f} decode_ms={decode_time_ms:.1f} "
-                f"preprocess_ms={preprocess_time_ms:.1f} yolo_ms={yolo_time_ms:.1f} "
-                f"p50_ms={metrics_snapshot['p50_inference_ms']:.1f} "
-                f"p95_ms={metrics_snapshot['p95_inference_ms']:.1f} "
-                f"errors={metrics_snapshot['error_count']}"
-            )
-
-        # ── S P1.3: non-blocking outbox enqueue ──────────────────────────────
-        _now_utc = datetime.now(tz=timezone.utc)
-
-        fall_dets = [d for d in detections if d.fall_detected]
-        has_new_detections = any(d.track_id in new_outbox_ids for d in detections)
-        needs_snapshot = bool(fall_dets or zone_violations_this_frame or has_new_detections)
-
-        # Encode the event snapshot JPEG at most once per frame, only when an event fires.
-        _snap_jpeg: Optional[bytes] = None
-        if needs_snapshot:
-            try:
-                ok, _snap_buf = cv2.imencode(
-                    ".jpg", snapshot_source_frame, [cv2.IMWRITE_JPEG_QUALITY, 75]
-                )
-                if ok:
-                    _snap_jpeg = bytes(_snap_buf)
-            except Exception as _enc_exc:
-                logger.debug("[%s] Snapshot encode failed: %s", camera_id, _enc_exc)
-
-        def _det_person_fields(det: "Detection") -> dict:
-            return {
-                "person_id": det.person_id,
-                "person_name": det.person_name,
-            }
-
-        # Fall events — always carry a snapshot
-        for _det in fall_dets:
-            outbox_worker.enqueue_event(OutboxEvent(
-                camera_id=camera_id,
-                event_type="fall",
-                occurred_at=_now_utc,
-                track_id=_det.track_id,
-                cls=_det.cls,
-                confidence=_det.score,
-                bbox_x=_det.x,
-                bbox_y=_det.y,
-                bbox_w=_det.w,
-                bbox_h=_det.h,
-                snapshot_jpeg=_snap_jpeg,
-                **_det_person_fields(_det),
-            ))
-
-        # New confirmed-track events — first appearance, now with a snapshot for review/enrollment
-        for _det in detections:
-            if _det.track_id in new_outbox_ids:
-                outbox_worker.enqueue_event(OutboxEvent(
-                    camera_id=camera_id,
-                    event_type="detection",
-                    occurred_at=_now_utc,
-                    track_id=_det.track_id,
-                    cls=_det.cls,
-                    confidence=_det.score,
-                    bbox_x=_det.x,
-                    bbox_y=_det.y,
-                    bbox_w=_det.w,
-                    bbox_h=_det.h,
-                    snapshot_jpeg=_snap_jpeg,
-                    **_det_person_fields(_det),
-                ))
-
-        # Zone violation events (P2.2) — one event per violation per entry, now with a snapshot
-        for _zv in zone_violations_this_frame:
-            _zv_det = next((d for d in detections if d.track_id == _zv.track_id), None)
-            outbox_worker.enqueue_event(OutboxEvent(
-                camera_id=camera_id,
-                event_type="zone_violation",
-                occurred_at=_now_utc,
-                track_id=_zv.track_id,
-                cls="person",
-                confidence=_zv_det.score if _zv_det else 0.0,
-                bbox_x=_zv_det.x if _zv_det else 0.0,
-                bbox_y=_zv_det.y if _zv_det else 0.0,
-                bbox_w=_zv_det.w if _zv_det else 0.0,
-                bbox_h=_zv_det.h if _zv_det else 0.0,
-                zone_id=_zv.zone_id,
-                snapshot_jpeg=_snap_jpeg,
-                **(_det_person_fields(_zv_det) if _zv_det else {}),
-            ))
-
-        return detections
-
+        for stage in PIPELINE_STAGES:
+            stage.run(ctx)
+            if ctx.stopped:
+                return ctx.result
+        return ctx.detections
     except Exception as e:
         error_message = f"Unexpected error in {route_label}: {type(e).__name__}: {e}"
         _record_camera_infer_error(state, error_message)
@@ -1725,6 +818,7 @@ def _run_person_detection_pipeline(
         INFER_REQUESTS.labels(camera_id=camera_id, status="error").inc()
         INFER_ERRORS.labels(camera_id=camera_id, kind="unknown").inc()
         return []
+
 
 
 @app.post("/infer", response_model=List[Detection])
