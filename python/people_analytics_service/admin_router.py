@@ -21,8 +21,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .config import API_KEY, API_KEY_REQUIRED, normalize_camera_id
-from .db import get_session
-from .db import dal
+from .db import get_session, get_repository
 from .config import logger
 from .person_age import effective_age, parse_date_of_birth
 from .zone_engine import invalidate_zone_cache
@@ -344,7 +343,8 @@ async def list_persons(
 ):
     _require_db()
     async with get_session() as session:
-        persons = await dal.list_persons(session, status=status, limit=limit)
+        repo = get_repository()
+        persons = await repo.list_persons(session, status=status, limit=limit)
     return [ _person_to_out(p) for p in persons ]
 
 
@@ -353,7 +353,8 @@ async def create_person(body: PersonCreate):
     _require_db()
     payload = _prepare_person_write(body.model_dump())
     async with get_session() as session:
-        person = await dal.create_person(session, **payload)
+        repo = get_repository()
+        person = await repo.create_person(session, **payload)
         out = _person_to_out(person)
         await session.commit()
     logger.info(f"[admin] Created person id={out.id} name={out.name!r}")
@@ -364,7 +365,8 @@ async def create_person(body: PersonCreate):
 async def get_person(person_id: uuid.UUID):
     _require_db()
     async with get_session() as session:
-        person = await dal.get_person(session, person_id)
+        repo = get_repository()
+        person = await repo.get_person(session, person_id)
     if person is None:
         raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
     return _person_to_out(person)
@@ -378,7 +380,8 @@ async def update_person(person_id: uuid.UUID, body: PersonUpdate):
         raise HTTPException(status_code=422, detail="No fields provided for update")
     payload = _prepare_person_write(raw)
     async with get_session() as session:
-        person = await dal.update_person(session, person_id, **payload)
+        repo = get_repository()
+        person = await repo.update_person(session, person_id, **payload)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
         out = _person_to_out(person)
@@ -391,7 +394,8 @@ async def update_person(person_id: uuid.UUID, body: PersonUpdate):
 async def delete_person(person_id: uuid.UUID):
     _require_db()
     async with get_session() as session:
-        deleted = await dal.delete_person(session, person_id)
+        repo = get_repository()
+        deleted = await repo.delete_person(session, person_id)
         if not deleted:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
         await session.commit()
@@ -422,10 +426,11 @@ async def get_person_history(
     if camera_id is not None:
         camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
-        person = await dal.get_person(session, person_id)
+        repo = get_repository()
+        person = await repo.get_person(session, person_id)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-        events = await dal.list_events(
+        events = await repo.list_events(
             session,
             person_id=person_id,
             event_type=event_type,
@@ -452,7 +457,8 @@ async def list_zones(
     if camera_id is not None:
         camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
-        zones = await dal.list_zones(session, camera_id=camera_id, active_only=active_only)
+        repo = get_repository()
+        zones = await repo.list_zones(session, camera_id=camera_id, active_only=active_only)
     return [ZoneOut.model_validate(z) for z in zones]
 
 
@@ -462,7 +468,8 @@ async def create_zone(body: ZoneCreate):
     payload = body.model_dump()
     payload["camera_id"] = normalize_camera_id(payload["camera_id"])
     async with get_session() as session:
-        zone = await dal.create_zone(session, **payload)
+        repo = get_repository()
+        zone = await repo.create_zone(session, **payload)
         out = ZoneOut.model_validate(zone)
         await session.commit()
     invalidate_zone_cache(out.camera_id)
@@ -474,7 +481,8 @@ async def create_zone(body: ZoneCreate):
 async def get_zone(zone_id: uuid.UUID):
     _require_db()
     async with get_session() as session:
-        zone = await dal.get_zone(session, zone_id)
+        repo = get_repository()
+        zone = await repo.get_zone(session, zone_id)
     if zone is None:
         raise HTTPException(status_code=404, detail=f"Zone {zone_id} not found")
     return ZoneOut.model_validate(zone)
@@ -487,7 +495,8 @@ async def update_zone(zone_id: uuid.UUID, body: ZoneUpdate):
     if not payload:
         raise HTTPException(status_code=422, detail="No fields provided for update")
     async with get_session() as session:
-        zone = await dal.update_zone(session, zone_id, **payload)
+        repo = get_repository()
+        zone = await repo.update_zone(session, zone_id, **payload)
         if zone is None:
             raise HTTPException(status_code=404, detail=f"Zone {zone_id} not found")
         out = ZoneOut.model_validate(zone)
@@ -501,7 +510,8 @@ async def update_zone(zone_id: uuid.UUID, body: ZoneUpdate):
 async def delete_zone(zone_id: uuid.UUID):
     _require_db()
     async with get_session() as session:
-        zone = await dal.delete_zone(session, zone_id)
+        repo = get_repository()
+        zone = await repo.delete_zone(session, zone_id)
         if zone is None:
             raise HTTPException(status_code=404, detail=f"Zone {zone_id} not found")
         camera_id = normalize_camera_id(zone.camera_id)
@@ -533,7 +543,8 @@ async def list_events(
     if camera_id is not None:
         camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
-        events = await dal.list_events(
+        repo = get_repository()
+        events = await repo.list_events(
             session,
             camera_id=camera_id,
             event_type=event_type,
@@ -552,7 +563,8 @@ async def list_events(
 async def get_event(event_id: str):
     _require_db()
     async with get_session() as session:
-        event = await dal.get_event_by_event_id(session, event_id)
+        repo = get_repository()
+        event = await repo.get_event_by_event_id(session, event_id)
     if event is None:
         raise HTTPException(status_code=404, detail=f"Event '{event_id}' not found")
     return EventOut.model_validate(event)
@@ -572,11 +584,12 @@ async def link_event_to_person(event_uuid: uuid.UUID, body: LinkPersonBody):
     """
     _require_db()
     async with get_session() as session:
+        repo = get_repository()
         # Verify person exists
-        person = await dal.get_person(session, body.person_id)
+        person = await repo.get_person(session, body.person_id)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {body.person_id} not found")
-        event = await dal.link_event_to_person(session, event_uuid, body.person_id)
+        event = await repo.link_event_to_person(session, event_uuid, body.person_id)
         if event is None:
             raise HTTPException(status_code=404, detail=f"Event {event_uuid} not found")
         out = EventOut.model_validate(event)
@@ -680,7 +693,8 @@ async def get_camera_config(camera_id: str):
     # reads back, regardless of which form was used at either call site.
     camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
-        cfg = await dal.get_camera_config(session, camera_id)
+        repo = get_repository()
+        cfg = await repo.get_camera_config(session, camera_id)
     if cfg is None:
         raise HTTPException(status_code=404, detail=f"No config found for camera '{camera_id}'")
     return CameraConfigOut.model_validate(cfg)
@@ -696,7 +710,8 @@ async def upsert_camera_config(camera_id: str, body: CameraConfigUpsert):
     camera_id = normalize_camera_id(camera_id)
     payload = {k: v for k, v in body.model_dump().items() if v is not None}
     async with get_session() as session:
-        cfg = await dal.upsert_camera_config(session, camera_id=camera_id, **payload)
+        repo = get_repository()
+        cfg = await repo.upsert_camera_config(session, camera_id=camera_id, **payload)
         out = CameraConfigOut.model_validate(cfg)
         await session.commit()
     invalidate_config_cache(camera_id)
@@ -709,7 +724,8 @@ async def delete_camera_config(camera_id: str):
     _require_db()
     camera_id = normalize_camera_id(camera_id)
     async with get_session() as session:
-        deleted = await dal.delete_camera_config(session, camera_id=camera_id)
+        repo = get_repository()
+        deleted = await repo.delete_camera_config(session, camera_id=camera_id)
     invalidate_config_cache(camera_id)
     if deleted == 0:
         raise HTTPException(status_code=404, detail=f"No config found for camera '{camera_id}'")
@@ -730,10 +746,11 @@ async def list_embeddings(person_id: uuid.UUID):
     """
     _require_db()
     async with get_session() as session:
-        person = await dal.get_person(session, person_id)
+        repo = get_repository()
+        person = await repo.get_person(session, person_id)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
-        embs = await dal.list_person_embeddings(session, person_id)
+        embs = await repo.list_person_embeddings(session, person_id)
     return [EmbeddingOut.model_validate(e) for e in embs]
 
 
@@ -753,7 +770,8 @@ async def enroll_from_image(person_id: uuid.UUID, body: EnrollFromImageBody):
     """
     _require_db()
     async with get_session() as session:
-        person = await dal.get_person(session, person_id)
+        repo = get_repository()
+        person = await repo.get_person(session, person_id)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
 
@@ -790,7 +808,8 @@ async def enroll_from_image(person_id: uuid.UUID, body: EnrollFromImageBody):
         raise HTTPException(status_code=422, detail=str(exc))
 
     async with get_session() as session:
-        emb = await dal.get_person_embedding(session, emb_id)
+        repo = get_repository()
+        emb = await repo.get_person_embedding(session, emb_id)
     logger.info(f"[admin] Enrolled embedding id={emb_id} for person={person_id}")
     return EmbeddingOut.model_validate(emb)
 
@@ -810,7 +829,8 @@ async def enroll_face_batch(person_id: uuid.UUID, body: EnrollFaceBatchBody):
     """
     _require_db()
     async with get_session() as session:
-        person = await dal.get_person(session, person_id)
+        repo = get_repository()
+        person = await repo.get_person(session, person_id)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
 
@@ -876,7 +896,8 @@ async def enroll_from_event(person_id: uuid.UUID, event_uuid: uuid.UUID):
     """
     _require_db()
     async with get_session() as session:
-        person = await dal.get_person(session, person_id)
+        repo = get_repository()
+        person = await repo.get_person(session, person_id)
         if person is None:
             raise HTTPException(status_code=404, detail=f"Person {person_id} not found")
 
@@ -888,7 +909,8 @@ async def enroll_from_event(person_id: uuid.UUID, event_uuid: uuid.UUID):
         raise HTTPException(status_code=422, detail=str(exc))
 
     async with get_session() as session:
-        emb = await dal.get_person_embedding(session, emb_id)
+        repo = get_repository()
+        emb = await repo.get_person_embedding(session, emb_id)
     logger.info(f"[admin] Enrolled embedding from event={event_uuid} for person={person_id}")
     return EmbeddingOut.model_validate(emb)
 
@@ -901,10 +923,11 @@ async def enroll_from_event(person_id: uuid.UUID, event_uuid: uuid.UUID):
 async def delete_embedding(person_id: uuid.UUID, emb_id: uuid.UUID):
     _require_db()
     async with get_session() as session:
-        emb = await dal.get_person_embedding(session, emb_id)
+        repo = get_repository()
+        emb = await repo.get_person_embedding(session, emb_id)
         if emb is None or emb.person_id != person_id:
             raise HTTPException(status_code=404, detail=f"Embedding {emb_id} not found for person {person_id}")
-        await dal.delete_person_embedding(session, emb_id)
+        await repo.delete_person_embedding(session, emb_id)
         await session.commit()
     logger.info(f"[admin] Deleted embedding id={emb_id} for person={person_id}")
 
@@ -976,7 +999,8 @@ async def event_snapshot(event_uuid: uuid.UUID):
 
     _require_db()
     async with get_session() as session:
-        event = await dal.get_event(session, event_uuid)
+        repo = get_repository()
+        event = await repo.get_event(session, event_uuid)
     if event is None:
         raise HTTPException(status_code=404, detail="Event not found")
     payload = event.payload or {}
@@ -1051,8 +1075,9 @@ async def enroll_from_track(body: EnrollFromTrackBody):
 
     created_person = False
     async with get_session() as session:
+        repo = get_repository()
         if body.person_id is not None:
-            person = await dal.get_person(session, body.person_id)
+            person = await repo.get_person(session, body.person_id)
             if person is None:
                 raise HTTPException(status_code=404, detail=f"Person {body.person_id} not found")
         else:
@@ -1064,7 +1089,7 @@ async def enroll_from_track(body: EnrollFromTrackBody):
                 "notes": body.notes,
                 "status": "active",
             })
-            person = await dal.create_person(session, **create_payload)
+            person = await repo.create_person(session, **create_payload)
             created_person = True
         person_pk = person.id
         person_name = person.name
@@ -1120,7 +1145,8 @@ async def reid_match(body: ReidMatchBody):
 
     person_id, score = result
     async with get_session() as session:
-        person = await dal.get_person(session, person_id)
+        repo = get_repository()
+        person = await repo.get_person(session, person_id)
     return ReidMatchResult(
         matched=True,
         person_id=person_id,
@@ -1181,7 +1207,8 @@ async def analytics_summary():
     """
     _require_db()
     async with get_session() as session:
-        return await dal.get_analytics_summary(session)
+        repo = get_repository()
+        return await repo.get_analytics_summary(session)
 
 
 @router.get(
@@ -1205,7 +1232,8 @@ async def analytics_timeseries(
     """
     _require_db()
     async with get_session() as session:
-        return await dal.get_events_timeseries(
+        repo = get_repository()
+        return await repo.get_events_timeseries(
             session,
             granularity=granularity,
             days_back=days_back,
@@ -1226,7 +1254,8 @@ async def analytics_cameras():
     """
     _require_db()
     async with get_session() as session:
-        return await dal.get_camera_analytics(session)
+        repo = get_repository()
+        return await repo.get_camera_analytics(session)
 
 
 @router.get(
@@ -1238,7 +1267,8 @@ async def analytics_zones():
     """Return violation counts and last-violation timestamps for every zone."""
     _require_db()
     async with get_session() as session:
-        return await dal.get_zone_analytics(session)
+        repo = get_repository()
+        return await repo.get_zone_analytics(session)
 
 
 @router.get(
@@ -1250,4 +1280,5 @@ async def analytics_alerts():
     """Return alert counts broken down by delivery status and channel."""
     _require_db()
     async with get_session() as session:
-        return await dal.get_alert_analytics(session)
+        repo = get_repository()
+        return await repo.get_alert_analytics(session)
