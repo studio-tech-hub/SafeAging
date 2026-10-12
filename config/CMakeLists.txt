@@ -221,14 +221,6 @@ file(GLOB_RECURSE OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC
 
 add_library(yolo26_people_analytics_plugin SHARED
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC})
-# /Od (MSVC) disables optimizations on the tracker to ease debugging; GCC/Clang
-# use -O0 automatically in Debug builds so no equivalent flag is needed there.
-if(MSVC)
-    set_source_files_properties(
-        ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}/object_tracker.cpp
-        PROPERTIES COMPILE_FLAGS "/Od"
-    )
-endif()
 target_include_directories(yolo26_people_analytics_plugin PRIVATE
     ${OPENCV_OBJECT_DETECTION_ANALYTICS_PLUGIN_SRC_DIR}
     ${PROJECT_ROOT}/3rd_party
@@ -238,7 +230,10 @@ target_link_libraries(yolo26_people_analytics_plugin
     nx_kit
     nx_sdk
     opencv::core opencv::flann opencv::imgproc opencv::imgcodecs opencv::ml 
-    opencv::plot opencv::opencv_features2d opencv::opencv_calib3d opencv::datasets opencv::video opencv::tracking
+    opencv::plot opencv::opencv_features2d opencv::opencv_calib3d opencv::datasets opencv::video
+    # P2-4: opencv::tracking dropped — it was only needed by the now-removed
+    # legacy ObjectTracker (cv::detail::tracking::tbm::ITrackerByMatching);
+    # nothing else in this plugin uses the OpenCV tracking module.
 )
 
 if (WIN32)

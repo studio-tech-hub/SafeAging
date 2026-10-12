@@ -28,7 +28,6 @@
 #include "frame.h"
 #include "multipart_binary_transport.h"
 #include "object_detector.h"
-#include "object_tracker.h"
 #include "transport_client.h"
 
 namespace sample_company {
@@ -82,8 +81,6 @@ protected:
     virtual nx::sdk::Result<const nx::sdk::ISettingsResponse*> settingsReceived() override;
 
 private:
-    void reinitializeObjectTrackerOnFrameSizeChanges(const Frame& frame);
-
     nx::sdk::Ptr<nx::sdk::analytics::ObjectMetadataPacket> detectionsToObjectMetadataPacket(
         const DetectionList& detections,
         int64_t timestampUs);
@@ -91,9 +88,6 @@ private:
     MetadataPacketList eventsToEventMetadataPacketList(
         const EventList& events,
         int64_t timestampUs);
-
-    MetadataPacketList processFrame(
-        const nx::sdk::analytics::IUncompressedVideoFrame* videoFrame);
 
     void workerThreadRun();
     // outEncodedWidth/outEncodedHeight (P1-4), when non-null, receive the actual
@@ -177,11 +171,7 @@ private:
     const std::unique_ptr<MultipartBinaryTransport> m_multipartBinaryTransport;
     std::atomic<ITransportClient*> m_activeTransport{nullptr};
 
-    std::unique_ptr<ObjectTracker> m_objectTracker;
     int m_frameIndex = 0;
-
-    int m_previousFrameWidth = 0;
-    int m_previousFrameHeight = 0;
 
     int m_currentPersons = 0;
     std::set<nx::sdk::Uuid> m_seenPersonIds;

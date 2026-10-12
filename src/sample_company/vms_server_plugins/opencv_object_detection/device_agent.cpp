@@ -293,7 +293,6 @@ namespace sample_company
                   m_jsonBase64Transport(std::make_unique<JsonBase64Transport>(*m_objectDetector)),
                   m_multipartBinaryTransport(std::make_unique<MultipartBinaryTransport>()),
                   m_activeTransport(m_jsonBase64Transport.get()), //< default transport; see settingsReceived()
-                  m_objectTracker(std::make_unique<ObjectTracker>()),
                   m_workerThread(&DeviceAgent::workerThreadRun, this),
                   m_workerShouldStop(false),
                   m_healthPollThread(&DeviceAgent::healthPollThreadRun, this), // P P1.1
@@ -2102,132 +2101,16 @@ namespace sample_company
                 objectMetadataPacket->setTimestampUs(timestampUs);
                 return objectMetadataPacket;
             }
-            void DeviceAgent::reinitializeObjectTrackerOnFrameSizeChanges(const Frame &frame)
-            {
-                const bool frameSizeUnset = m_previousFrameWidth == 0 && m_previousFrameHeight == 0;
-                if (frameSizeUnset)
-                {
-                    m_previousFrameWidth = frame.width;
-                    m_previousFrameHeight = frame.height;
-                    return;
-                }
 
-                const bool frameSizeChanged =
-                    frame.width != m_previousFrameWidth ||
-                    frame.height != m_previousFrameHeight;
-
-                if (frameSizeChanged)
-                {
-                    m_objectTracker = std::make_unique<ObjectTracker>();
-                    m_previousFrameWidth = frame.width;
-                    m_previousFrameHeight = frame.height;
-                }
-            }
-
-            // ── Legacy synchronous path ──────────────────────────────────────────────
-            // NOT called during normal operation. The active path is:
-            //   pushUncompressedVideoFrame() → worker queue → processFrameJob()
-            // This method is kept to satisfy the ConsumingDeviceAgent interface but
-            // is never invoked because doSetNeededMetadataTypes() always succeeds.
-            //
-            // The local m_objectTracker call below is intentionally isolated here.
-            // The authoritative track_id comes from the Python service (via
-            // processFrameJob). Do NOT call m_objectTracker from the worker path.
-            // TODO P2: Remove this method and m_objectTracker entirely once
-            //          ConsumingDeviceAgent no longer requires it.
-            DeviceAgent::MetadataPacketList DeviceAgent::processFrame(
-                const IUncompressedVideoFrame *videoFrame)
-            {
-                if (m_frameIndex % 200 == 0)
-                {
-                    logutil::log(
-                        logutil::Level::debug,
-                        "processFrame pixelFormat=" + std::to_string((int)videoFrame->pixelFormat()) +
-                            " w=" + std::to_string(videoFrame->width()) +
-                            " h=" + std::to_string(videoFrame->height()) +
-                            " lineSize0=" + std::to_string(videoFrame->lineSize(0)));
-                }
-
-                try
-                {
-                    Frame frame(videoFrame, m_frameIndex);
-                    reinitializeObjectTrackerOnFrameSizeChanges(frame);
-
-                    logutil::logThrottled(
-                        logutil::Level::warn,
-                        "device_agent.process_frame.legacy_path",
-                        std::chrono::seconds(30),
-                        "Legacy processFrame path invoked — this should not happen in normal operation");
-
-                    // Local tracker used only here; Python service is authoritative.
-                    int encodedWidth = 0;
-                    int encodedHeight = 0;
-                    std::vector<uint8_t> jpegBytes =
-                        encodeFrameToJpeg(frame, 640, &encodedWidth, &encodedHeight);
-                    ITransportClient* const transport =
-                        m_activeTransport.load(std::memory_order_relaxed);
-                    DetectionList detections =
-                        transport->sendFrame(m_cameraId, jpegBytes, encodedWidth, encodedHeight);
-                    const auto trackingResult = m_objectTracker->run(frame, detections);
-
-                    const auto &objectMetadataPacket =
-                        detectionsToObjectMetadataPacket(trackingResult.detections, frame.timestampUs);
-
-                    const auto &eventMetadataPacketList =
-                        eventsToEventMetadataPacketList(trackingResult.events, frame.timestampUs);
-
-                    MetadataPacketList result;
-                    if (objectMetadataPacket)
-                        result.push_back(objectMetadataPacket);
-
-                    result.insert(
-                        result.end(),
-                        std::make_move_iterator(eventMetadataPacketList.begin()),
-                        std::make_move_iterator(eventMetadataPacketList.end()));
-
-                    return result;
-                }
-                catch (const ObjectDetectionError &e)
-                {
-                    // Log error nhưng KHÔNG terminate plugin
-                    // Plugin sẽ tiếp tục chạy và retry lần sau
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::error,
-                        "Object detection failed - will retry next frame",
-                        e.what());
-                }
-                catch (const ObjectTrackingError &e)
-                {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::error,
-                        "Object tracking error - will retry next frame",
-                        e.what());
-                }
-                catch (const std::runtime_error &e)
-                {
-                    // Frame constructor throws std::runtime_error for unsupported pixel format
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::error,
-                        "Frame conversion error (unsupported pixel format or OpenCV error) - skipping frame",
-                        e.what());
-                }
-                catch (const std::exception &e)
-                {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::error,
-                        "Unexpected error in frame processing",
-                        (std::string("Type: ") + typeid(e).name() + " Message: " + e.what()).c_str());
-                }
-                catch (...)
-                {
-                    pushPluginDiagnosticEvent(
-                        nx::sdk::IPluginDiagnosticEvent::Level::error,
-                        "Unknown exception in frame processing",
-                        "catch(...) - Unable to determine exception type");
-                }
-
-                return {};
-            }
+            // P2-4: removed the legacy ObjectTracker-backed processFrame() synchronous
+            // path (and reinitializeObjectTrackerOnFrameSizeChanges()) that used to
+            // live here. It was a private, non-virtual helper with zero call sites
+            // anywhere in this codebase (confirmed by repo-wide search before
+            // removal) — the real, active path has always been
+            // pushUncompressedVideoFrame() -> worker queue -> processFrameJob(),
+            // which never touched ObjectTracker. See the P2-4 commit for the full
+            // verification writeup and object_tracker.{h,cpp} /
+            // object_tracker_utils.{h,cpp} removal.
 
         } // namespace opencv_object_detection
     } // namespace vms_server_plugins

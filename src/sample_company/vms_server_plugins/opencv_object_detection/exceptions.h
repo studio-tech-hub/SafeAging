@@ -23,15 +23,11 @@ class ObjectDetectorIsTerminatedError: public ObjectDetectorError
 class ObjectDetectionError: public ObjectDetectorError
     { using ObjectDetectorError::ObjectDetectorError; };
 
-class ObjectTrackerError: public Error { using Error::Error; };
-
-class ObjectTrackingError: public ObjectTrackerError
-    { using ObjectTrackerError::ObjectTrackerError; };
-
-inline std::string cvExceptionToStdString(const cv::Exception& e)
-{
-    return "OpenCV error: " + e.err + " (error code: " + std::to_string(e.code) + ")";
-}
+// P2-4: ObjectTrackerError / ObjectTrackingError, and the cvExceptionToStdString()
+// helper they used for formatting, removed along with the legacy ObjectTracker
+// they existed solely to support (object_tracker.cpp was their only call/throw
+// site; device_agent.cpp's catch(const ObjectTrackingError&) was their only
+// catch site, removed in the same change) — see the P2-4 commit.
 
 } // namespace opencv_object_detection
 } // namespace vms_server_plugins
