@@ -12,27 +12,9 @@ outer try/except in api.py, exactly as it did inline.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
-from ...config import (
-    BBOX_SMOOTHING,
-    ENABLE_HISTORY_REMATCH,
-    ENABLE_POST_NMS,
-    HOLD_SUPPRESS_IOU,
-    MATCH_IOU_THRESHOLD,
-    MIN_DETECTION_AREA,
-    NEW_TRACK_MIN_CONFIDENCE,
-    OUTPUT_DEDUPE_IOU,
-    OUTPUT_TENTATIVE_TRACKS,
-    PERSON_MIN_HW_RATIO,
-    POST_NMS_IOU,
-    TENTATIVE_MAX_MISSES,
-    TRACK_DUPLICATE_IOU,
-    TRACK_MAX_MISSES,
-    TRACK_MIN_HITS,
-    TRACK_OUTPUT_HOLD_TIME,
-    logger,
-)
+from ...config import logger
 from ...tracking import (
     appearance_distance,
     dedupe_output_tracks,
@@ -48,9 +30,13 @@ from ...tracking import (
 )
 from .base import Stage
 
+if TYPE_CHECKING:
+    from ...config import AppConfig
+    from ..context import InferContext
+
 
 class TrackStage(Stage):
-    def run(self, ctx) -> None:
+    def run(self, ctx: "InferContext", config: "AppConfig") -> None:
         from ... import api as _api  # Detection model lives in api.py
 
         Detection = _api.Detection
@@ -81,7 +67,7 @@ class TrackStage(Stage):
         track_by_id: Dict[int, Dict[str, Any]] = {tr["id"]: tr for tr in tracks}
         for tr in track_by_id.values():
             tr.setdefault("status", "confirmed")
-            tr.setdefault("hits", TRACK_MIN_HITS)
+            tr.setdefault("hits", config.track_min_hits)
             tr.setdefault("misses", 0)
             tr.setdefault("vx", 0.0)
             tr.setdefault("vy", 0.0)
@@ -118,8 +104,8 @@ class TrackStage(Stage):
                 hw_ratio = h_box / max(1.0, w_box)
 
                 # Filter by minimum area
-                if w_box <= 1.0 or h_box <= 1.0 or area < MIN_DETECTION_AREA:
-                    logger.debug(f"[{camera_id}] Skipping small detection: {w_box:.1f}x{h_box:.1f} (area={area:.0f} < {MIN_DETECTION_AREA})")
+                if w_box <= 1.0 or h_box <= 1.0 or area < config.min_detection_area:
+                    logger.debug(f"[{camera_id}] Skipping small detection: {w_box:.1f}x{h_box:.1f} (area={area:.0f} < {config.min_detection_area})")
                     continue
 
                 det_box = (x1, y1, x2, y2)
@@ -130,11 +116,11 @@ class TrackStage(Stage):
                 # track is far more likely that same person now lying down
                 # (a fall) than furniture, so the filter must never drop a
                 # person mid-track (P1-2).
-                if hw_ratio < PERSON_MIN_HW_RATIO:
-                    if not overlaps_confirmed_track(det_box, track_by_id, MATCH_IOU_THRESHOLD):
+                if hw_ratio < config.person_min_hw_ratio:
+                    if not overlaps_confirmed_track(det_box, track_by_id, config.match_iou_threshold):
                         logger.debug(
                             f"[{camera_id}] Skipping wide person-like detection: "
-                            f"{w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f} < {PERSON_MIN_HW_RATIO:.2f}"
+                            f"{w_box:.1f}x{h_box:.1f} ratio={hw_ratio:.2f} < {config.person_min_hw_ratio:.2f}"
                         )
                         continue
                     logger.debug(
@@ -148,8 +134,8 @@ class TrackStage(Stage):
                 continue
 
         # Extra dedupe to avoid overlapping boxes for the same person
-        if ENABLE_POST_NMS and len(raw_dets) > 1:
-            raw_dets = post_nms_dedupe(raw_dets, POST_NMS_IOU)
+        if config.enable_post_nms and len(raw_dets) > 1:
+            raw_dets = post_nms_dedupe(raw_dets, config.post_nms_iou)
 
         matched_ids = set()
         output_track_ids = set()
@@ -169,8 +155,8 @@ class TrackStage(Stage):
 
             prev_bbox = tr.get("bbox", det_box)
             prev_measurement_bbox = tr.get("measurement_bbox", prev_bbox)
-            if BBOX_SMOOTHING > 0.0 and tr.get("bbox"):
-                tr["bbox"] = smooth_bbox(prev_bbox, det_box, BBOX_SMOOTHING)
+            if config.bbox_smoothing > 0.0 and tr.get("bbox"):
+                tr["bbox"] = smooth_bbox(prev_bbox, det_box, config.bbox_smoothing)
             else:
                 tr["bbox"] = det_box
 
@@ -186,7 +172,7 @@ class TrackStage(Stage):
             tr["score"] = score
             tr["misses"] = 0
             tr["hits"] = int(tr.get("hits", 0)) + 1
-            if tr["status"] != "confirmed" and tr["hits"] >= TRACK_MIN_HITS:
+            if tr["status"] != "confirmed" and tr["hits"] >= config.track_min_hits:
                 tr["status"] = "confirmed"
             elif tr["status"] == "lost":
                 tr["status"] = "confirmed"
@@ -199,7 +185,7 @@ class TrackStage(Stage):
                 continue
             tr["misses"] = int(tr.get("misses", 0)) + 1
             if tr.get("status") == "tentative":
-                if tr["misses"] > TENTATIVE_MAX_MISSES:
+                if tr["misses"] > config.tentative_max_misses:
                     tr["status"] = "deleted"
             else:
                 tr["status"] = "lost"
@@ -214,7 +200,7 @@ class TrackStage(Stage):
                 track_id = None
 
                 # Optional history rematch: appearance-only for returning person.
-                if ENABLE_HISTORY_REMATCH and track_history_snapshot and det_appearance.get("color_hist") is not None:
+                if config.enable_history_rematch and track_history_snapshot and det_appearance.get("color_hist") is not None:
                     best_hist_score = -1.0
                     best_hist = None
                     for hist_tr in track_history_snapshot:
@@ -238,7 +224,7 @@ class TrackStage(Stage):
                             "appearance": det_appearance,
                             "score": score,
                             "status": "confirmed",
-                            "hits": max(TRACK_MIN_HITS, int(best_hist.get("hits", TRACK_MIN_HITS))),
+                            "hits": max(config.track_min_hits, int(best_hist.get("hits", config.track_min_hits))),
                             "misses": 0,
                             "vx": 0.0,
                             "vy": 0.0,
@@ -248,15 +234,15 @@ class TrackStage(Stage):
                         logger.debug(f"[{camera_id}] Re-matched track ID={track_id} from history")
 
                 if track_id is None:
-                    if score < NEW_TRACK_MIN_CONFIDENCE:
+                    if score < config.new_track_min_confidence:
                         continue
 
                     if has_duplicate_track_overlap(
                         det_box=det_box,
                         track_by_id=track_by_id,
                         now_ts=now,
-                        overlap_iou=TRACK_DUPLICATE_IOU,
-                        recent_only_sec=max(TRACK_OUTPUT_HOLD_TIME, 0.5),
+                        overlap_iou=config.track_duplicate_iou,
+                        recent_only_sec=max(config.track_output_hold_time, 0.5),
                     ):
                         continue
 
@@ -271,7 +257,7 @@ class TrackStage(Stage):
                         "created_at": now,
                         "appearance": det_appearance,
                         "score": score,
-                        "status": "confirmed" if initial_hits >= TRACK_MIN_HITS else "tentative",
+                        "status": "confirmed" if initial_hits >= config.track_min_hits else "tentative",
                         "hits": initial_hits,
                         "misses": 0,
                         "vx": 0.0,
@@ -294,17 +280,17 @@ class TrackStage(Stage):
             is_tentative = tr.get("status") == "tentative"
 
             if tr["id"] in matched_ids:
-                if is_confirmed or (OUTPUT_TENTATIVE_TRACKS and is_tentative):
+                if is_confirmed or (config.output_tentative_tracks and is_tentative):
                     output_track_ids.add(tr["id"])
                 continue
 
             if not is_confirmed:
                 continue
-            if int(tr.get("misses", 0)) > TRACK_MAX_MISSES:
+            if int(tr.get("misses", 0)) > config.track_max_misses:
                 continue
-            if now - tr.get("last_seen", 0.0) > TRACK_OUTPUT_HOLD_TIME:
+            if now - tr.get("last_seen", 0.0) > config.track_output_hold_time:
                 continue
-            if suppress_overlapping_holds(tr, output_track_ids, track_by_id, HOLD_SUPPRESS_IOU):
+            if suppress_overlapping_holds(tr, output_track_ids, track_by_id, config.hold_suppress_iou):
                 continue
             output_track_ids.add(tr["id"])
 
@@ -337,15 +323,15 @@ class TrackStage(Stage):
                 degraded=False,
             ))
 
-        detections = dedupe_output_tracks(detections, OUTPUT_DEDUPE_IOU)
+        detections = dedupe_output_tracks(detections, config.output_dedupe_iou)
 
         if raw_dets and not detections:
             best_score = max(det["score"] for det in raw_dets)
             logger.warning(
                 f"[{camera_id}] YOLO raw persons={len(raw_dets)} but output detections=0 "
-                f"(best_score={best_score:.2f}, track_min_hits={TRACK_MIN_HITS}, "
-                f"output_tentative={OUTPUT_TENTATIVE_TRACKS}, "
-                f"new_track_min_confidence={NEW_TRACK_MIN_CONFIDENCE:.2f})"
+                f"(best_score={best_score:.2f}, track_min_hits={config.track_min_hits}, "
+                f"output_tentative={config.output_tentative_tracks}, "
+                f"new_track_min_confidence={config.new_track_min_confidence:.2f})"
             )
 
             # Degraded mode: if stable service-side tracking filters
@@ -354,7 +340,7 @@ class TrackStage(Stage):
             # treat these as render-only detections, not lifecycle events.
             fallback_detections: List[Any] = []
             used_track_ids: set[int] = set()
-            reuse_window_sec = max(TRACK_OUTPUT_HOLD_TIME, 0.5)
+            reuse_window_sec = max(config.track_output_hold_time, 0.5)
 
             for det in sorted(raw_dets, key=lambda item: item["score"], reverse=True):
                 det_box = det["bbox"]

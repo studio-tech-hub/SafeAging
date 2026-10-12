@@ -8,13 +8,19 @@ and swallowed, never failing the whole /infer request.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ...config import logger
 from ...zone_engine import check_zones, get_zones_for_camera_sync
 from .base import Stage
 
+if TYPE_CHECKING:
+    from ...config import AppConfig
+    from ..context import InferContext
+
 
 class ZoneStage(Stage):
-    def run(self, ctx) -> None:
+    def run(self, ctx: "InferContext", config: "AppConfig") -> None:
         camera_id = ctx.camera_id
         detections = ctx.detections
 

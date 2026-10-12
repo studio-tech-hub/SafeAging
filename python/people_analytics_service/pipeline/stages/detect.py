@@ -12,25 +12,23 @@ from __future__ import annotations
 
 import os
 import time
+from typing import TYPE_CHECKING
 
 import cv2
 
-from ...config import (
-    ENABLE_INPUT_UPSCALE,
-    ENABLE_MULTI_SCALE,
-    MIN_INPUT_RESOLUTION,
-    SAVE_DEBUG_SAMPLES,
-    YOLO_IMGSZ,
-    logger,
-)
+from ...config import logger
 from ...model import load_model
 from ...preprocess import ensure_min_input_side, multi_scale_inference_smart
 from ... import yolo_backend
 from .base import Stage
 
+if TYPE_CHECKING:
+    from ...config import AppConfig
+    from ..context import InferContext
+
 
 class DetectStage(Stage):
-    def run(self, ctx) -> None:
+    def run(self, ctx: "InferContext", config: "AppConfig") -> None:
         from ... import api as _api
 
         camera_id = ctx.camera_id
@@ -41,7 +39,7 @@ class DetectStage(Stage):
             # Startup preloads the model; keep this as a defensive fallback.
             yolo_model = load_model()
 
-            if SAVE_DEBUG_SAMPLES and cam_seq % 200 == 0:
+            if config.save_debug_samples and cam_seq % 200 == 0:
                 try:
                     os.makedirs('frame_samples', exist_ok=True)
                     sample_pre = f'frame_samples/{camera_id}_{cam_seq:06d}_pre_yolo.jpg'
@@ -53,13 +51,13 @@ class DetectStage(Stage):
 
             yolo_frame = frame
             yolo_inv_scale = 1.0
-            if ENABLE_INPUT_UPSCALE:
-                yolo_frame, yolo_scale = ensure_min_input_side(frame, MIN_INPUT_RESOLUTION)
+            if config.enable_input_upscale:
+                yolo_frame, yolo_scale = ensure_min_input_side(frame, config.min_input_resolution)
                 if yolo_scale != 1.0:
                     yolo_inv_scale = 1.0 / yolo_scale
 
             # Choose inference strategy
-            if ENABLE_MULTI_SCALE:
+            if config.enable_multi_scale:
                 # Smart multi-scale detection: only retry at larger scale if no detections
                 r = multi_scale_inference_smart(yolo_model, yolo_frame, ctx.H, ctx.W)
             else:
@@ -70,14 +68,14 @@ class DetectStage(Stage):
                     conf=ctx.conf_threshold,
                     iou=ctx.iou_threshold,
                     classes=[0],  # person only
-                    imgsz=YOLO_IMGSZ,
+                    imgsz=config.yolo_imgsz,
                     verbose=False,
                     augment=False,
                 )
 
             yolo_time_ms = (time.perf_counter() - yolo_start) * 1000.0
 
-            if SAVE_DEBUG_SAMPLES and cam_seq % 200 == 0:
+            if config.save_debug_samples and cam_seq % 200 == 0:
                 try:
                     os.makedirs('frame_samples', exist_ok=True)
                     frame_with_boxes = frame.copy()

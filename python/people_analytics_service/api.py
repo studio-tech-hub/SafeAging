@@ -47,6 +47,7 @@ from .config import (
     TLS_CERT_FILE,
     TLS_KEY_FILE,
     YOLO_IMGSZ,
+    get_config,
     log_config_summary,
     logger,
 )
@@ -792,7 +793,16 @@ def _run_person_detection_pipeline(
     extracted verbatim from this function's former body, one at a time,
     gated by python/tests/unit/test_infer_golden.py (the characterization
     test that must stay green, unmodified, through the whole decomposition).
+
+    P2-3: `config` is fetched once per request via `get_config()` (an
+    explicit accessor over the same process-wide AppConfig singleton the
+    globals above are already derived from — not new state) and passed
+    explicitly into every stage's `run()`, instead of each stage importing
+    config.py's module-level globals directly. This is what makes stages
+    unit-testable in isolation with a constructed AppConfig instead of
+    `monkeypatch.setattr(config, ...)` on shared module globals.
     """
+    config = get_config()
     ctx = InferContext(
         frame=frame,
         camera_id=camera_id,
@@ -807,7 +817,7 @@ def _run_person_detection_pipeline(
     )
     try:
         for stage in PIPELINE_STAGES:
-            stage.run(ctx)
+            stage.run(ctx, config)
             if ctx.stopped:
                 return ctx.result
         return ctx.detections
@@ -1262,12 +1272,15 @@ async def startup_event():
         # Pass the already-resolved value explicitly (P0-4: supports
         # DATABASE_URL_FILE) instead of letting init_engine() re-read the raw
         # env var itself, which would bypass the _FILE secrets convention.
-        init_engine(_DATABASE_URL)
+        # P2-3: also pass the injected AppConfig so init_engine() reads
+        # EDGE_SQLITE_PATH from it instead of a second, independent
+        # os.getenv() call.
+        _startup_config = get_config()
+        init_engine(_DATABASE_URL, config=_startup_config)
         from .db.session import is_edge_mode
 
         if is_edge_mode():
-            from .config import EDGE_SQLITE_PATH
-            logger.info(f"Edge SQLite store ready ({EDGE_SQLITE_PATH})")
+            logger.info(f"Edge SQLite store ready ({_startup_config.edge_sqlite_path})")
         else:
             logger.info("Database engine initialised (pool ready)")
     except Exception as _db_exc:

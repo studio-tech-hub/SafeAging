@@ -8,13 +8,19 @@ whole /infer request.
 """
 from __future__ import annotations
 
-from ...config import ENABLE_FALL_DETECTION, ENABLE_POSE_FALL, POSE_IMGSZ, POSE_KEYPOINT_CONF, logger
+from typing import TYPE_CHECKING
+
+from ...config import logger
 from ... import pose_backend
 from .base import Stage
 
+if TYPE_CHECKING:
+    from ...config import AppConfig
+    from ..context import InferContext
+
 
 class FallStage(Stage):
-    def run(self, ctx) -> None:
+    def run(self, ctx: "InferContext", config: "AppConfig") -> None:
         from ... import api as _api
 
         camera_id = ctx.camera_id
@@ -25,7 +31,7 @@ class FallStage(Stage):
         camera_frame_idx = ctx.camera_frame_idx
         yolo_frame = ctx.yolo_frame
 
-        if not (ENABLE_FALL_DETECTION and fall_detector):
+        if not (config.enable_fall_detection and fall_detector):
             return
 
         try:
@@ -58,15 +64,15 @@ class FallStage(Stage):
                 fall_stats = fall_detector.get_stats()
 
             # Tier 2: pose on person crop only when bbox signals pending fall
-            if ENABLE_POSE_FALL and fall_input_detections:
+            if config.enable_pose_fall and fall_input_detections:
                 pose_candidates = fall_detector.get_pose_candidate_track_ids()
                 if pose_candidates:
                     pose_hints = pose_backend.match_pose_to_crops(
                         yolo_frame,
                         fall_input_detections,
                         pose_candidates,
-                        conf=POSE_KEYPOINT_CONF,
-                        imgsz=POSE_IMGSZ,
+                        conf=config.pose_keypoint_conf,
+                        imgsz=config.pose_imgsz,
                     )
                     if pose_hints:
                         with camera_lock:

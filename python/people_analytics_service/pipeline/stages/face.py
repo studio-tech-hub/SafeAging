@@ -9,13 +9,19 @@ needs detections already remapped into full input-frame pixel space.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ...config import logger
 from ...preprocess import remap_detections_to_input_space
 from .base import Stage
 
+if TYPE_CHECKING:
+    from ...config import AppConfig
+    from ..context import InferContext
+
 
 class FaceStage(Stage):
-    def run(self, ctx) -> None:
+    def run(self, ctx: "InferContext", config: "AppConfig") -> None:
         from ... import api as _api
 
         camera_id = ctx.camera_id

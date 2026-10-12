@@ -12,27 +12,22 @@ from __future__ import annotations
 
 import os
 import time
+from typing import TYPE_CHECKING
 
 import cv2
 
-from ...config import (
-    CONFIDENCE_THRESHOLD,
-    ENABLE_CLAHE,
-    ENABLE_FACE_RECOGNITION,
-    ENABLE_FRAME_ENHANCEMENT,
-    ENABLE_ROI,
-    ENABLE_UNDISTORT,
-    IOU_THRESHOLD,
-    SAVE_DEBUG_SAMPLES,
-    logger,
-)
+from ...config import logger
 from ...config_engine import get_per_camera_config_sync
 from ...preprocess import apply_roi, preprocess_frame, undistort_frame
 from .base import Stage
 
+if TYPE_CHECKING:
+    from ...config import AppConfig
+    from ..context import InferContext
+
 
 class PreprocessStage(Stage):
-    def run(self, ctx) -> None:
+    def run(self, ctx: "InferContext", config: "AppConfig") -> None:
         # Lazy import: api.py imports this package at module load, so a
         # top-level `from ..api import ...` here would be circular.
         from ... import api as _api
@@ -66,7 +61,7 @@ class PreprocessStage(Stage):
                 f"[{camera_id}] Transport: {ctx.transport_name}, "
                 f"encoded_bytes={ctx.transport_encoded_bytes}, raw_bytes={ctx.transport_raw_bytes}"
             )
-            if SAVE_DEBUG_SAMPLES:
+            if config.save_debug_samples:
                 try:
                     os.makedirs('frame_samples', exist_ok=True)
                     sample_path = f'frame_samples/{camera_id}_{cam_seq:06d}.jpg'
@@ -80,7 +75,7 @@ class PreprocessStage(Stage):
         undistort_crop_offset = (0, 0)
 
         # 1.4) Undistortion (for wide-angle/fisheye cameras)
-        if ENABLE_UNDISTORT:
+        if config.enable_undistort:
             undistort_start = time.perf_counter()
             frame, undistort_crop_offset = undistort_frame(frame)
             undistort_time_ms = (time.perf_counter() - undistort_start) * 1000.0
@@ -97,7 +92,7 @@ class PreprocessStage(Stage):
         # 1.5) ROI Crop (Region of Interest)
         roi_box = None
         roi_type = None
-        if ENABLE_ROI:
+        if config.enable_roi:
             roi_start = time.perf_counter()
             frame, roi_box, roi_type = apply_roi(frame, roi_override=roi_override)
             roi_time_ms = (time.perf_counter() - roi_start) * 1000.0
@@ -111,7 +106,7 @@ class PreprocessStage(Stage):
         H, W = frame.shape[:2]
 
         # 1.6) Preprocess frame for wide-angle optimization
-        if ENABLE_CLAHE or ENABLE_FRAME_ENHANCEMENT:
+        if config.enable_clahe or config.enable_frame_enhancement:
             preprocess_start = time.perf_counter()
             frame = preprocess_frame(frame)
             preprocess_step_ms = (time.perf_counter() - preprocess_start) * 1000.0
@@ -119,19 +114,19 @@ class PreprocessStage(Stage):
             if cam_seq % 20 == 0:
                 logger.debug(
                     f"[{camera_id}] Frame preprocessing: {preprocess_step_ms:.1f}ms "
-                    f"(CLAHE={ENABLE_CLAHE}, Enhancement={ENABLE_FRAME_ENHANCEMENT})"
+                    f"(CLAHE={config.enable_clahe}, Enhancement={config.enable_frame_enhancement})"
                 )
 
         # 1.7) Per-camera config override (P2.2)
         conf_threshold = (
             cam_cfg["confidence_threshold"]
             if cam_cfg and cam_cfg.get("confidence_threshold") is not None
-            else CONFIDENCE_THRESHOLD
+            else config.confidence_threshold
         )
         iou_threshold = (
             cam_cfg["iou_threshold"]
             if cam_cfg and cam_cfg.get("iou_threshold") is not None
-            else IOU_THRESHOLD
+            else config.iou_threshold
         )
 
         # Per-camera face-recognition toggle (P1-6). Lives under
@@ -140,7 +135,7 @@ class PreprocessStage(Stage):
         # (None/missing/non-bool) means "inherit the global
         # ENABLE_FACE_RECOGNITION setting" — existing deployments that never
         # set this are completely unaffected.
-        enable_face_recognition = ENABLE_FACE_RECOGNITION
+        enable_face_recognition = config.enable_face_recognition
         if cam_cfg and isinstance(cam_cfg.get("extra"), dict):
             face_recog_override = cam_cfg["extra"].get("enable_face_recognition")
             if isinstance(face_recog_override, bool):

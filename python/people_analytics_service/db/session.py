@@ -12,12 +12,16 @@ Lifecycle
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+
+if TYPE_CHECKING:
+    from ..config import AppConfig
 
 _engine = None
 _session_factory: async_sessionmaker | None = None
@@ -56,17 +60,29 @@ def _to_async_url(url: str) -> str:
     return url  # already has a driver or is empty
 
 
-def init_engine(database_url: str | None = None) -> None:
-    """Create Postgres engine or open edge SQLite when DATABASE_URL is empty."""
+def init_engine(database_url: str | None = None, config: "AppConfig | None" = None) -> None:
+    """Create Postgres engine or open edge SQLite when DATABASE_URL is empty.
+
+    `config` (P2-3) is an optional explicit `AppConfig` to read
+    `EDGE_SQLITE_PATH` from, instead of this function re-reading the raw env
+    var itself — matching the P0-4 `_FILE`-secrets-aware, already-resolved
+    value api.py passes for `database_url`. Optional and defaults to the old
+    `os.getenv` behaviour for every existing caller (e.g. the P2-2 contract
+    test, which intentionally drives edge/Postgres mode via env vars
+    directly) — purely additive, no behaviour change for callers that don't
+    pass it.
+    """
     global _engine, _session_factory, _edge_mode
 
     url = (database_url or os.getenv("DATABASE_URL", "")).strip()
     if not url:
         from .edge_store import init_edge_store
 
-        edge_path = os.getenv(
-            "EDGE_SQLITE_PATH", "/app/runtime/edge_state.db"
-        ).strip()
+        edge_path = (
+            config.edge_sqlite_path
+            if config is not None
+            else os.getenv("EDGE_SQLITE_PATH", "/app/runtime/edge_state.db").strip()
+        )
         if not edge_path:
             raise ValueError(
                 "DATABASE_URL is not configured and EDGE_SQLITE_PATH is empty."

@@ -294,6 +294,10 @@ class AppConfig:
         )
 
         # Upscale decoded frames when short side < MIN_INPUT_RESOLUTION before YOLO only.
+        # Exposed as a field (not just the module-level MIN_INPUT_RESOLUTION constant
+        # above) so P2-1 pipeline stages can read it via the injected `config: AppConfig`
+        # parameter (P2-3) instead of importing the bare global directly.
+        self.min_input_resolution = MIN_INPUT_RESOLUTION
         self.enable_input_upscale = _env_bool("ENABLE_INPUT_UPSCALE", True)
         self.enable_clahe = _env_bool("ENABLE_CLAHE", False)
         self.enable_multi_scale = _env_bool("ENABLE_MULTI_SCALE", False)
@@ -529,6 +533,41 @@ class AppConfig:
 
 _load_local_env()
 CONFIG = AppConfig()
+
+
+def get_config() -> AppConfig:
+    """Explicit, injectable accessor for the process-wide AppConfig singleton
+    (P2-3).
+
+    Zero new logic — just names the existing `CONFIG` object as a dependency
+    boundary. Old code keeps reading the module-level globals below
+    (`CONFIDENCE_THRESHOLD`, `ENABLE_ROI`, etc.) exactly as before: nothing
+    about that compatibility layer changes or is scheduled for removal here.
+
+    New/refactored code (starting with the P2-1 pipeline stages and P2-2
+    repositories) should receive `AppConfig` as an explicit parameter instead
+    of importing a global, e.g. via FastAPI's own convention:
+
+        @app.get("/foo")
+        async def foo(config: AppConfig = Depends(get_config)): ...
+
+    or, for non-request-scoped code (pipeline stages), by having the caller
+    fetch `get_config()` once and pass it down explicitly:
+
+        config = get_config()
+        for stage in PIPELINE_STAGES:
+            stage.run(ctx, config)
+
+    This makes the receiving code trivially unit-testable with a constructed
+    `AppConfig`-like test double instead of `monkeypatch.setattr(config, ...)`
+    on module globals, and is a prerequisite for any future runtime-
+    reconfigurable (hot-reload) behaviour — neither of which the global-import
+    pattern can support. See tools/check_config_di_boundary.py, which enforces
+    this convention (no direct config-global imports) for new code under
+    `pipeline/` and `db/repository.py` going forward.
+    """
+    return CONFIG
+
 
 SERVICE_PORT = CONFIG.service_port
 SERVICE_HOST = CONFIG.service_host

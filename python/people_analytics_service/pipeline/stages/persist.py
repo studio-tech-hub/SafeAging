@@ -12,19 +12,11 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import cv2
 
-from ...config import (
-    ENABLE_HISTORY_REMATCH,
-    FLICKER_REUSE_TIME,
-    METRICS_LOG_INTERVAL,
-    TENTATIVE_MAX_MISSES,
-    TRACK_TTL,
-    UNIQUE_COUNT_MIN_HITS,
-    logger,
-)
+from ...config import logger
 from ...metrics import (
     ACTIVE_TRACKS,
     DECODE_LATENCY,
@@ -39,6 +31,10 @@ from ... import outbox_worker
 from ...outbox_worker import OutboxEvent
 from .base import Stage
 
+if TYPE_CHECKING:
+    from ...config import AppConfig
+    from ..context import InferContext
+
 
 def _det_person_fields(det) -> dict:
     return {
@@ -48,7 +44,7 @@ def _det_person_fields(det) -> dict:
 
 
 class PersistStage(Stage):
-    def run(self, ctx) -> None:
+    def run(self, ctx: "InferContext", config: "AppConfig") -> None:
         camera_id = ctx.camera_id
         state = ctx.state
         now = ctx.now
@@ -61,7 +57,7 @@ class PersistStage(Stage):
             # 4) Anti-flicker: reuse last output if empty
             if not detections and state["last_output"]:
                 time_since_last = now - state["last_time"]
-                if time_since_last < FLICKER_REUSE_TIME:
+                if time_since_last < config.flicker_reuse_time:
                     logger.debug(f"[{camera_id}] Reusing last output (anti-flicker, {time_since_last*1000:.0f}ms)")
                     detections = state["last_output"]
             else:
@@ -78,17 +74,17 @@ class PersistStage(Stage):
                     expired_tracks.append(tr)
                     continue
 
-                if tr.get("status") == "tentative" and int(tr.get("misses", 0)) > TENTATIVE_MAX_MISSES:
+                if tr.get("status") == "tentative" and int(tr.get("misses", 0)) > config.tentative_max_misses:
                     tr["status"] = "deleted"
                     expired_tracks.append(tr)
                     continue
 
-                if now - tr.get("last_seen", 0.0) <= TRACK_TTL:
+                if now - tr.get("last_seen", 0.0) <= config.track_ttl:
                     active_tracks.append(tr)
                 else:
                     expired_tracks.append(tr)
 
-            if ENABLE_HISTORY_REMATCH:
+            if config.enable_history_rematch:
                 state["track_history"] = [tr for tr in state["track_history"] if now - tr.get("last_seen", now) <= 30.0]
                 history_candidates = [
                     tr for tr in expired_tracks
@@ -127,7 +123,7 @@ class PersistStage(Stage):
                 for track_id in output_track_ids
                 if track_id in track_by_id
                 and track_by_id[track_id].get("status") == "confirmed"
-                and int(track_by_id[track_id].get("hits", 0)) >= UNIQUE_COUNT_MIN_HITS
+                and int(track_by_id[track_id].get("hits", 0)) >= config.unique_count_min_hits
             }
 
             # Update timestamps for currently-active confirmed tracks
@@ -135,9 +131,9 @@ class PersistStage(Stage):
                 state["seen_ids_with_time"][track_id] = now
 
             # Expire old IDs that haven't been seen recently (older than
-            # TRACK_TTL + grace period). Grace period allows re-detection of
+            # config.track_ttl + grace period). Grace period allows re-detection of
             # same person after brief exit.
-            id_expiry_threshold = TRACK_TTL + 30.0  # Keep IDs for up to 45s after last detection
+            id_expiry_threshold = config.track_ttl + 30.0  # Keep IDs for up to 45s after last detection
             expired_ids = [
                 vid for vid, last_seen in state["seen_ids_with_time"].items()
                 if now - last_seen > id_expiry_threshold
@@ -175,7 +171,7 @@ class PersistStage(Stage):
         DETECTIONS_PER_FRAME.labels(camera_id=camera_id).observe(float(len(detections)))
         ACTIVE_TRACKS.labels(camera_id=camera_id).set(float(tracks_count))
 
-        if ctx.camera_request_count == 1 or ctx.camera_request_count % METRICS_LOG_INTERVAL == 0:
+        if ctx.camera_request_count == 1 or ctx.camera_request_count % config.metrics_log_interval == 0:
             logger.info(
                 f"[{camera_id}] Summary: detections={len(detections)} "
                 f"tracks={tracks_count} unique={unique_count} "

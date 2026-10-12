@@ -1,23 +1,25 @@
 name: CI
 
-# P1-7: Minimal CI pipeline (test gate + compose lint + secret scan + C++ build).
+# P1-7: Minimal CI pipeline (test gate + compose lint + config-DI lint +
+# secret scan + C++ build).
 #
 # Intentionally minimal by design (see working_pipeline/CPU_PRODUCTION_PROFILE.md
-# "CI pipeline (P1-7)"): four independent jobs, each individually disable-able
+# "CI pipeline (P1-7)"): independent jobs, each individually disable-able
 # (comment it out / remove it) without touching the others if it ever produces
 # false positives. Expand incrementally from here rather than growing this into
 # a full release pipeline in one step.
 #
-# All four jobs were validated end-to-end locally (Docker Desktop, WSL) before
-# this file was added, specifically so day one is green, not red:
-#   - python-tests:  built the image, ran the full compose stack, ran
-#                     tests/unit + tests/integration -m integration for real.
-#   - compose-lint:  ran tools/check_compose_security.py and
-#                     tools/verify_compose_config.py directly.
-#   - secret-scan:   ran detect-secrets against the tracked tree and hand
-#                     audited every finding before writing .secrets.baseline.
-#   - build-plugin:  compiled + ran both dependency-free C++ unit test
-#                     binaries with g++.
+# All jobs were validated end-to-end locally (Docker Desktop, WSL) before
+# being added, specifically so day one is green, not red:
+#   - python-tests:    built the image, ran the full compose stack, ran
+#                       tests/unit + tests/integration -m integration for real.
+#   - compose-lint:    ran tools/check_compose_security.py and
+#                       tools/verify_compose_config.py directly.
+#   - config-di-lint:  ran tools/check_config_di_boundary.py directly (P2-3).
+#   - secret-scan:     ran detect-secrets against the tracked tree and hand
+#                       audited every finding before writing .secrets.baseline.
+#   - build-plugin:    compiled + ran both dependency-free C++ unit test
+#                       binaries with g++.
 
 on:
   pull_request:
@@ -144,7 +146,36 @@ jobs:
         run: python tools/verify_compose_config.py
 
   # ─────────────────────────────────────────────────────────────────────────
-  # 3. Secret scanning (P0-1 regression guard): fail the build if a new,
+  # 3. Config dependency-injection boundary lint (P2-3): new/refactored code
+  #    under python/people_analytics_service/pipeline/ and
+  #    db/repository.py must receive AppConfig as an explicit parameter
+  #    (get_config()) rather than importing config.py's module-level global
+  #    mirrors directly. Every other module keeps reading globals
+  #    indefinitely — this check is scoped to exactly those two locations by
+  #    design, not a repo-wide rule.
+  # ─────────────────────────────────────────────────────────────────────────
+  config-di-lint:
+    name: Config DI boundary lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test runner
+        run: pip install --quiet pytest
+
+      - name: Unit tests for the lint tool itself
+        run: python -m pytest tools/test_check_config_di_boundary.py -v
+
+      - name: Static lint — no direct config-global imports under pipeline/ or db/repository.py
+        run: python tools/check_config_di_boundary.py
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. Secret scanning (P0-1 regression guard): fail the build if a new,
   #    unbaselined secret-looking string is committed anywhere in the tree.
   # ─────────────────────────────────────────────────────────────────────────
   secret-scan:
@@ -173,7 +204,7 @@ jobs:
         run: detect-secrets-hook --baseline .secrets.baseline $(git ls-files)
 
   # ─────────────────────────────────────────────────────────────────────────
-  # 4. C++ build (plugin). The two standalone unit test binaries (no Nx SDK
+  # 5. C++ build (plugin). The two standalone unit test binaries (no Nx SDK
   #    needed) always run and must pass. The full plugin compile against the
   #    real Nx Metadata SDK only runs if the team has provisioned the
   #    NX_METADATA_SDK_URL secret, since the SDK is Network Optix's licensed,
