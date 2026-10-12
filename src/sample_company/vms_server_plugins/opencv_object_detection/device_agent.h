@@ -25,6 +25,7 @@
 #include <nx/sdk/ptr.h>
 
 #include "engine.h"
+#include "event.h"
 #include "frame.h"
 #include "multipart_binary_transport.h"
 #include "object_detector.h"

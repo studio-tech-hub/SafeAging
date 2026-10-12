@@ -3,7 +3,9 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace sample_company {
 namespace vms_server_plugins {
@@ -22,6 +24,8 @@ struct Event
     const int64_t timestampUs;
     const std::string classLabel;
 };
+
+using EventList = std::vector<std::shared_ptr<Event>>;
 
 } // namespace opencv_object_detection
 } // namespace vms_server_plugins
